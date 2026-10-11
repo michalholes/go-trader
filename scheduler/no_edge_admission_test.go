@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -267,22 +268,56 @@ func TestV20NoEdgeMigrationNeverGrantsRefusedOrNonLiveReferences(t *testing.T) {
 	mixed["close_strategy"] = map[string]interface{}{"name": "vortex_trend"}
 	allowedOpenRefusedClose := noEdgeHLStrategy("hl-bo-cci", "breakout", "BTC", "1h", "--mode=live")
 	allowedOpenRefusedClose["close_strategy"] = map[string]interface{}{"name": "commodity_channel_trend"}
+	wrrClose := noEdgeHLStrategy("hl-wrr-close", "breakout", "ETH", "1h", "--mode=live")
+	wrrClose["close_strategy"] = map[string]interface{}{"name": "williams_r_reversal"}
+	mfiClose := noEdgeHLStrategy("hl-bo-mfi", "breakout", "SOL", "4h", "--mode=live")
+	mfiClose["close_strategy"] = map[string]interface{}{"name": "money_flow_index_reversal"}
 	explicitFalse := noEdgeHLStrategy("hl-false", "rsi", "SOL", "1h", "--mode=live")
 	explicitFalse["allow_no_edge"] = false
 	explicitFalse["allow_deprecated"] = true
+	eomOpen := noEdgeHLStrategy("hl-eombo", "ease_of_movement_breakout", "ARB", "1h", "--mode=live")
+	eomOpen["allow_deprecated"] = true
+	eomClose := noEdgeHLStrategy("hl-bo-eom", "breakout", "OP", "1h", "--mode=live")
+	eomClose["close_strategy"] = map[string]interface{}{"name": "ease_of_movement_breakout"}
+	obvOpen := noEdgeHLStrategy("hl-obv", "on_balance_volume_divergence", "ARB", "4h", "--mode=live")
+	obvOpen["allow_deprecated"] = true
+	obvClose := noEdgeHLStrategy("hl-bo-obv", "breakout", "OP", "4h", "--mode=live")
+	obvClose["close_strategy"] = map[string]interface{}{"name": "on_balance_volume_divergence"}
+	fisherCloseFallback := noEdgeHLStrategy("hl-bo-fisher", "breakout", "BTC", "4h", "--mode=live")
+	fisherCloseFallback["close_strategy"] = map[string]interface{}{"name": "fisher_reversal"}
 	path := writeNoEdgeConfig(t, 19,
 		mixed,
 		allowedOpenRefusedClose,
+		eomOpen,
+		eomClose,
+		obvOpen,
+		obvClose,
 		noEdgeHLStrategy("hl-ao", "awesome_oscillator", "ETH", "4h", "--mode=live"),
+		noEdgeHLStrategy("hl-wrr", "williams_r_reversal", "BTC", "4h", "--mode=live"),
+		wrrClose,
+		noEdgeHLStrategy("hl-mfi", "money_flow_index_reversal", "ETH", "4h", "--mode=live"),
+		mfiClose,
+		noEdgeHLStrategy("hl-fisher", "fisher_reversal", "ETH", "4h", "--mode=live"),
+		fisherCloseFallback,
 		noEdgeHLStrategy("hl-missing", "rsi", "DOGE", "1h"),
 		noEdgeHLStrategy("hl-invalid", "rsi", "LINK", "1h", "--mode=live", "--mode=live"),
 		explicitFalse,
 	)
-	_, err := LoadConfig(path)
+	report, err := migrateV20NoEdge(readRawConfig(t, path), 19)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"hl-ao", "hl-bo-cci", "hl-bo-eom", "hl-bo-fisher", "hl-bo-mfi", "hl-bo-obv", "hl-eombo", "hl-fisher", "hl-mfi", "hl-mix", "hl-obv", "hl-wrr", "hl-wrr-close"}; !reflect.DeepEqual(report.VetoedResearch, want) {
+		t.Fatalf("vetoed research = %v, want %v", report.VetoedResearch, want)
+	}
+	if len(report.Stamped) != 0 {
+		t.Fatalf("stamped = %v, want none", stampedIDs(report))
+	}
+	_, err = LoadConfig(path)
 	if err == nil {
 		t.Fatal("refused references must stay refused after migration")
 	}
-	for _, id := range []string{"hl-mix", "hl-bo-cci", "hl-ao", "hl-missing", "hl-invalid", "hl-false"} {
+	for _, id := range []string{"hl-mix", "hl-bo-cci", "hl-eombo", "hl-bo-eom", "hl-obv", "hl-bo-obv", "hl-ao", "hl-wrr", "hl-wrr-close", "hl-mfi", "hl-bo-mfi", "hl-fisher", "hl-bo-fisher", "hl-missing", "hl-invalid", "hl-false"} {
 		if !strings.Contains(err.Error(), "strategy "+id+":") {
 			t.Fatalf("%s should be refused after migration: %v", id, err)
 		}
@@ -296,6 +331,81 @@ func TestV20NoEdgeMigrationNeverGrantsRefusedOrNonLiveReferences(t *testing.T) {
 	if raw["hl-false"]["allow_no_edge"] != false {
 		t.Fatal("an existing explicit false must be preserved")
 	}
+}
+
+func TestV20NoEdgeMigrationStampsOnlyNamesThatRanLiveBeforeV20(t *testing.T) {
+	setNoEdgeLiveCredentials(t)
+	assertUnstamped := func(t *testing.T, path string, version int, id string) {
+		t.Helper()
+		report, err := migrateV20NoEdge(readRawConfig(t, path), version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(report.Stamped) != 0 || !reflect.DeepEqual(report.VetoedResearch, []string{id}) {
+			t.Fatalf("report stamped=%v unstamped=%v, want no stamp and %s listed unstamped", stampedIDs(report), report.VetoedResearch, id)
+		}
+		if !strings.Contains(strings.Join(report.lines(), "\n"), "did not stamp "+id+":") {
+			t.Fatalf("notice does not name %s as unstamped: %v", id, report.lines())
+		}
+		_, err = LoadConfig(path)
+		if err == nil || !strings.Contains(err.Error(), "strategy "+id+":") {
+			t.Fatalf("%s must be refused by the no-edge admission after migration, got %v", id, err)
+		}
+		if v, has := rawStrategiesByID(t, path)[id]["allow_no_edge"]; has {
+			t.Fatalf("%s gained allow_no_edge=%v", id, v)
+		}
+	}
+
+	t.Run("versionless live williams_r_reversal open", func(t *testing.T) {
+		path := writeNoEdgeConfig(t, 0, noEdgeHLStrategy("hl-wrr", "williams_r_reversal", "BTC", "4h", "--mode=live"))
+		assertUnstamped(t, path, 0, "hl-wrr")
+	})
+
+	t.Run("v19 live breakout with a williams_r_reversal close_strategies fallback", func(t *testing.T) {
+		sc := noEdgeHLStrategy("hl-bo-wrr", "breakout", "BTC", "4h", "--mode=live")
+		sc["close_strategies"] = []interface{}{map[string]interface{}{"name": "williams_r_reversal"}}
+		path := writeNoEdgeConfig(t, 19, sc)
+		assertUnstamped(t, path, 19, "hl-bo-wrr")
+	})
+
+	t.Run("a no-edge name registered after v20 is unstamped without a deny-set entry", func(t *testing.T) {
+		const later = "later_no_edge_candidate"
+		if _, research := v20FormerResearchStrategies[later]; research {
+			t.Fatalf("%s must stay outside the research deny set for this case", later)
+		}
+		noEdgeStrategies[later] = noEdgeEvidence{Source: "study_fail", Ref: "backtest/candidates/later/REPORT.md"}
+		t.Cleanup(func() { delete(noEdgeStrategies, later) })
+		openRef := noEdgeHLStrategy("hl-later", later, "BTC", "4h", "--mode=live")
+		closeRef := noEdgeHLStrategy("hl-rsi-later", "rsi", "ETH", "4h", "--mode=live")
+		closeRef["close_strategy"] = map[string]interface{}{"name": later}
+		eligible := noEdgeHLStrategy("hl-rsi", "rsi", "SOL", "4h", "--mode=live")
+		raw := readRawConfig(t, writeNoEdgeConfig(t, 19, openRef, closeRef, eligible))
+		report, err := migrateV20NoEdge(raw, 19)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"hl-later", "hl-rsi-later"}; !reflect.DeepEqual(report.VetoedResearch, want) {
+			t.Fatalf("unstamped = %v, want %v", report.VetoedResearch, want)
+		}
+		if got := stampedIDs(report); !reflect.DeepEqual(got, []string{"hl-rsi"}) {
+			t.Fatalf("stamped = %v, want only the pre-v20 rsi strategy", got)
+		}
+		for _, item := range raw["strategies"].([]interface{}) {
+			sc := item.(map[string]interface{})
+			_, has := sc["allow_no_edge"]
+			if want := sc["id"] == "hl-rsi"; has != want {
+				t.Fatalf("%v allow_no_edge present=%v, want %v", sc["id"], has, want)
+			}
+		}
+	})
+
+	t.Run("the stamp allowlist and the research deny set are disjoint", func(t *testing.T) {
+		for name := range v20StampEligibleStrategies {
+			if _, research := v20FormerResearchStrategies[name]; research {
+				t.Fatalf("%s is both stamp-eligible and research-only", name)
+			}
+		}
+	})
 }
 
 func TestV20NoEdgeMigrationOrderingAndOwnership(t *testing.T) {
@@ -637,4 +747,297 @@ func TestNoEdgeBatchSlotCarriesRawModeEvidenceAndAcknowledgement(t *testing.T) {
 	if fpPlain == fpAcked {
 		t.Fatal("acknowledgement must be part of the slot fingerprint")
 	}
+}
+
+func TestMoneyFlowIndexReversalAdmissionAndPaperAdd(t *testing.T) {
+	setNoEdgeLiveCredentials(t)
+	const name = "money_flow_index_reversal"
+	const ref = "backtest/candidates/money_flow_index_reversal_1658/REPORT.md"
+	mfi := func(args ...string) map[string]interface{} {
+		return noEdgeHLStrategy("hl-mfi-eth", append([]string{name, "ETH", "4h"}, args...)...)
+	}
+	ack := func(sc map[string]interface{}) map[string]interface{} {
+		sc["allow_no_edge"] = true
+		return sc
+	}
+	openRef := func(sc map[string]interface{}) map[string]interface{} {
+		sc["open_strategy"] = map[string]interface{}{"name": name}
+		return sc
+	}
+	closeRef := func(sc map[string]interface{}) map[string]interface{} {
+		sc["close_strategy"] = map[string]interface{}{"name": name}
+		return sc
+	}
+	withArgs := func(sc map[string]interface{}, args ...string) map[string]interface{} {
+		sc["args"] = append([]string{"breakout", "ETH", "4h"}, args...)
+		return sc
+	}
+	cases := []struct {
+		name    string
+		sc      map[string]interface{}
+		wantErr []string
+		scope   PortfolioScope
+	}{
+		{"explicit paper", mfi("--mode=paper"), nil, ScopePaper},
+		{"explicit paper space form", mfi("--mode", "paper"), nil, ScopePaper},
+		{"live refused", mfi("--mode=live"), []string{`open strategy "` + name + `"`, "source study_fail", ref, "explicit live mode"}, ""},
+		{"missing mode refused", mfi(), []string{"missing --mode"}, ""},
+		{"live acknowledged", ack(mfi("--mode=live")), nil, ScopeLive},
+		{"missing mode acknowledged stays paper", ack(mfi()), nil, ScopePaper},
+		{"repeated mode refused", ack(mfi("--mode=paper", "--mode=paper")), []string{"invalid mode", "given 2 times"}, ""},
+		{"unknown mode refused", mfi("--mode=Paper"), []string{"invalid mode"}, ""},
+		{"effective open live refused", withArgs(openRef(mfi()), "--mode=live"), []string{`open strategy "` + name + `"`, "explicit live mode"}, ""},
+		{"effective open missing mode refused", withArgs(openRef(mfi())), []string{"missing --mode"}, ""},
+		{"effective open paper", withArgs(openRef(mfi()), "--mode=paper"), nil, ScopePaper},
+		{"close fallback live refused", withArgs(closeRef(mfi()), "--mode=live"), []string{`close strategy "` + name + `"`, "explicit live mode"}, ""},
+		{"close fallback missing mode refused", withArgs(closeRef(mfi())), []string{"missing --mode"}, ""},
+		{"close fallback acknowledged", ack(withArgs(closeRef(mfi()), "--mode=live")), nil, ScopeLive},
+		{"native close keeps live admission", func() map[string]interface{} {
+			sc := withArgs(mfi(), "--mode=live")
+			sc["close_strategy"] = map[string]interface{}{"name": "tiered_tp_atr"}
+			return sc
+		}(), nil, ScopeLive},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeNoEdgeConfig(t, CurrentConfigVersion, tc.sc)
+			cfg, loadErr := LoadConfig(path)
+			_, probeErr := LoadConfigForProbe(path)
+			if (loadErr == nil) != (probeErr == nil) {
+				t.Fatalf("LoadConfig err=%v but LoadConfigForProbe err=%v", loadErr, probeErr)
+			}
+			if len(tc.wantErr) == 0 {
+				if loadErr != nil {
+					t.Fatalf("unexpected refusal: %v", loadErr)
+				}
+				if got := portfolioScopeFor(cfg.Strategies[0]); got != tc.scope {
+					t.Fatalf("portfolio scope = %q, want %q", got, tc.scope)
+				}
+				return
+			}
+			if loadErr == nil {
+				t.Fatalf("expected refusal containing %q", tc.wantErr)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(loadErr.Error(), want) || !strings.Contains(probeErr.Error(), want) {
+					t.Fatalf("errors missing %q:\nload:  %v\nprobe: %v", want, loadErr, probeErr)
+				}
+			}
+		})
+	}
+
+	id, entry, err := buildAddStrategyEntry(name, "hyperliquid", "sol")
+	if err != nil {
+		t.Fatalf("paper add refused: %v", err)
+	}
+	if id != "hl-mfi-sol" {
+		t.Fatalf("add id = %q, want hl-mfi-sol", id)
+	}
+	var sc map[string]interface{}
+	if err := json.Unmarshal(entry, &sc); err != nil {
+		t.Fatal(err)
+	}
+	if sc["direction"] != DirectionBoth {
+		t.Fatalf("direction = %v, want both", sc["direction"])
+	}
+	if got := sc["args"].([]interface{}); len(got) != 4 || got[0] != name || got[3] != "--mode=paper" {
+		t.Fatalf("args = %v, want explicit paper", got)
+	}
+	if _, has := sc["allow_no_edge"]; has {
+		t.Fatal("paper add must not write an acknowledgement")
+	}
+	if _, _, err := buildAddStrategyEntry(name, "binanceus", "BTC"); err == nil {
+		t.Fatal("futures-only candidate must not be addable to binanceus")
+	}
+	root := map[string]json.RawMessage{"strategies": json.RawMessage(`[]`)}
+	addedID, err := addStrategyToRoot(root, name, "hyperliquid", "SOL")
+	if err != nil || addedID != id {
+		t.Fatalf("shared add path = %q, %v", addedID, err)
+	}
+	if _, err := addStrategyToRoot(root, name, "hyperliquid", "SOL"); err == nil {
+		t.Fatal("duplicate add must be refused")
+	}
+	list, err := configStrategies(root)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("strategies after add = %v, %v", list, err)
+	}
+	var added map[string]interface{}
+	if err := json.Unmarshal(list[0], &added); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(writeNoEdgeConfigRoot(t, CurrentConfigVersion, map[string]interface{}{"market_feed": "websocket"}, added))
+	if err != nil {
+		t.Fatalf("added paper entry must load without acknowledgement: %v", err)
+	}
+	got := cfg.Strategies[0]
+	if portfolioScopeFor(got) != ScopePaper || edgeGateModeForStrategy(got).Kind != edgeGateModePaper || got.AllowNoEdgeAcknowledged() {
+		t.Fatalf("added entry is not explicit unacknowledged paper: %+v", got)
+	}
+	if got.Direction != DirectionBoth {
+		t.Fatalf("loaded direction = %q, want both", got.Direction)
+	}
+}
+
+func TestEaseOfMovementAdmissionThroughRealLoaders(t *testing.T) {
+	setNoEdgeLiveCredentials(t)
+	const name = "ease_of_movement_breakout"
+	const ref = "backtest/candidates/ease_of_movement_1671/REPORT.md"
+	ack := func(sc map[string]interface{}) map[string]interface{} {
+		sc["allow_no_edge"] = true
+		return sc
+	}
+	asClose := func(sc map[string]interface{}) map[string]interface{} {
+		sc["close_strategy"] = map[string]interface{}{"name": name}
+		return sc
+	}
+	cases := []struct {
+		label     string
+		sc        map[string]interface{}
+		wantErr   []string
+		wantScope PortfolioScope
+	}{
+		{"explicit paper", noEdgeHLStrategy("hl-eombo-btc", name, "BTC", "1h", "--mode=paper"), nil, ScopePaper},
+		{"explicit live refused", noEdgeHLStrategy("hl-eombo-btc", name, "BTC", "1h", "--mode=live"),
+			[]string{`open strategy "` + name + `"`, "source study_fail", ref, "explicit live mode"}, ""},
+		{"missing mode refused", noEdgeHLStrategy("hl-eombo-btc", name, "BTC", "1h"), []string{"missing --mode"}, ""},
+		{"invalid mode refused", noEdgeHLStrategy("hl-eombo-btc", name, "BTC", "1h", "--mode=paper", "--mode=live"), []string{"invalid mode"}, ""},
+		{"explicit live acknowledged", ack(noEdgeHLStrategy("hl-eombo-btc", name, "BTC", "1h", "--mode=live")), nil, ScopeLive},
+		{"close fallback refused live", asClose(noEdgeHLStrategy("hl-bo-btc", "breakout", "BTC", "1h", "--mode=live")),
+			[]string{`close strategy "` + name + `"`, "explicit live mode"}, ""},
+		{"close fallback refused missing mode", asClose(noEdgeHLStrategy("hl-bo-btc", "breakout", "BTC", "1h")),
+			[]string{`close strategy "` + name + `"`, "missing --mode"}, ""},
+		{"close fallback paper", asClose(noEdgeHLStrategy("hl-bo-btc", "breakout", "BTC", "1h", "--mode=paper")), nil, ScopePaper},
+		{"close fallback acknowledged", ack(asClose(noEdgeHLStrategy("hl-bo-btc", "breakout", "BTC", "1h", "--mode=live"))), nil, ScopeLive},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			path := writeNoEdgeConfig(t, CurrentConfigVersion, tc.sc)
+			cfg, loadErr := LoadConfig(path)
+			_, probeErr := LoadConfigForProbe(path)
+			if (loadErr == nil) != (probeErr == nil) {
+				t.Fatalf("LoadConfig err=%v but LoadConfigForProbe err=%v", loadErr, probeErr)
+			}
+			if len(tc.wantErr) == 0 {
+				if loadErr != nil {
+					t.Fatalf("unexpected refusal: %v", loadErr)
+				}
+				if got := portfolioScopeFor(cfg.Strategies[0]); got != tc.wantScope {
+					t.Fatalf("portfolio scope = %q, want %q", got, tc.wantScope)
+				}
+				return
+			}
+			if loadErr == nil {
+				t.Fatalf("expected refusal containing %q", tc.wantErr)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(loadErr.Error(), want) || !strings.Contains(probeErr.Error(), want) {
+					t.Fatalf("errors missing %q:\nload:  %v\nprobe: %v", want, loadErr, probeErr)
+				}
+			}
+		})
+	}
+}
+
+func assertEaseOfMovementPaperEntry(t *testing.T, sc StrategyConfig) {
+	t.Helper()
+	if sc.ID != "hl-eombo-btc" || sc.Direction != DirectionBoth || sc.MarginMode != "isolated" {
+		t.Fatalf("entry identity = %s direction=%q margin=%q", sc.ID, sc.Direction, sc.MarginMode)
+	}
+	if sc.AllowNoEdge != nil || portfolioScopeFor(sc) != ScopePaper || edgeGateModeForStrategy(sc).Kind != edgeGateModePaper {
+		t.Fatalf("%s must be explicit paper with no acknowledgement", sc.ID)
+	}
+	if !sc.ClosedBarDecisions {
+		t.Fatalf("%s must decide on closed bars", sc.ID)
+	}
+	if args := appendClosedBarDecisionArgs(sc.Args, sc, nil); !slices.Contains(args, closedBarDecisionsFlag) {
+		t.Fatalf("%s check args %v lack %s", sc.ID, args, closedBarDecisionsFlag)
+	}
+	refs := sc.closeRefs()
+	if len(refs) != 1 || refs[0].Name != "tiered_tp_atr" {
+		t.Fatalf("close owners = %+v, want exactly tiered_tp_atr", refs)
+	}
+	if sc.StopLossATRMult == nil || *sc.StopLossATRMult != DefaultStopLossATRMult {
+		t.Fatalf("stop owner = %v, want the loader default stop_loss_atr_mult %g", sc.StopLossATRMult, DefaultStopLossATRMult)
+	}
+	if sc.StopLossPct != nil || sc.StopLossMarginPct != nil || sc.TrailingStopPct != nil || sc.TrailingStopATRMult != nil ||
+		sc.StopLossATRMultRegime.IsConfigured() || sc.TrailingStopATRMultRegime.IsConfigured() || strategyUsesUnifiedRegimeClose(sc) {
+		t.Fatalf("%s has a second stop owner", sc.ID)
+	}
+	if refsEdge := noEdgeReferences(sc); len(refsEdge) != 1 || refsEdge[0] != (edgeReference{Role: edgeRefRoleOpen, Name: "ease_of_movement_breakout"}) {
+		t.Fatalf("no-edge references = %+v", refsEdge)
+	}
+}
+
+func TestEaseOfMovementOperatorAddPathsCreateExplicitPaperEntries(t *testing.T) {
+	setNoEdgeLiveCredentials(t)
+	id, entry, err := buildAddStrategyEntry("ease_of_movement_breakout", "hyperliquid", "btc")
+	if err != nil || id != "hl-eombo-btc" {
+		t.Fatalf("build = %q, %v", id, err)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(entry, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(raw["args"], []interface{}{"ease_of_movement_breakout", "BTC", "1h", "--mode=paper"}) {
+		t.Fatalf("args = %v", raw["args"])
+	}
+	if !reflect.DeepEqual(raw["close_strategy"], map[string]interface{}{"name": "tiered_tp_atr"}) {
+		t.Fatalf("close_strategy = %v", raw["close_strategy"])
+	}
+	if raw["closed_bar_decisions"] != true {
+		t.Fatalf("closed_bar_decisions = %v, want true", raw["closed_bar_decisions"])
+	}
+	if _, _, err := buildAddStrategyEntry("ease_of_movement_breakout", "binanceus", "BTC"); err == nil {
+		t.Fatal("futures-only candidate was accepted for binanceus")
+	}
+	if _, momentum, err := buildAddStrategyEntry("momentum", "hyperliquid", "BTC"); err != nil || strings.Contains(string(momentum), "close_strategy") || strings.Contains(string(momentum), "closed_bar_decisions") {
+		t.Fatalf("other strategies must keep their existing add entry: %s %v", momentum, err)
+	}
+
+	t.Run("discord", func(t *testing.T) {
+		path := writeNoEdgeConfig(t, CurrentConfigVersion, noEdgeHLStrategy("hl-rsi-eth", "rsi", "ETH", "1h", "--mode=paper"))
+		root := readConfigRoot(t, path)
+		if _, err := addStrategyToRoot(root, "ease_of_movement_breakout", "hyperliquid", "BTC"); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.MarshalIndent(root, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("Discord-added candidate must load without acknowledgement: %v", err)
+		}
+		assertEaseOfMovementPaperEntry(t, cfg.Strategies[1])
+	})
+
+	t.Run("status page", func(t *testing.T) {
+		ss, path, _ := newStructuralTestServer(t)
+		params := `{"name":"ease_of_movement_breakout","platform":"hyperliquid","asset":"BTC"}`
+		confirm := structuralConfirm(t, ss, "add-strategy", "", params)
+		if confirm.ConfirmPhrase != "hl-eombo-btc" {
+			t.Fatalf("confirm phrase = %q", confirm.ConfirmPhrase)
+		}
+		body := `{"nonce":"` + confirm.Nonce + `","params":` + params + `}`
+		if w := mutationPost(ss, ss.handleAPIAddStrategy, "/api/config/add-strategy", body, nil); w.Code != 200 {
+			t.Fatalf("add-strategy status = %d, body %s", w.Code, w.Body.String())
+		}
+		cfg, err := LoadConfigForProbe(path)
+		if err != nil {
+			t.Fatalf("status-page-added candidate must load: %v", err)
+		}
+		var found bool
+		for _, sc := range cfg.Strategies {
+			if sc.ID == "hl-eombo-btc" {
+				found = true
+				assertEaseOfMovementPaperEntry(t, sc)
+			}
+		}
+		if !found {
+			t.Fatal("status-page add did not write hl-eombo-btc")
+		}
+	})
 }

@@ -29,7 +29,7 @@ from run_backtest import (
     stop_context_to_json,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ISSUE = 1338
 
 DEFAULT_SINCE = "2019-01-01"
@@ -236,6 +236,14 @@ def build_candidate(open_name: str, params: dict, resolution: dict) -> dict:
         if resolution.get("regime_windows_spec"):
             cand["regime_windows_spec"] = copy.deepcopy(
                 resolution["regime_windows_spec"])
+        if resolution.get("regime_gate_on_failure"):
+            cand["regime_gate_on_failure"] = resolution["regime_gate_on_failure"]
+        plan = resolution.get("regime_label_windows")
+        if plan:
+            cand["regime_label_windows"] = copy.deepcopy(plan)
+            cand["regime_vocabularies"] = {
+                k: list(v) for k, v in sorted((plan.get("vocabularies") or {}).items())
+            }
     return cand
 
 
@@ -255,17 +263,12 @@ def unsupported_reason(resolution: dict) -> str | None:
         return "unsupported_allow_scale_in"
     if str(resolution.get("atr_method") or "simple").strip().lower() not in ("", "simple"):
         return f"unsupported_atr_method:{resolution.get('atr_method')}"
-    if str(resolution.get("regime_gate_on_failure") or "open").strip().lower() == "closed":
-        return "unsupported_regime_gate_on_failure_closed"
     return None
 
 
 def stage1_skip_reason(resolution: dict) -> str | None:
     if (resolution.get("direction") or "long") == "short":
         return "short_direction_long_only_seeder"
-    if (resolution.get("regime_enabled")
-            and resolution.get("regime_windows_spec")):
-        return "composite_regime_gate_unmodelable_in_walk_forward"
     return None
 
 
@@ -300,10 +303,40 @@ def config_strategy_entries(config_path: str,
     return out
 
 
+def _trim_continuous_history(df, symbol: str, strategy_type: str, mode: str):
+    """Drop a leading prefix so every right-closed hour through the end has a record."""
+    if mode == "off":
+        return df, None
+    if str(FEE_PLATFORM).strip().lower() != "hyperliquid":
+        return df, None
+    if str(strategy_type or "perps").strip().lower() != "perps":
+        return df, None
+    import numpy as np
+    from funding_fetcher import continuous_history_start, load_cached_funding
+    coin = str(symbol).split("/")[0]
+    source_box = {}
+    try:
+        loaded = load_cached_funding(coin, df.index[0], end_date=df.index[-1],
+                                     source_box=source_box)
+    except Exception as exc:
+        raise ValueError(
+            f"stage-1 funding fetch failed for {coin}: {exc}"
+        ) from exc
+    if loaded is None or getattr(loaded, "empty", True) or "timestamp" not in loaded.columns:
+        event_ms = np.array([], dtype=np.int64)
+    else:
+        event_ms = loaded["timestamp"].to_numpy(dtype=np.int64)
+    start = continuous_history_start(df, event_ms,
+                                     absent_hours=source_box.get("venue_absent_hours") or ())
+    if start is None:
+        return df, None
+    return df[df.index >= start], str(start)
+
+
 def run_stage1(open_name: str, grid: dict, resolution: dict, symbol: str,
                timeframe: str, registry: str, stage2_start: str,
                n_splits: int, capital: float, metric: str,
-               verbose: bool) -> dict:
+               verbose: bool, funding_mode: str = "charge") -> dict:
     df = load_cached_data(symbol, timeframe, exchange_id=DATA_PLATFORM,
                           start_date=DEFAULT_SINCE)
     if df is None or df.empty:
@@ -319,7 +352,23 @@ def run_stage1(open_name: str, grid: dict, resolution: dict, symbol: str,
             f">= {MIN_STAGE1_BARS}); stage-1 search would overlap stage-2 "
             f"evidence or have no data. Narrow the stage-2 windows or extend "
             f"cached history.")
-    df = _attach_funding_if_needed(df, open_name, symbol, DEFAULT_SINCE)
+    df, trimmed_start = _trim_continuous_history(
+        df, symbol, resolution.get("strategy_type") or "perps", funding_mode)
+    if len(df) < MIN_STAGE1_BARS:
+        raise ValueError(
+            f"stage-1 continuous funding history leaves only {len(df)} bars "
+            f"before {stage2_start} (need >= {MIN_STAGE1_BARS}); the kept "
+            f"start is {trimmed_start}.")
+    df = _attach_funding_if_needed(
+        df, open_name, symbol, DEFAULT_SINCE,
+        platform=FEE_PLATFORM,
+        strategy_type=resolution.get("strategy_type") or "perps",
+        mode=funding_mode, timeframe=timeframe,
+    )
+    plan = resolution.get("regime_label_windows") if resolution.get("regime_enabled") else None
+    if plan:
+        from regime_label_columns import attach_regime_label_columns
+        df, _ = attach_regime_label_columns(df, plan)
 
     summary = walk_forward_optimize(
         df, open_name, grid,
@@ -330,6 +379,9 @@ def run_stage1(open_name: str, grid: dict, resolution: dict, symbol: str,
         regime_period=int(resolution.get("regime_period") or 14),
         regime_adx_threshold=float(resolution.get("regime_adx_threshold") or 20.0),
         allowed_regimes=resolution.get("allowed_regimes"),
+        regime_windows_spec=resolution.get("regime_windows_spec"),
+        regime_gate_on_failure=resolution.get("regime_gate_on_failure") or "open",
+        regime_label_plan=plan,
         close_strategies=resolution.get("close_strategies") or None,
         stop_loss_atr_mult=resolution.get("stop_loss_atr_mult"),
         trailing_stop_atr_mult=resolution.get("trailing_stop_atr_mult"),
@@ -341,6 +393,7 @@ def run_stage1(open_name: str, grid: dict, resolution: dict, symbol: str,
     )
     if summary.get("error"):
         return {"error": summary["error"], "n_bars": int(len(df)),
+                "trimmed_start": trimmed_start, "funding_mode": funding_mode,
                 "close_validation": summary.get("close_validation")}
     seen, survivors = set(), []
     for w in summary.get("window_results") or []:
@@ -355,6 +408,8 @@ def run_stage1(open_name: str, grid: dict, resolution: dict, symbol: str,
         "survivors": survivors,
         "n_folds": int(summary.get("n_valid_folds") or 0),
         "n_bars": int(len(df)),
+        "trimmed_start": trimmed_start,
+        "funding_mode": funding_mode,
         "close_validation": summary.get("close_validation"),
     }
 
@@ -376,11 +431,13 @@ def write_stage2_spec(spec_path: str, study: str, registry: str,
         json.dump(spec, fh, indent=2, default=str)
 
 
-def run_stage2(spec_path: str, out_json: str, out_dir: str, jobs: int) -> dict:
+def run_stage2(spec_path: str, out_json: str, out_dir: str, jobs: int,
+               funding_mode: str = "charge") -> dict:
     rc = auto_suggest.main([
         "--spec", spec_path, "--json", out_json,
         "--out-dir", os.path.join(out_dir, "harness_runs"),
         "--jobs", str(jobs),
+        "--funding", funding_mode,
     ])
     with open(out_json) as fh:
         report = json.load(fh)
@@ -548,7 +605,8 @@ def tune_strategy(config_path: str, strategy_id: str, symbol: str,
         try:
             s1 = run_stage1(open_name, grid, resolution, symbol, timeframe,
                             registry, stage2_start, args.splits, args.capital,
-                            args.optimize_metric, args.verbose)
+                            args.optimize_metric, args.verbose,
+                            getattr(args, "funding", "charge"))
         except ValueError as exc:
             result["status"] = "stage1_error"
             result["error"] = str(exc)
@@ -561,6 +619,8 @@ def tune_strategy(config_path: str, strategy_id: str, symbol: str,
         result["stage1"] = {"ran": True, "n_folds": s1["n_folds"],
                             "n_bars": s1["n_bars"],
                             "n_survivors": len(s1["survivors"]),
+                            "trimmed_start": s1.get("trimmed_start"),
+                            "funding_mode": s1.get("funding_mode"),
                             "close_validation": s1.get("close_validation")}
         survivor_params = s1["survivors"]
 
@@ -600,7 +660,8 @@ def tune_strategy(config_path: str, strategy_id: str, symbol: str,
         result["status"] = "dry_run"
         return result
     try:
-        report = run_stage2(spec_path, stage2_json, out_dir, args.jobs)
+        report = run_stage2(spec_path, stage2_json, out_dir, args.jobs,
+                            getattr(args, "funding", "charge"))
     except Exception as exc:
         result["status"] = "stage2_failed"
         result["error"] = f"{type(exc).__name__}: {exc}"
@@ -667,6 +728,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Refuse a strategy whose stage-2 candidate count exceeds "
                         "this (guards the stage-1-skipped full-neighborhood path)")
     p.add_argument("--jobs", type=int, default=4, help="Stage-2 harness parallelism")
+    p.add_argument("--funding", choices=["charge", "partial", "off"],
+                   default="charge",
+                   help="Same funding mode for stage 1 and stage 2")
     p.add_argument("--out-dir", default=None, dest="out_dir",
                    help="Artifact directory (default: <config dir>/tune_live_runs)")
     p.add_argument("--json", default=None, dest="json_out",

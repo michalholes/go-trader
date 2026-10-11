@@ -1,6 +1,6 @@
 {
   "schema": "go-trader.booked-ledger",
-  "schema_version": 1,
+  "schema_version": 2,
   "inspected_revision": null,
   "capture_manifest_sha256": "a35623c14d5675b735b9a7ba01f0cd574c0b06bf280ea67ed8acf2a437cf0703",
   "time_basis": "UTC",
@@ -505,6 +505,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -937,6 +944,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -1353,6 +1367,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -1769,6 +1790,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -2185,6 +2213,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -2601,6 +2636,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -3017,6 +3059,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -3433,6 +3482,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -3849,6 +3905,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -4265,6 +4328,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -4681,6 +4751,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -5097,6 +5174,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -5513,6 +5597,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -5929,6 +6020,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -6345,6 +6443,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -6761,6 +6866,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -7177,6 +7289,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -7593,6 +7712,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -8009,6 +8135,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -8425,6 +8558,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -8841,6 +8981,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -9257,6 +9404,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -9673,6 +9827,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -10089,6 +10250,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     },
     {
@@ -10505,6 +10673,13 @@
             "source_field": "tp_tiers_json"
           }
         ]
+      },
+      "cost_model_version": {
+        "value": null,
+        "raw_value": null,
+        "status": "unavailable",
+        "reason": "column_absent",
+        "provenance": []
       }
     }
   ],

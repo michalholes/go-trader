@@ -11,8 +11,13 @@ import pandas as pd
 
 from registry_loader import load_registry
 from backtester import (STOP_OWNERS_NEEDING_ATR, Backtester, CloseCapabilityError,
-                        aggregate_close_validations)
+                        aggregate_close_validations, charge_funding_rejected)
 from atr import ensure_atr_indicator
+
+_SHARED_TOOLS = os.path.join(os.path.dirname(__file__), "..", "shared_tools")
+if _SHARED_TOOLS not in sys.path:
+    sys.path.insert(0, _SHARED_TOOLS)
+from funding_fetcher import rejoin_funding_columns
 
 
 _EXPECTED_FOLD_ERRORS = (KeyError, ValueError, TypeError, IndexError, ZeroDivisionError)
@@ -231,6 +236,9 @@ def walk_forward_optimize(
     direction: Optional[str] = None,
     comparison_mode: Optional[str] = None,
     stop_kwargs: Optional[dict] = None,
+    regime_windows_spec: Optional[dict] = None,
+    regime_gate_on_failure: str = "open",
+    regime_label_plan: Optional[dict] = None,
 ) -> dict:
     total_len = len(df)
     window_size = total_len // n_splits
@@ -255,6 +263,17 @@ def walk_forward_optimize(
         extra_stop_kwargs[key] = value
     if close_stack_grid and direction is None:
         direction = "long"
+    label_columns = None
+    feature_labels = {}
+    if regime_label_plan:
+        from regime_label_columns import (engine_label_columns,
+                                          feature_label_kwargs,
+                                          require_label_frame)
+        require_label_frame(df, regime_label_plan)
+        label_columns = engine_label_columns(regime_label_plan)
+        feature_labels = feature_label_kwargs(regime_label_plan)
+        if regime_windows_spec is None:
+            regime_windows_spec = regime_label_plan.get("windows_spec")
     if direction == "short":
         raise ValueError(
             "direction='short' is not supported by walk-forward optimization "
@@ -293,11 +312,15 @@ def walk_forward_optimize(
             regime_enabled=regime_enabled, regime_period=regime_period,
             regime_adx_threshold=regime_adx_threshold,
             allowed_regimes=allowed_regimes,
+            regime_windows_spec=regime_windows_spec,
+            regime_gate_on_failure=regime_gate_on_failure,
+            regime_label_columns=label_columns,
             stop_loss_atr_mult=stack.get("stop_loss_atr_mult"),
             trailing_stop_atr_mult=stack.get("trailing_stop_atr_mult"),
             close_strategies=stack.get("close_strategies"),
             direction=direction,
             comparison_mode=comparison_mode,
+            **feature_labels,
             **extra_stop_kwargs,
         ))
         for stack in stacks
@@ -329,6 +352,8 @@ def walk_forward_optimize(
         print(f"  Optimizing: {optimize_metric}")
 
     window_results = []
+    funding_skipped_candidates = 0
+    funding_skipped_folds = 0
 
     for fold in range(n_splits):
         start_idx = fold * window_size
@@ -361,9 +386,13 @@ def walk_forward_optimize(
         best_params = None
         best_stack = None
         best_bt = None
+        fold_funding_rejects = 0
         for params in param_grid:
             try:
                 signals_ext = apply_strategy(strategy_name, train_ext_df, params)
+                if regime_label_plan:
+                    from regime_label_columns import overlay_regime_columns
+                    signals_ext = overlay_regime_columns(train_ext_df, signals_ext)
                 if uses_exits:
                     signals_ext = ensure_atr_indicator(signals_ext)
                 signals_df = signals_ext.iloc[train_boundary_idx:]
@@ -376,12 +405,18 @@ def walk_forward_optimize(
                 if verbose:
                     print(f"    [skip] fold {fold+1} {strategy_name} {params}: {type(e).__name__}: {e}")
                 continue
+            signals_ext = rejoin_funding_columns(signals_ext, train_ext_df)
+            signals_df = signals_ext.iloc[train_boundary_idx:]
             for stack, stack_bt in stack_bts:
                 try:
                     result = stack_bt.run(signals_df, strategy_name=strategy_name,
                                           symbol=symbol, timeframe=timeframe,
                                           params=params, save=False,
                                           starting_long=train_seed)
+                    if charge_funding_rejected(result):
+                        funding_skipped_candidates += 1
+                        fold_funding_rejects += 1
+                        continue
                     metric_val = _result_metric(result, optimize_metric)
                     if metric_val > best_metric:
                         best_metric = metric_val
@@ -397,13 +432,19 @@ def walk_forward_optimize(
                     continue
 
         if best_params is None:
+            if fold_funding_rejects > 0:
+                funding_skipped_folds += 1
             continue
 
         test_boundary_idx = max(test_trim - 1, 0)
         try:
             test_signals_ext = apply_strategy(strategy_name, test_ext_df, best_params)
+            if regime_label_plan:
+                from regime_label_columns import overlay_regime_columns
+                test_signals_ext = overlay_regime_columns(test_ext_df, test_signals_ext)
             if uses_exits:
                 test_signals_ext = ensure_atr_indicator(test_signals_ext)
+            test_signals_ext = rejoin_funding_columns(test_signals_ext, test_ext_df)
             test_signals = test_signals_ext.iloc[test_boundary_idx:]
             test_seed = warmup_exit_long_entry(
                 test_signals_ext.iloc[:test_boundary_idx], bt.slippage_pct,
@@ -412,6 +453,9 @@ def walk_forward_optimize(
                                       symbol=symbol, timeframe=timeframe,
                                       params=best_params, save=False,
                                       starting_long=test_seed)
+            if charge_funding_rejected(test_result):
+                funding_skipped_folds += 1
+                continue
         except CloseCapabilityError:
             raise
         except _EXPECTED_FOLD_ERRORS as e:
@@ -444,7 +488,18 @@ def walk_forward_optimize(
                   f"MaxDD: {test_result['max_drawdown_pct']:.2f}%")
 
     if not window_results:
-        return {"error": "No valid optimization windows", "strategy": strategy_name,
+        error = "No valid optimization windows"
+        if funding_skipped_folds > 0:
+            error = "No valid optimization windows: incomplete funding"
+        if verbose:
+            print(f"  {error}")
+            print(f"  Funding-skipped folds: {funding_skipped_folds}")
+            print(f"  Funding-skipped candidates: {funding_skipped_candidates}")
+        return {"error": error, "strategy": strategy_name,
+                "n_splits": n_splits,
+                "n_valid_folds": 0,
+                "funding_skipped_folds": funding_skipped_folds,
+                "funding_skipped_candidates": funding_skipped_candidates,
                 "close_validation": grid_validation,
                 "close_stack_validations": stack_validations}
 
@@ -463,6 +518,8 @@ def walk_forward_optimize(
         "strategy": strategy_name,
         "n_splits": n_splits,
         "n_valid_folds": len(window_results),
+        "funding_skipped_folds": funding_skipped_folds,
+        "funding_skipped_candidates": funding_skipped_candidates,
         "param_grid_size": len(param_grid),
         "close_stack_grid_size": len(stack_bts),
         "optimize_metric": optimize_metric,
@@ -484,6 +541,8 @@ def walk_forward_optimize(
         print(f"  WALK-FORWARD SUMMARY: {strategy_name}")
         print(f"{'='*60}")
         print(f"  Valid folds: {summary['n_valid_folds']}/{n_splits}")
+        print(f"  Funding-skipped folds: {summary['funding_skipped_folds']}")
+        print(f"  Funding-skipped candidates: {summary['funding_skipped_candidates']}")
         print(f"  OOS Mean Return: {summary['oos_mean_return']:+.2f}%")
         print(f"  OOS Median Return: {summary['oos_median_return']:+.2f}%")
         print(f"  OOS Return StdDev: {summary['oos_std_return']:.2f}%")
@@ -653,6 +712,10 @@ DEFAULT_PARAM_RANGES = {
         "oversold": [5.0, 10.0, 20.0],
         "overbought": [80.0, 90.0, 95.0],
     },
+    "fisher_reversal": {
+        "lookback": [5, 9, 13, 21],
+        "extreme": [0.75, 1.0, 1.5, 2.0],
+    },
     "vortex_trend": {
         "period": [7, 14, 21, 28],
         "min_separation": [0.0, 0.02, 0.05, 0.10],
@@ -664,6 +727,29 @@ DEFAULT_PARAM_RANGES = {
     "awesome_oscillator": {
         "fast_period": [3, 5, 8, 13],
         "slow_period": [21, 34, 55, 89],
+    },
+    "on_balance_volume_divergence": {
+        "left_span": [2, 3, 5],
+        "right_span": [2, 3, 5],
+        "min_separation": [3, 5, 8],
+        "max_separation": [20, 40, 60],
+        "volume_threshold": [0.0, 0.05, 0.10, 0.20],
+        "setup_expiry": [6, 12, 24],
+        "volume_test": [True],
+    },
+    "williams_r_reversal": {
+        "lookback": [7, 14, 21, 28],
+        "oversold": [-90.0, -80.0, -70.0],
+        "overbought": [-30.0, -20.0, -10.0],
+    },
+    "money_flow_index_reversal": {
+        "lookback": [7, 14, 28, 56],
+        "oversold": [10.0, 20.0, 30.0],
+        "overbought": [70.0, 80.0, 90.0],
+    },
+    "ease_of_movement_breakout": {
+        "eom_period": [7, 14, 21, 28],
+        "breakout_window": [10, 20, 40, 60],
     },
     "analog_retrieval": {
         "horizon": [6, 12, 24],

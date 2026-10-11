@@ -7,6 +7,7 @@ import itertools
 import json
 import math
 import os
+import re
 import sys
 import traceback
 from typing import Optional
@@ -21,9 +22,11 @@ import numpy as np
 import pandas as pd
 
 import offline_manifest as om
+from regime_context import SIZING_REASON_CODES, configuration_sha256, resolve_regime_context
 from backtester import (
     COMPARISON_MODE_APPROXIMATE,
     COMPARISON_MODE_STRICT,
+    FILL_COST_MODEL_VERSION,
     LEDGER_EVENTS_SCHEMA,
     LEDGER_EVENTS_SCHEMA_VERSION,
     STOP_FIELD_KEYS,
@@ -36,7 +39,11 @@ from backtester import (
     Backtester,
     CapabilityContext,
     CloseCapabilityError,
+    PAPER_FILL_COST_MODELS,
+    RESTING_TP_TIER_CLOSES,
+    RESTING_TP_UNSUPPORTED_CLOSE,
     _apply_direction_invert_value,
+    _ensure_close_strategies_path,
     _close_fraction_columns,
     _finite_number,
     _normalize_open_action,
@@ -49,11 +56,11 @@ from backtester import (
 )
 
 REPORT_SCHEMA = "go-trader.ledger-reconciliation-report"
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 INPUT_SCHEMA = "go-trader.ledger-comparison-input"
-SUPPORTED_INPUT_VERSIONS = (1, 2)
+SUPPORTED_INPUT_VERSIONS = (1, 2, 3, 4)
 EXPORT_SCHEMA = "go-trader.booked-ledger"
-SUPPORTED_EXPORT_VERSIONS = (1,)
+SUPPORTED_EXPORT_VERSIONS = (1, 2)
 EXIT_STRICT_SUCCESS = 0
 EXIT_NOT_STRICT = 1
 EXIT_INPUT_ERROR = 2
@@ -73,6 +80,27 @@ EVENT_EVIDENCE_FIELDS = (
     "manual", "row_net_pnl", "ledger_delta", "event_kind", "close_reason", "close_extent",
     "position_allocation", "entry_atr", "stop_loss_atr_mult", "stop_loss_trigger_px",
     "stop_loss_oid", "tp_oids_json", "tp_tiers_json",
+)
+EVENT_EVIDENCE_FIELDS_V2 = EVENT_EVIDENCE_FIELDS + ("cost_model_version",)
+PAPER_COST_MODEL_KIND = "paper_fill_cost_model"
+PAPER_COST_MODEL_FROZEN_FROM = {
+    "taker_fee_pct": "fees.go HyperliquidTakerFeePct",
+    "tier_fee_pct": "fees.go HyperliquidTakerFeePct (tier fills pay taker in this version)",
+    "slippage_pct": "fees.go SlippagePct",
+}
+HL_TIER_FEE_RULE = (
+    "issue 1726 evidence (operator-reported check of the 2026-10-06 live capture, not verifiable from "
+    "the repository) did not classify live Hyperliquid take-profit tier fills as maker, so paper and "
+    "the backtester without a maker rate charge taker on tier fills; this live comparison charges the "
+    "manifest maker_fee_pct on simulated tier fills, which a Hyperliquid comparison manifest must set "
+    "equal to taker_fee_pct to match the evidence (the committed fixture manifests are frozen at a lower "
+    "maker rate and do not meet this rule yet), so maker_equals_taker false means the simulated tier "
+    "fees differ from what the evidence supports; this check is informational and never refuses: "
+    "https://github.com/richkuo/go-trader/issues/1726#issuecomment-6055361624"
+)
+PAPER_COST_UNAPPROXIMABLE_REASONS = (
+    "paper_cost_model_partition_unknown", "paper_cost_model_mode_disagrees", "paper_cost_model_mixed",
+    "paper_cost_model_unknown",
 )
 EXPORT_SECTIONS = (
     "schema", "schema_version", "inspected_revision", "capture_manifest_sha256", "time_basis",
@@ -120,7 +148,7 @@ PORTFOLIO_CONTROL_FIELDS = (
 )
 REGIME_FIELDS = (
     "allowed_regimes", "regime_gate_on_failure", "regime_gate_window",
-    "regime_directional_window", "regime_directional_policy", "regime_window_divergence",
+    "regime_directional_window", "regime_atr_window", "regime_directional_policy", "regime_window_divergence",
     "regime_profile_allocation",
 )
 UNSUPPORTED_FEATURE_FIELDS = {
@@ -131,9 +159,7 @@ UNSUPPORTED_FEATURE_FIELDS = {
     "replay_source_id": "replay_mirror",
     "theta_harvest": "options",
     "futures": "futures_contract",
-    "margin_per_trade_usd": "sizing",
     "capital_pct": "sizing",
-    "risk_per_trade_pct": "sizing",
 }
 INFORMATIONAL_FIELDS = {
     "id": "identity",
@@ -153,6 +179,20 @@ INFORMATIONAL_FIELDS = {
 
 DECISION_TIMING_CLOSED_BAR = "closed_bar"
 DECISION_TIMING_LEGACY = "legacy_runtime"
+
+RESTING_RULE_INPUT_KEYS = ("enabled", "k_ticks", "source")
+RESTING_RULE_INPUT_VERSION = 4
+RESTING_RULE_PROVENANCE = "structural_floor"
+RESTING_TIER_CLOSE_REASONS = tuple(RESTING_TP_TIER_CLOSES) + (RESTING_TP_UNSUPPORTED_CLOSE,)
+RESTING_REPLAY_FIELDS = ("replay_sharing", "replay_source_id")
+RESTING_HL_SYNC_TP_REASON = re.compile(r"^hl_sync_tp[0-9]+_fill$")
+RESTING_POSSIBLE_TIER_REASONS = ("signal",)
+RESTING_FILL_PARITY_SCOPE = (
+    "agreement is claimed only for tier closes on frames where no armed stop is reached, under ohlc_walk; stop "
+    "closes are not claimed equal; an intrabar tier close matches a booked record time inside its bar plus the "
+    "time tolerance, so a booked touch fill recorded inside the next bar's window cannot be told apart from a "
+    "trade-through in that bar; that window is unchanged by the rule"
+)
 
 
 class LedgerInputError(ValueError):
@@ -180,6 +220,82 @@ def resolve_decision_timing(strategy: dict) -> dict:
             "basis": "closed_bar_decisions is off or omitted, so live checks may have decided on a forming bar",
             "limitation": "a closed-bar simulation cannot establish historical forming-bar decision parity without "
                           "recorded decision evidence; this diagnostic never implies verified input parity"}
+
+
+def _resting_rule_floor_ticks() -> int:
+    _ensure_close_strategies_path()
+    from _helpers import RESTING_TP_TRADE_THROUGH_TICKS
+    return int(RESTING_TP_TRADE_THROUGH_TICKS)
+
+
+def _close_ref_names(refs) -> list:
+    names = []
+    for ref in refs or []:
+        if isinstance(ref, dict):
+            name = ref.get("name")
+        else:
+            name = ref
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def resolve_resting_rule(strategy: dict, close_names, input_rule: Optional[dict]) -> dict:
+    floor = _resting_rule_floor_ticks()
+    names = list(close_names or [])
+    live = _args_are_live(strategy.get("args"))
+    flag_present = "resting_tp_trade_through" in strategy
+    flag_value = strategy.get("resting_tp_trade_through") if flag_present else None
+    out = {
+        "status": "off", "enabled": False, "source": None, "k_ticks": floor,
+        "provenance": RESTING_RULE_PROVENANCE, "mode": "live" if live else "paper",
+        "flag_present": flag_present, "flag_value": flag_value,
+        "input": copy.deepcopy(input_rule),
+        "tier_strategy": any(name in RESTING_TIER_CLOSE_REASONS for name in names),
+        "close_names": names, "refusal": None,
+    }
+
+    def refuse(code: str, detail: str) -> dict:
+        out.update(status="refused", enabled=False, refusal={"reason_code": code, "detail": detail})
+        return out
+
+    if flag_present and not isinstance(flag_value, bool):
+        return refuse("resting_rule_flag_invalid",
+                      f"resting_tp_trade_through must be a JSON boolean, got {flag_value!r}")
+    if live:
+        if flag_value is True:
+            return refuse("resting_rule_live_flag",
+                          "a live strategy refuses resting_tp_trade_through at config load; the venue decides "
+                          "live take-profit fills, so the comparison input names the rule")
+        out["source"] = "comparison_input" if input_rule is not None else "default_off"
+        enabled = bool(input_rule["enabled"]) if input_rule is not None else False
+    else:
+        out["source"] = "paper_strategy_flag"
+        enabled = flag_value is True
+    if input_rule is not None and input_rule["k_ticks"] != floor:
+        return refuse("resting_rule_k_unsupported",
+                      f"resting_tp_rule.k_ticks {input_rule['k_ticks']!r} is not the structural floor {floor}; "
+                      "a different threshold needs a recorded measurement")
+    if not live and input_rule is not None and bool(input_rule["enabled"]) != enabled:
+        return refuse("resting_rule_conflict",
+                      f"resting_tp_rule.enabled {input_rule['enabled']!r} disagrees with the paper strategy's "
+                      f"own resting_tp_trade_through {flag_value!r}")
+    if enabled:
+        why = None
+        if str(strategy.get("platform") or "").strip().lower() != "hyperliquid" or strategy.get("type") != "perps":
+            why = "the rule models Hyperliquid perps resting take-profit limits only"
+        elif RESTING_TP_UNSUPPORTED_CLOSE in names:
+            why = f"the rule does not support {RESTING_TP_UNSUPPORTED_CLOSE} (a Hyperliquid live-only close)"
+        elif not any(name in RESTING_TP_TIER_CLOSES for name in names):
+            why = f"the rule needs a tier close ({', '.join(RESTING_TP_TIER_CLOSES)}); close refs are {names}"
+        elif strategy.get("allow_scale_in"):
+            why = "the rule does not model scale-in adds; the tier geometry must stay frozen"
+        elif any(_active(strategy.get(field)) for field in RESTING_REPLAY_FIELDS):
+            why = "a replay-mirror strategy books live take-profit closes at the live tier price"
+        if why is not None:
+            return refuse("resting_rule_ineligible", why)
+        out.update(status="enabled", enabled=True)
+    return out
 
 
 def _sha256(data: bytes) -> str:
@@ -253,13 +369,33 @@ def _validate_evidence(ev, label: str) -> None:
         raise LedgerInputError(f"{label}.provenance is not a list")
 
 
+def event_evidence_fields(doc) -> tuple:
+    return EVENT_EVIDENCE_FIELDS_V2 if doc["schema_version"] >= 2 else EVENT_EVIDENCE_FIELDS
+
+
+def _is_strict_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _validate_cost_model_version(ev: dict, label: str) -> None:
+    if ev["status"] == "available":
+        if not _is_strict_int(ev["value"]) or ev["value"] < 1:
+            raise LedgerInputError(f"{label} is available but its value {ev['value']!r} is not an integer >= 1")
+    elif ev["status"] != "unavailable":
+        raise LedgerInputError(f"{label} status {ev['status']!r} is not available or unavailable")
+    raw = ev["raw_value"]
+    if raw is not None and (not _is_strict_int(raw) or raw < 0):
+        raise LedgerInputError(f"{label}.raw_value {raw!r} is not a non-negative integer")
+
+
 def validate_export(doc) -> None:
     if not isinstance(doc, dict):
         raise LedgerInputError("export is not a JSON object")
     missing = [k for k in EXPORT_SECTIONS if k not in doc]
     if missing:
         raise LedgerInputError(f"export lacks sections {missing}")
-    if doc["schema"] != EXPORT_SCHEMA or doc["schema_version"] not in SUPPORTED_EXPORT_VERSIONS:
+    if (doc["schema"] != EXPORT_SCHEMA or isinstance(doc["schema_version"], bool)
+            or doc["schema_version"] not in SUPPORTED_EXPORT_VERSIONS):
         raise LedgerInputError(
             f"export is {doc['schema']!r} version {doc['schema_version']!r}; this comparison reads "
             f"{EXPORT_SCHEMA!r} versions {list(SUPPORTED_EXPORT_VERSIONS)}")
@@ -287,8 +423,10 @@ def validate_export(doc) -> None:
             if ev.get(field) != sel[field]:
                 raise LedgerInputError(f"{key} {field} {ev.get(field)!r} disagrees with the selection")
         _utc(ev.get("timestamp"), f"{key}.timestamp")
-        for field in EVENT_EVIDENCE_FIELDS:
+        for field in event_evidence_fields(doc):
             _validate_evidence(ev.get(field), f"{key}.{field}")
+        if doc["schema_version"] >= 2:
+            _validate_cost_model_version(ev["cost_model_version"], f"{key}.cost_model_version")
         for field in ("quantity", "price", "value", "exchange_fee", "realized_pnl", "row_net_pnl", "ledger_delta"):
             v = ev[field]["value"]
             if v is not None and not _is_number(v):
@@ -399,8 +537,24 @@ def validate_comparison_input(doc, base_dir: str) -> dict:
         if version < 2:
             raise LedgerInputError("initial_stop_geometry_evidence needs comparison input version 2")
         _validate_geometry_evidence(geometry)
+    if "resting_tp_rule" in doc:
+        if version < RESTING_RULE_INPUT_VERSION:
+            raise LedgerInputError(
+                f"resting_tp_rule needs comparison input version {RESTING_RULE_INPUT_VERSION}")
+        _validate_resting_rule_input(doc["resting_tp_rule"])
     return {"manifest_path": manifest_path, "start": start, "end": end, "tolerances": tolerances,
             "input_version": version}
+
+
+def _validate_resting_rule_input(rule) -> None:
+    if not isinstance(rule, dict) or set(rule) != set(RESTING_RULE_INPUT_KEYS):
+        raise LedgerInputError(f"resting_tp_rule must be an object with exactly the keys {list(RESTING_RULE_INPUT_KEYS)}")
+    if not isinstance(rule["enabled"], bool):
+        raise LedgerInputError("resting_tp_rule.enabled must be a JSON boolean")
+    if not _is_strict_int(rule["k_ticks"]):
+        raise LedgerInputError("resting_tp_rule.k_ticks must be an integer")
+    if not isinstance(rule["source"], str) or not rule["source"].strip():
+        raise LedgerInputError("resting_tp_rule.source must be a non-empty string")
 
 
 def _validate_provenance(entry, label: str, presence: bool) -> None:
@@ -612,7 +766,7 @@ def normalize_booked(doc: dict, start: pd.Timestamp, end: pd.Timestamp, coin: st
     records.sort(key=lambda r: (r["ts"], r["event_key"]))
     field_evidence = {}
     for ev in doc["events"]:
-        for field in EVENT_EVIDENCE_FIELDS:
+        for field in event_evidence_fields(doc):
             item = ev[field]
             label = item["status"] if item["reason"] is None else f"{item['status']}:{item['reason']}"
             counts = field_evidence.setdefault(field, {})
@@ -1228,24 +1382,237 @@ def _stop_rows(verdict: dict, strategy: dict) -> list:
     return rows
 
 
+def _args_are_live(args) -> bool:
+    if not isinstance(args, list):
+        return False
+    for i, arg in enumerate(args):
+        if arg == "--mode=live":
+            return True
+        if arg == "--mode" and i + 1 < len(args) and args[i + 1] == "live":
+            return True
+    return False
+
+
+def _is_paper_partition(partition) -> bool:
+    return partition == "paper" or (isinstance(partition, str) and partition.startswith("paper:")
+                                    and len(partition) > len("paper:"))
+
+
+def _booked_row_cost_model_version(doc: dict, ev: dict) -> int:
+    if doc["schema_version"] < 2:
+        return 0
+    item = ev["cost_model_version"]
+    return int(item["value"]) if item["status"] == "available" else 0
+
+
+def resolve_comparison_cost_model(doc: dict, start: pd.Timestamp, end: pd.Timestamp, strategy: dict,
+                                  mode: str) -> dict:
+    partition = doc["selection"]["partition"]
+    live_args = _args_are_live(strategy.get("args"))
+    out = {"partition": partition, "refusals": [], "approximations": [], "paper": None}
+    if partition == "live":
+        if not live_args:
+            out["refusals"].append({"reason": "paper_cost_model_mode_disagrees",
+                                    "detail": "the export is the live partition but the strategy args are not live"})
+        return out
+    if not _is_paper_partition(partition):
+        out["refusals"].append({"reason": "paper_cost_model_partition_unknown",
+                                "detail": f"partition {partition!r} is neither live, paper nor paper:<id>"})
+        return out
+    if live_args:
+        out["refusals"].append({"reason": "paper_cost_model_mode_disagrees",
+                                "detail": f"the export is the {partition!r} partition but the strategy args are live"})
+        return out
+    versions = set()
+    for ev in doc["events"]:
+        ts = _utc(ev["timestamp"], ev["event_key"])
+        if not (start <= ts < end):
+            continue
+        if _ev(ev, "event_kind") not in ("non_close", "scale_in", "close"):
+            continue
+        versions.add(_booked_row_cost_model_version(doc, ev))
+    if not versions:
+        version, source = FILL_COST_MODEL_VERSION, "no_in_interval_fills"
+    elif len(versions) > 1:
+        out["refusals"].append({"reason": "paper_cost_model_mixed", "versions": sorted(versions),
+                                "detail": "in-interval paper fills were booked by different paper cost model "
+                                          "versions; one model cannot reproduce them all"})
+        return out
+    else:
+        version = next(iter(versions))
+        source = "booked_rows" if doc["schema_version"] >= 2 else "export_version_1_rows_read_as_0"
+    entry = PAPER_FILL_COST_MODELS.get(version)
+    if entry is None:
+        out["refusals"].append({"reason": "paper_cost_model_unknown", "version": version,
+                                "detail": f"paper cost model version {version} has no PAPER_FILL_COST_MODELS entry"})
+        return out
+    slippage = entry["slippage_pct"]
+    if not entry["price_reproducible"]:
+        if mode == COMPARISON_MODE_STRICT:
+            out["refusals"].append({"reason": "paper_cost_model_not_reproducible", "version": version,
+                                    "detail": f"paper cost model version {version} booked random slippage; "
+                                              "its fill prices cannot be reproduced"})
+            return out
+        out["approximations"].append({"feature": "paper_cost_model", "category": "execution_cost",
+                                      "assumption": f"paper cost model version {version} booked random "
+                                                    "slippage; the simulation uses zero slippage",
+                                      "effect": "paper fill prices are not reproducible"})
+        slippage = 0.0
+    src = f"PAPER_FILL_COST_MODELS[{version}]"
+    values = {
+        "taker_fee_pct": {"value": entry["taker_fee_pct"],
+                          "source": f"{src} (frozen from {PAPER_COST_MODEL_FROZEN_FROM['taker_fee_pct']})"},
+        "tier_fee_pct": {"value": entry["tier_fee_pct"],
+                         "source": f"{src} (frozen from {PAPER_COST_MODEL_FROZEN_FROM['tier_fee_pct']})"},
+        "slippage_pct": {"value": slippage,
+                         "source": (f"{src} (frozen from {PAPER_COST_MODEL_FROZEN_FROM['slippage_pct']})"
+                                    if entry["price_reproducible"] else
+                                    f"{src} has no reproducible slippage; approximate mode substitutes 0")},
+        "half_spread_pct": {"value": 0.0, "source": "paper books no spread"},
+    }
+    out["paper"] = {"version": version, "version_source": source, "values": values}
+    return out
+
+
+def _comparison_mode_name(args) -> str:
+    if not isinstance(args, list):
+        return ""
+    for i, arg in enumerate(args):
+        text = str(arg)
+        if text.startswith("--mode="):
+            return text.split("=", 1)[1]
+        if text == "--mode" and i + 1 < len(args):
+            return str(args[i + 1])
+    return ""
+
+
+def _pool_needs_evidence(strategy: dict) -> bool:
+    margin = strategy.get("margin_per_trade_usd")
+    if not _is_number(margin) or margin <= 0:
+        return False
+    capital = strategy.get("capital")
+    pct = strategy.get("capital_pct")
+    has_capital = _is_number(capital) and capital != 0
+    has_pct = _is_number(pct) and pct != 0
+    return not has_capital and not has_pct
+
+
+def _sizing_budget_reason(strategy: dict, evidence: dict, version: int):
+    if not _pool_needs_evidence(strategy):
+        return None
+    if version < 3:
+        return "sizing_evidence_unavailable"
+    budget = evidence.get("sizing_budget") if isinstance(evidence, dict) else None
+    if not isinstance(budget, dict) or budget.get("status") != "available":
+        return "sizing_evidence_unavailable"
+    margin = float(strategy["margin_per_trade_usd"])
+    entries = budget.get("entries")
+    if isinstance(entries, list) and entries:
+        for entry in entries:
+            avail = entry.get("available_margin_usd") if isinstance(entry, dict) else None
+            if not _is_number(avail) or avail < margin:
+                return "pool_margin_cap_bound"
+        return None
+    avail = budget.get("available_margin_usd")
+    if _is_number(avail):
+        return None if avail >= margin else "pool_margin_cap_bound"
+    if budget.get("covers_budget") is True:
+        return None
+    return "sizing_evidence_unavailable"
+
+
+def _liquidation_refusal(strategy: dict, evidence: dict, market: dict, version: int):
+    lev = strategy.get("leverage")
+    if not _is_number(lev) or lev <= 1:
+        return None
+    if str(strategy.get("margin_mode") or "isolated").strip().lower() == "cross":
+        return "cross_margin_unmodeled"
+    if _comparison_mode_name(strategy.get("args")) == "paper":
+        return None
+    if not market.get("venue_margin"):
+        return "venue_margin_missing"
+    if version < 3:
+        return "liquidation_formula_unverified"
+    peers = evidence.get("shared_coin_peers") if isinstance(evidence, dict) else None
+    if (not isinstance(peers, dict) or peers.get("status") != "available"
+            or peers.get("peers_held_coin") is not False):
+        return "shared_coin_liquidation_unmodeled"
+    venue = market.get("venue_margin") or {}
+    liq = evidence.get("liquidation") if isinstance(evidence, dict) else None
+    if not venue.get("formula_verified") or not isinstance(liq, dict) or liq.get("formula_checked") is not True:
+        return "liquidation_formula_unverified"
+    if liq.get("trigger_source") != "mark":
+        return "liquidation_settlement_unverified"
+    for key in ("isolated_collateral", "fees", "funding", "margin_changes", "gap_settlement"):
+        if liq.get(key) != "verified":
+            return "liquidation_settlement_unverified"
+    if liq.get("partial_liquidation") not in ("verified", "not_applicable"):
+        return "liquidation_partial_unmodeled"
+    if liq.get("margin_tier") != "verified":
+        return "margin_tier_unmodeled"
+    return None
+
+
+def _comparison_perps_sizing(strategy: dict, evidence: dict, version: int):
+    if strategy.get("type") != "perps":
+        return None
+    platform = strategy.get("platform")
+    if platform not in (None, "", "hyperliquid"):
+        return None
+    exchange = float(strategy["leverage"]) if _is_number(strategy.get("leverage")) and strategy["leverage"] > 0 else 1.0
+    sizing_set = _is_number(strategy.get("sizing_leverage")) and strategy["sizing_leverage"] > 0
+    sizing = float(strategy["sizing_leverage"]) if sizing_set else exchange
+    margin = (float(strategy["margin_per_trade_usd"])
+              if _is_number(strategy.get("margin_per_trade_usd")) and strategy["margin_per_trade_usd"] > 0 else None)
+    risk = _is_number(strategy.get("risk_per_trade_pct")) and strategy["risk_per_trade_pct"] > 0
+    if margin is None and not risk and not (sizing_set and sizing != 1) and exchange <= 1:
+        return None
+    budget = "shared_wallet_pool" if _pool_needs_evidence(strategy) else "strategy_cash"
+    raw = {
+        "exchange_leverage": exchange,
+        "sizing_leverage": sizing,
+        "margin_per_trade_usd": margin,
+        "margin_mode": str(strategy.get("margin_mode") or "isolated").strip().lower() or "isolated",
+        "budget_source": budget,
+        "pool_evidence": "verified",
+        "provenance": "ledger_compare",
+    }
+    if budget == "shared_wallet_pool" and version >= 3 and isinstance(evidence, dict):
+        block = evidence.get("sizing_budget") or {}
+        avail = block.get("available_margin_usd")
+        entries = block.get("entries")
+        if not _is_number(avail) and isinstance(entries, list) and entries:
+            values = [e.get("available_margin_usd") for e in entries if isinstance(e, dict)]
+            if values and all(_is_number(v) for v in values):
+                avail = min(values)
+        if _is_number(avail):
+            raw["pool_available_margin"] = float(avail)
+    from backtester import normalize_perps_sizing
+    return normalize_perps_sizing(raw, exchange)
+
+
 def capability_matrix(seg: dict, capability_evidence: dict, market: dict, stop_verdict: dict,
-                      atr_verdict: Optional[dict] = None) -> list:
+                      atr_verdict: Optional[dict] = None, regime_context: Optional[dict] = None,
+                      input_version: int = 2, resting_rule: Optional[dict] = None) -> list:
     strategy = seg.get("strategy") or {}
     regime = seg.get("regime") or {}
     risk = seg.get("portfolio_risk") or {}
     controls_verified = _evidence_verified(capability_evidence.get("portfolio_controls"))
     rows = []
 
-    def row(field, category, value, decision, reason, approximable=False):
+    def row(field, category, value, decision, reason, approximable=False, reason_code=None):
         if field.startswith("regime."):
             present = field[len("regime."):] in regime
         elif field.startswith("portfolio_risk."):
             present = field[len("portfolio_risk."):] in risk
         else:
             present = field in strategy
-        rows.append({"field": field, "category": category, "present": present,
-                     "value": value, "active": decision not in ("inactive", "informational"),
-                     "decision": decision, "reason": reason, "approximable": approximable})
+        item = {"field": field, "category": category, "present": present,
+                "value": value, "active": decision not in ("inactive", "informational"),
+                "decision": decision, "reason": reason, "approximable": approximable}
+        if reason_code:
+            item["reason_code"] = reason_code
+        rows.append(item)
 
     handled = set()
     stype = strategy.get("type")
@@ -1310,20 +1677,77 @@ def capability_matrix(seg: dict, capability_evidence: dict, market: dict, stop_v
     else:
         row("atr_method", "signal_model", atr_verdict["method"], "unverified",
             "; ".join(r["detail"] for r in atr_verdict["refusals"]))
-    for field in ("leverage", "sizing_leverage"):
+    for field, category, inactive_reason in (
+        ("leverage", "margin_liquidation", "exchange leverage at or below 1 has no liquidation effect"),
+        ("sizing_leverage", "sizing", "sizing leverage is not configured"),
+    ):
         handled.add(field)
         v = strategy.get(field)
+        if field == "sizing_leverage":
+            if v is None:
+                row(field, category, v, "inactive", inactive_reason)
+            elif not _is_number(v) or isinstance(v, bool) or v <= 0 or v > 100:
+                row(field, category, v, "refused", "sizing_leverage must be a number in (0, 100]")
+            else:
+                row(field, category, v, "modeled",
+                    "sizing leverage changes open notional, including values below 1")
+            continue
         if v is None or (_is_number(v) and v <= 1):
-            row(field, "margin_liquidation" if field == "leverage" else "sizing", v, "inactive",
-                "leverage at or below 1 has no margin, liquidation or sizing effect")
+            row(field, category, v, "inactive", inactive_reason)
+            continue
+        refusal = _liquidation_refusal(strategy, capability_evidence, market, input_version)
+        if refusal:
+            row(field, category, v, "refused", refusal)
+        elif _comparison_mode_name(strategy.get("args")) == "paper":
+            row(field, category, v, "modeled",
+                "exchange leverage sizes the margin budget; paper does not book a venue liquidation")
         else:
-            row(field, "margin_liquidation" if field == "leverage" else "sizing", v, "refused",
-                "the simulator does not model leverage, margin or liquidation")
+            row(field, category, v, "modeled",
+                "isolated liquidation inputs are present, including a formula checked against a recorded liquidation")
+    if (_is_number(strategy.get("leverage")) and strategy.get("leverage") > 1
+            and _comparison_mode_name(strategy.get("args")) == "paper"
+            and market.get("venue_margin")):
+        handled.add("paper_liquidation_crossing")
+        row("paper_liquidation_crossing", "margin_liquidation", None, "informational",
+            "venue margin can price a crossing; paper does not book a venue liquidation")
+    handled.add("margin_per_trade_usd")
+    margin_budget = strategy.get("margin_per_trade_usd")
+    if not _active(margin_budget):
+        row("margin_per_trade_usd", "sizing", margin_budget, "inactive", "no margin budget")
+    else:
+        pool_reason = _sizing_budget_reason(strategy, capability_evidence, input_version)
+        if pool_reason:
+            row("margin_per_trade_usd", "sizing", margin_budget, "refused", pool_reason)
+        elif _pool_needs_evidence(strategy):
+            row("margin_per_trade_usd", "sizing", margin_budget, "modeled",
+                "per-entry available wallet margin covers the configured budget")
+        else:
+            row("margin_per_trade_usd", "sizing", margin_budget, "modeled",
+                "strategy cash caps the margin budget; notional is min(margin, sizing cash) times exchange leverage")
+    handled.add("risk_per_trade_pct")
+    risk_pct = strategy.get("risk_per_trade_pct")
+    if not _active(risk_pct):
+        row("risk_per_trade_pct", "sizing", risk_pct, "inactive", "risk sizing is not configured")
+    elif stop_verdict.get("status") != "modeled":
+        row("risk_per_trade_pct", "sizing", risk_pct, "refused",
+            "risk sizing needs a verified stop distance and is capped at cash times exchange leverage")
+    else:
+        row("risk_per_trade_pct", "sizing", risk_pct, "modeled",
+            "risk notional uses the verified stop distance and is capped at cash times exchange leverage")
     handled.add("margin_mode")
     lev = strategy.get("leverage")
-    row("margin_mode", "margin_liquidation", strategy.get("margin_mode"),
-        "inactive" if lev is None or (_is_number(lev) and lev <= 1) else "refused",
-        "margin mode matters only with leverage above 1")
+    mode_name = strategy.get("margin_mode")
+    if lev is None or (_is_number(lev) and lev <= 1):
+        row("margin_mode", "margin_liquidation", mode_name, "inactive",
+            "margin mode matters only with leverage above 1")
+    elif str(mode_name or "isolated").strip().lower() == "cross":
+        row("margin_mode", "margin_liquidation", mode_name, "refused", "cross_margin_unmodeled")
+    else:
+        liq_reason = _liquidation_refusal(strategy, capability_evidence, market, input_version)
+        if liq_reason and _comparison_mode_name(strategy.get("args")) != "paper":
+            row("margin_mode", "margin_liquidation", mode_name, "refused", liq_reason)
+        else:
+            row("margin_mode", "margin_liquidation", mode_name, "modeled", "isolated margin")
     handled.update(STOP_ROLE_FIELDS)
     rows.extend(_stop_rows(stop_verdict, strategy))
     handled.update(("allow_scale_in", "scale_in"))
@@ -1359,17 +1783,47 @@ def capability_matrix(seg: dict, capability_evidence: dict, market: dict, stop_v
     else:
         row("closed_bar_decisions", "decision_timing", timing["value"], "informational",
             f"{timing['basis']}; {timing['limitation']}")
-    for field in REGIME_FIELDS:
-        handled.add(field)
-        v = strategy.get(field)
-        row(field, "regime", v, "refused" if _active(v) else "inactive",
-            "regime gating is not modeled by this comparison" if _active(v) else "not configured")
+    handled.add("resting_tp_trade_through")
+    if resting_rule is None:
+        close_ref = strategy.get("close_strategy")
+        resting_rule = resolve_resting_rule(strategy, _close_ref_names([close_ref] if close_ref else []), None)
+    rule_value = {"enabled": resting_rule["enabled"], "source": resting_rule["source"],
+                  "k_ticks": resting_rule["k_ticks"], "provenance": resting_rule["provenance"],
+                  "flag_value": resting_rule["flag_value"]}
+    if resting_rule["status"] == "refused":
+        row("resting_tp_trade_through", "take_profit_fill_model", rule_value, "refused",
+            resting_rule["refusal"]["detail"], reason_code=resting_rule["refusal"]["reason_code"])
+    elif resting_rule["enabled"]:
+        row("resting_tp_trade_through", "take_profit_fill_model", rule_value, "modeled",
+            f"one-tick trade-through on adapter-rounded limits; source {resting_rule['source']}")
+    elif resting_rule["tier_strategy"]:
+        row("resting_tp_trade_through", "take_profit_fill_model", rule_value, "informational",
+            f"rule off (source {resting_rule['source']}): simulated tier closes are resting_fill_unverified, "
+            "so a tier close on either side refuses strict success")
+    else:
+        row("resting_tp_trade_through", "take_profit_fill_model", rule_value, "inactive",
+            f"no tier close evaluator (source {resting_rule['source']})")
+    regime_rows = (regime_context or {}).get("rows") or []
+    for item in regime_rows:
+        handled.add(item["field"])
+        rows.append(item)
+    if not regime_rows:
+        for field in REGIME_FIELDS:
+            handled.add(field)
+            v = strategy.get(field)
+            row(field, "regime", v, "refused" if _active(v) else "inactive",
+                "regime gating is not modeled by this comparison" if _active(v) else "not configured",
+                reason_code="regime_unresolved")
     for field, category in UNSUPPORTED_FEATURE_FIELDS.items():
         handled.add(field)
         v = strategy.get(field)
         enabled = v.get("enabled", True) if isinstance(v, dict) and field == "hurst_gate" else _active(v)
-        row(field, category, v, "refused" if enabled and _active(v) else "inactive",
-            f"{category} is not modeled" if enabled and _active(v) else "not configured")
+        sizing = SIZING_REASON_CODES.get(field)
+        if sizing and enabled and _active(v):
+            row(field, category, v, "refused", sizing[1], reason_code=sizing[0])
+        else:
+            row(field, category, v, "refused" if enabled and _active(v) else "inactive",
+                f"{category} is not modeled" if enabled and _active(v) else "not configured")
     for field, category in INFORMATIONAL_FIELDS.items():
         handled.add(field)
         if field in strategy:
@@ -1378,23 +1832,29 @@ def capability_matrix(seg: dict, capability_evidence: dict, market: dict, stop_v
         v = strategy[field]
         row(field, "unknown", v, "refused" if _active(v) else "inactive",
             "unknown active field: unknown behavior prevents strict eligibility" if _active(v) else "unknown field, inactive")
-    needs_labels = bool(stop_verdict.get("needs_labels"))
-    if not regime.get("enabled"):
-        row("regime.enabled", "regime", regime.get("enabled"), "inactive", "regime disabled")
-    elif needs_labels:
-        row("regime.enabled", "regime", True, "modeled",
-            "label input only: the primary-window classification supplies the regime-owned stop label; "
-            "no entry gating is added")
-    else:
-        row("regime.enabled", "regime", True, "refused",
-            "regime classification is modeled only as the label input of a regime-owned stop")
-    timeframe = str(regime.get("timeframe") or "").strip().lower()
-    if timeframe:
-        differs = timeframe != str(market.get("interval") or "").strip().lower()
-        row("regime.timeframe", "regime", regime.get("timeframe"),
-            "refused" if differs and needs_labels else "informational",
-            "regime labels from another timeframe are not prepared by the frozen comparison"
-            if differs and needs_labels else "labels come from the frozen dataset interval")
+    if not any(item["field"] == "regime.enabled" for item in rows):
+        needs_labels = bool(stop_verdict.get("needs_labels"))
+        if not regime.get("enabled"):
+            row("regime.enabled", "regime", regime.get("enabled"), "inactive", "regime disabled",
+                reason_code="regime_enabled_inactive")
+        elif needs_labels:
+            row("regime.enabled", "regime", True, "modeled",
+                "label input only: the primary-window classification supplies the regime-owned stop label; "
+                "no entry gating is added", reason_code="regime_enabled_modeled")
+        else:
+            row("regime.enabled", "regime", True, "refused",
+                "regime classification is modeled only as the label input of a regime-owned stop",
+                reason_code="regime_enabled_unmodeled")
+    if not any(item["field"] == "regime.timeframe" for item in rows):
+        timeframe = str(regime.get("timeframe") or "").strip().lower()
+        needs_labels = bool(stop_verdict.get("needs_labels"))
+        if timeframe:
+            differs = timeframe != str(market.get("interval") or "").strip().lower()
+            row("regime.timeframe", "regime", regime.get("timeframe"),
+                "refused" if differs and needs_labels else "informational",
+                "regime labels from another timeframe are not prepared by the frozen comparison"
+                if differs and needs_labels else "labels come from the frozen dataset interval",
+                reason_code="regime_timeframe_unprepared" if differs and needs_labels else "regime_timeframe_matches")
     for field in sorted(risk):
         v = risk[field]
         if field == "warn_threshold_pct":
@@ -1423,6 +1883,44 @@ def _signal_actions(frame: pd.DataFrame, direction: str, invert: bool) -> pd.Ser
 def _signal_columns(frame: pd.DataFrame) -> list:
     cols = [c for c in ("signal", "open_action", "entry_fraction") if c in frame.columns]
     return cols + _close_fraction_columns(frame)
+
+
+def _blank_label(value) -> bool:
+    if value is None:
+        return True
+    try:
+        if value != value:
+            return True
+    except TypeError:
+        pass
+    return str(value).strip() in ("", "nan", "None")
+
+
+def _fill_bounded_trim_blanks(scored_full: pd.DataFrame, scored_trim: pd.DataFrame,
+                              columns: list, limit: int, warmup: int, trim: int) -> pd.DataFrame:
+    """Ignore bounded-label blanks caused by the trim cutting into the lookback.
+
+    bounded_window_labels leaves a bar blank when fewer than `limit` rows end
+    at it. Removing the first third of a warm-up that already covers the live
+    lookback can blank early scored bars even though those labels depend only
+    on the trailing lookback, not on the trimmed prefix.
+    """
+    if limit < 1 or not columns or len(scored_full) != len(scored_trim):
+        return scored_trim
+    out = scored_trim.copy()
+    first = warmup - trim
+    for col in columns:
+        if col not in out.columns or col not in scored_full.columns:
+            continue
+        loc = out.columns.get_loc(col)
+        full_loc = scored_full.columns.get_loc(col)
+        for k in range(len(out)):
+            if first + k >= limit - 1:
+                continue
+            if not _blank_label(out.iloc[k, loc]):
+                continue
+            out.iloc[k, loc] = scored_full.iloc[k, full_loc]
+    return out
 
 
 def _frames_equal(a: pd.DataFrame, b: pd.DataFrame, cols: list) -> bool:
@@ -1522,7 +2020,8 @@ def _with_stop_inputs(frame: pd.DataFrame, atr: bool, atr_method: str, labels: O
 
 def market_strategy_checks(market: dict, name: str, params: dict, direction: str, invert: bool,
                            needs_oi: bool, has_close: bool, atr_method: str = "simple",
-                           stop_needs_atr: bool = False, labels: Optional[dict] = None) -> dict:
+                           stop_needs_atr: bool = False, labels: Optional[dict] = None,
+                           regime_prepare: Optional[dict] = None) -> dict:
     from registry_loader import load_registry
     reg = load_registry("futures")
     manifest, dataset, win = market["manifest"], market["dataset"], market["window"]
@@ -1558,6 +2057,12 @@ def market_strategy_checks(market: dict, name: str, params: dict, direction: str
                                     if invalid else "the strategy reports no per-bar observation validity"})
     with_atr = has_close or stop_needs_atr
     signals = _with_stop_inputs(signals, with_atr, atr_method, labels)
+    if regime_prepare:
+        from regime import bounded_window_labels
+        bounded_window_labels(
+            signals, period=regime_prepare["period"], adx_threshold=regime_prepare["adx_threshold"],
+            windows_spec=regime_prepare.get("windows_spec"), limit=regime_prepare["limit"],
+            columns=regime_prepare["columns"])
     warm = manifest["warmup_bars"]
     trim = warm // 3
     cols = _signal_columns(signals)
@@ -1565,17 +2070,31 @@ def market_strategy_checks(market: dict, name: str, params: dict, direction: str
         cols.append("atr")
     if labels is not None:
         cols.append("regime")
+    if regime_prepare:
+        cols.extend(sorted(regime_prepare["columns"]))
     stable = True
     if trim > 0:
         trimmed = _with_stop_inputs(reg.apply_strategy(name, frame.iloc[trim:].copy(), p), with_atr,
                                     atr_method, labels)
+        if regime_prepare:
+            from regime import bounded_window_labels
+            bounded_window_labels(
+                trimmed, period=regime_prepare["period"], adx_threshold=regime_prepare["adx_threshold"],
+                windows_spec=regime_prepare.get("windows_spec"), limit=regime_prepare["limit"],
+                columns=regime_prepare["columns"])
         scored_full = om.slice_window(signals, win)
         scored_trim = om.slice_window(trimmed, win)
-        stable = len(scored_full) == len(scored_trim) and _frames_equal(scored_full, scored_trim, cols)
+        stable = len(scored_full) == len(scored_trim)
+        if stable and regime_prepare:
+            scored_trim = _fill_bounded_trim_blanks(
+                scored_full, scored_trim, sorted(regime_prepare["columns"]),
+                int(regime_prepare["limit"]), warm, trim)
+        stable = stable and _frames_equal(scored_full, scored_trim, cols)
     out["checks"]["indicator_history"] = {
         "ok": bool(stable), "trimmed_warmup_bars": trim, "compared_columns": cols,
         "rule": "scored-window decisions, and the ATR and regime labels a stop owner reads, are identical "
-                "when the first third of warm-up is removed",
+                "when the first third of warm-up is removed; a bounded regime label left blank because "
+                "that trim cuts into the live lookback is not a difference",
     }
     if not stable:
         out["refusals"].append({"reason": "market_indicator_history_insufficient",
@@ -1589,6 +2108,12 @@ def market_strategy_checks(market: dict, name: str, params: dict, direction: str
     return out
 
 
+def _tier_fee_check(spec: dict) -> dict:
+    return {"maker_fee_pct": spec["maker_fee_pct"], "taker_fee_pct": spec["taker_fee_pct"],
+            "maker_equals_taker": spec["maker_fee_pct"] == spec["taker_fee_pct"],
+            "rule": HL_TIER_FEE_RULE}
+
+
 def run_simulation(market: dict, signals: pd.DataFrame, plan: dict) -> dict:
     manifest, dataset, win = market["manifest"], market["dataset"], market["window"]
     spec = om.execution_spec(manifest, dataset)
@@ -1600,14 +2125,51 @@ def run_simulation(market: dict, signals: pd.DataFrame, plan: dict) -> dict:
         invert_signal=plan["invert_signal"], atr_method=plan["atr_method"],
         comparison_mode=plan["comparison_mode"],
     )
-    if plan["execution_spec"]:
+    paper = plan.get("paper_cost_model")
+    if paper is not None:
+        vals = {k: v["value"] for k, v in paper["values"].items()}
+        if plan["execution_spec"]:
+            paper_spec = dict(spec)
+            paper_spec.update(taker_fee_pct=vals["taker_fee_pct"], maker_fee_pct=vals["tier_fee_pct"],
+                              half_spread_pct=vals["half_spread_pct"], slippage_pct=vals["slippage_pct"])
+            kwargs["execution_spec"] = paper_spec
+            mechanism = {"execution_spec": paper_spec}
+        else:
+            kwargs["commission_pct"] = vals["taker_fee_pct"]
+            kwargs["maker_fee_pct"] = vals["tier_fee_pct"]
+            kwargs["slippage_pct"] = vals["half_spread_pct"] + vals["slippage_pct"]
+            mechanism = {"commission_pct": kwargs["commission_pct"], "maker_fee_pct": kwargs["maker_fee_pct"],
+                         "slippage_pct": kwargs["slippage_pct"]}
+        cost_model = {"kind": PAPER_COST_MODEL_KIND, "version": paper["version"],
+                      "version_source": paper["version_source"], "values": paper["values"], **mechanism}
+    elif plan["execution_spec"]:
         kwargs["execution_spec"] = spec
-        cost_model = {"kind": "market_manifest_execution_spec", "spec": spec}
+        cost_model = {"kind": "market_manifest_execution_spec", "spec": spec,
+                      "value_sources": {
+                          "taker_fee_pct": "manifest costs.taker_fee_pct",
+                          "maker_fee_pct": "manifest costs.maker_fee_pct",
+                          "half_spread_pct": "manifest dataset half_spread_bps",
+                          "slippage_pct": "manifest costs.slippage_bps",
+                          "size_decimals": "manifest dataset size_decimals",
+                          "min_notional_usd": "manifest costs.min_notional_usd",
+                          "min_notional_margin": "manifest costs.min_notional_margin",
+                      },
+                      "tier_fee_check": _tier_fee_check(spec)}
     else:
         kwargs["commission_pct"] = spec["taker_fee_pct"]
+        kwargs["maker_fee_pct"] = spec["maker_fee_pct"]
         kwargs["slippage_pct"] = spec["half_spread_pct"] + spec["slippage_pct"]
         cost_model = {"kind": "flat_taker_fee_and_adverse_price",
-                      "commission_pct": kwargs["commission_pct"], "slippage_pct": kwargs["slippage_pct"]}
+                      "commission_pct": kwargs["commission_pct"], "maker_fee_pct": kwargs["maker_fee_pct"],
+                      "slippage_pct": kwargs["slippage_pct"],
+                      "value_sources": {
+                          "commission_pct": "manifest costs.taker_fee_pct",
+                          "maker_fee_pct": "manifest costs.maker_fee_pct",
+                          "slippage_pct": "manifest dataset half_spread_bps + manifest costs.slippage_bps",
+                      },
+                      "tier_fee_check": _tier_fee_check(spec)}
+    if plan.get("resting_tp_trade_through"):
+        kwargs["resting_tp_trade_through"] = True
     stop = plan.get("stop") or {}
     if stop.get("kwargs"):
         kwargs.update(stop["kwargs"])
@@ -1616,9 +2178,18 @@ def run_simulation(market: dict, signals: pd.DataFrame, plan: dict) -> dict:
             kwargs.update(regime_enabled=True, regime_period=labels["period"],
                           regime_adx_threshold=labels["adx_threshold"],
                           regime_windows_spec=labels["windows_spec"])
+    if plan.get("perps_sizing"):
+        kwargs["perps_sizing"] = plan["perps_sizing"]
+    if plan.get("liquidation_model"):
+        kwargs["liquidation_model"] = plan["liquidation_model"]
+    if plan.get("venue_margin"):
+        kwargs["venue_margin"] = plan["venue_margin"]
     if plan.get("allow_scale_in"):
         kwargs["allow_scale_in"] = True
         kwargs["scale_in"] = plan.get("scale_in")
+    regime_engine = plan.get("regime_engine") or {}
+    if regime_engine:
+        kwargs.update(regime_engine)
     stop_events: list = []
     bt = Backtester(**kwargs)
     res = bt.run(scored, strategy_name=plan["open_name"], symbol=dataset["symbol"],
@@ -1634,11 +2205,21 @@ def run_simulation(market: dict, signals: pd.DataFrame, plan: dict) -> dict:
             "stop_warmup_skipped_entries": res.get("stop_warmup_skipped_entries", 0)}
 
 
+def _close_reason_name(reason) -> str:
+    return str(reason or "").split(":", 1)[0]
+
+
+def is_simulated_tier_close(event: dict) -> bool:
+    return (event.get("kind") == "close" and not event.get("synthetic")
+            and _close_reason_name(event.get("reason")) in RESTING_TIER_CLOSE_REASONS)
+
+
 def normalize_simulated(env: dict) -> dict:
     positions = {}
     funding = []
     synthetic = []
     dispositions = {}
+    tier_closes = [e for e in env["events"] if is_simulated_tier_close(e)]
     for e in env["events"]:
         if e["kind"] == "funding":
             funding.append(e)
@@ -1669,10 +2250,11 @@ def normalize_simulated(env: dict) -> dict:
             "net": _fsum(e["gross_realized"] or 0.0 for e in closes) - _fsum(e["fee_charged"] for e in evs),
             "entry_fee_allocated": _fsum(e["entry_fee_allocated"] or 0.0 for e in closes),
             "entry_fee_outstanding": (end.get("entry_fee_outstanding") or 0.0) if end.get("position_local_id") == pid else 0.0,
+            "tier_close_event_ids": [e["event_id"] for e in closes if is_simulated_tier_close(e)],
         })
         out.append(p)
     return {"positions": out, "funding": funding, "synthetic": synthetic, "dispositions": dispositions,
-            "interval_end": end}
+            "interval_end": end, "tier_closes": tier_closes}
 
 
 def _time_window(sim_event: dict, step_s: float, tol_s: float):
@@ -2069,6 +2651,181 @@ def conservation(booked_doc: dict, norm: dict, sim: Optional[dict], sim_env: Opt
     return {"checks": checks, "all_passed": all(c["ok"] for c in checks), "informational_totals": informational}
 
 
+def classify_booked_close(close_reason) -> str:
+    if close_reason is None or close_reason in RESTING_POSSIBLE_TIER_REASONS:
+        return "possible_tier"
+    reason = str(close_reason)
+    if _close_reason_name(reason) in RESTING_TIER_CLOSE_REASONS or RESTING_HL_SYNC_TP_REASON.match(reason):
+        return "tier"
+    return "non_tier"
+
+
+def _resting_fill_consistent(evidence: dict, event: dict, k_ticks: int) -> bool:
+    return (evidence.get("rule") == "trade_through" and evidence.get("k_ticks") == k_ticks
+            and evidence.get("verdict") == "traded_through" and _is_number(evidence.get("fill_px"))
+            and _is_number(event.get("raw_price")) and evidence["fill_px"] == event["raw_price"])
+
+
+def resting_fill_populations(rule: Optional[dict], booked: dict, simulated: Optional[dict], matched: list,
+                             booked_disp: dict, sim_disp: dict) -> dict:
+    enabled = bool(rule and rule["enabled"])
+    tier_strategy = bool(rule and rule["tier_strategy"])
+    comp_by_b, comp_by_s = {}, {}
+    for pair in matched:
+        for comp in pair["components"]:
+            comp_by_b[comp["booked_event_key"]] = comp
+            comp_by_s[comp["simulated_event_id"]] = comp
+    sim_events = {}
+    if simulated is not None:
+        for p in simulated["positions"]:
+            for e in p["_events"]:
+                sim_events[e["event_id"]] = e
+    records = {r["event_key"]: r for r in booked["records"]}
+
+    def disposition(comp, disp):
+        if comp is not None:
+            return "matched"
+        return "ambiguous" if disp == "ambiguous" else "unmatched"
+
+    booked_rows = []
+    booked_class = {}
+    if tier_strategy:
+        for r in booked["records"]:
+            if r["relation"] != "in" or r["kind"] != "close" or booked_disp.get(r["event_key"]) == "not_comparable":
+                continue
+            cls = classify_booked_close(r["close_reason"])
+            comp = comp_by_b.get(r["event_key"])
+            sim_ev = sim_events.get(comp["simulated_event_id"]) if comp else None
+            sim_tier = is_simulated_tier_close(sim_ev) if sim_ev is not None else None
+            if cls == "possible_tier" and comp is not None and sim_tier is False and comp["within_tolerance"]:
+                cls = "resolved_non_tier"
+            booked_class[r["event_key"]] = cls
+            if cls == "non_tier":
+                continue
+            booked_rows.append({
+                "event_key": r["event_key"], "position_id": r["position_id"], "timestamp": r["timestamp"],
+                "close_reason": r["close_reason"], "classification": cls,
+                "disposition": disposition(comp, booked_disp.get(r["event_key"])),
+                "simulated_event_id": comp["simulated_event_id"] if comp else None,
+                "simulated_is_tier_close": sim_tier,
+                "within_tolerance": comp["within_tolerance"] if comp else None,
+            })
+    sim_rows = []
+    for e in (simulated or {}).get("tier_closes") or []:
+        comp = comp_by_s.get(e["event_id"])
+        bkey = comp["booked_event_key"] if comp else None
+        if bkey is not None and bkey not in booked_class and bkey in records:
+            booked_class[bkey] = classify_booked_close(records[bkey]["close_reason"])
+        sim_rows.append({
+            "event_id": e["event_id"], "position_local_id": e["position_local_id"],
+            "bar_timestamp": e["bar_timestamp"], "reason": e["reason"], "quantity": e["quantity"],
+            "raw_price": e["raw_price"], "disposition": disposition(comp, sim_disp.get(e["event_id"])),
+            "booked_event_key": bkey, "booked_classification": booked_class.get(bkey) if bkey else None,
+            "within_tolerance": comp["within_tolerance"] if comp else None,
+            "resting_fill": copy.deepcopy(e.get("resting_fill")),
+        })
+
+    failures = []
+    failed_ids = set()
+    out_of_tolerance_pairs = set()
+
+    def fail(code, detail, event_id=None, event_key=None):
+        failures.append({"code": code, "detail": detail, "simulated_event_id": event_id,
+                         "booked_event_key": event_key})
+        if event_id is not None:
+            failed_ids.add(("s", event_id))
+        if event_key is not None:
+            failed_ids.add(("b", event_key))
+
+    def out_of_tolerance(event_id, event_key):
+        if (event_id, event_key) in out_of_tolerance_pairs:
+            return
+        out_of_tolerance_pairs.add((event_id, event_key))
+        fail("tier_close_out_of_tolerance",
+             f"booked close {event_key} and simulated close {event_id} are paired outside the time, price, "
+             "quantity or fee tolerance", event_id, event_key)
+
+    k_ticks = rule["k_ticks"] if rule else None
+    counted_booked = [b for b in booked_rows if b["classification"] in ("tier", "possible_tier")]
+    if not enabled:
+        for srow in sim_rows:
+            fail("resting_fill_unverified",
+                 "the resting take-profit rule is off, so this simulated tier close books on the mark without "
+                 "trade-through evidence", srow["event_id"], srow["booked_event_key"])
+        for brow in counted_booked:
+            fail("resting_fill_unverified",
+                 f"the resting take-profit rule is off, so booked {brow['classification']} close cannot be "
+                 "verified against a trade-through", brow["simulated_event_id"], brow["event_key"])
+    else:
+        for srow in sim_rows:
+            evidence = srow["resting_fill"]
+            sid, bkey = srow["event_id"], srow["booked_event_key"]
+            if not isinstance(evidence, dict):
+                fail("resting_fill_missing", "a rule-on simulated tier close carries no resting_fill record", sid, bkey)
+            elif not _resting_fill_consistent(evidence, srow, k_ticks):
+                fail("resting_fill_inconsistent",
+                     f"resting_fill rule {evidence.get('rule')!r}, k_ticks {evidence.get('k_ticks')!r}, verdict "
+                     f"{evidence.get('verdict')!r} and fill_px {evidence.get('fill_px')!r} do not prove a "
+                     f"{k_ticks}-tick trade-through fill at the event price {srow['raw_price']!r}", sid, bkey)
+            if srow["disposition"] != "matched":
+                fail("simulated_tier_close_unmatched",
+                     f"simulated tier close is {srow['disposition']}; no booked close is paired with it", sid, None)
+            else:
+                if srow["booked_classification"] == "non_tier":
+                    fail("simulated_tier_close_paired_with_non_tier",
+                         f"simulated tier close is paired with booked non-tier close {bkey}", sid, bkey)
+                if not srow["within_tolerance"]:
+                    out_of_tolerance(sid, bkey)
+        for brow in counted_booked:
+            sid, bkey = brow["simulated_event_id"], brow["event_key"]
+            if brow["disposition"] != "matched":
+                fail("booked_tier_close_unmatched",
+                     f"booked {brow['classification']} close is {brow['disposition']}; no simulated close is paired "
+                     "with it", None, bkey)
+                continue
+            if brow["classification"] == "tier" and brow["simulated_is_tier_close"] is False:
+                fail("booked_tier_close_paired_with_non_tier",
+                     f"booked tier close is paired with simulated non-tier close {sid}", sid, bkey)
+            if not brow["within_tolerance"]:
+                out_of_tolerance(sid, bkey)
+        if not sim_rows and counted_booked:
+            fail("resting_rule_suppressed_every_tier_close",
+                 f"the enabled rule left no simulated tier close while {len(counted_booked)} booked tier or "
+                 "possible tier close(s) remain: " + ", ".join(b["event_key"] for b in counted_booked))
+    for srow in sim_rows:
+        srow["status"] = "failed" if ("s", srow["event_id"]) in failed_ids else "verified"
+    for brow in booked_rows:
+        if brow["classification"] == "resolved_non_tier":
+            brow["status"] = "resolved_non_tier"
+        else:
+            brow["status"] = "failed" if ("b", brow["event_key"]) in failed_ids else "verified"
+    counts = {
+        "simulated_tier_closes": len(sim_rows),
+        "simulated_with_resting_fill": sum(1 for r in sim_rows if isinstance(r["resting_fill"], dict)),
+        "booked_tier": sum(1 for b in booked_rows if b["classification"] == "tier"),
+        "booked_possible_tier": sum(1 for b in booked_rows if b["classification"] == "possible_tier"),
+        "booked_resolved_non_tier": sum(1 for b in booked_rows if b["classification"] == "resolved_non_tier"),
+        "failures": len(failures),
+    }
+    return {
+        "rule": copy.deepcopy(rule),
+        "simulated_tier_closes": sim_rows,
+        "booked_tier_closes": booked_rows,
+        "counts": counts,
+        "failures": failures,
+        "parity_scope": RESTING_FILL_PARITY_SCOPE,
+        "classification": {
+            "simulated": "a non-synthetic simulated close whose reason name (text before the first ':') is one of "
+                         + ", ".join(RESTING_TIER_CLOSE_REASONS) + "; resting_fill presence never decides membership",
+            "booked": "on a strategy whose close refs include a tier evaluator: tier when close_reason starts with a "
+                      "tier evaluator name or is hl_sync_tp<N>_fill; possible_tier when close_reason is unavailable "
+                      "or 'signal'; non_tier otherwise; a possible_tier close paired within tolerance with a "
+                      "simulated non-tier close resolves to non_tier",
+        },
+        "verified": not failures,
+    }
+
+
 def _decision_class(rows: list) -> tuple:
     refusals = [r for r in rows if r["decision"] == "refused"]
     return refusals, [r for r in rows if r["decision"] == "requires_evidence_verified"]
@@ -2123,6 +2880,11 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
                       "registry": set(load_registry("futures").STRATEGY_REGISTRY),
                       "funding_input_strategies": set(FUNDING_COLUMN_STRATEGIES),
                       "observation_input_strategies": set(OBSERVATION_INPUT_STRATEGIES)}
+        try:
+            import offline_manifest as om
+            market_ctx["venue_margin"] = om.venue_margin(market["manifest"], market["dataset"])
+        except Exception:
+            market_ctx["venue_margin"] = None
     args = strategy.get("args") or []
     if strategy.get("type") == "manual":
         coin = strategy.get("symbol")
@@ -2137,8 +2899,29 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
                      "input_version": input_version, "basis": None, "resolved_live_units": None,
                      "capability_context": None, "close_refs": None})
     has_close = bool(strategy.get("close_strategy"))
+    plan_close_refs = ((copy.deepcopy(stop_verdict["close_refs"]) if stop_verdict.get("close_refs") is not None
+                        else [strategy["close_strategy"]]) if has_close else None)
+    resting_rule = (resolve_resting_rule(strategy, _close_ref_names(plan_close_refs), cin.get("resting_tp_rule"))
+                    if seg else None)
     atr_verdict = resolve_atr_method(seg, has_close or stop_verdict.get("owner") in STOP_OWNERS_NEEDING_ATR)
-    matrix = (capability_matrix(seg, cin.get("capability_evidence", {}), market_ctx, stop_verdict, atr_verdict)
+    regime_context = None
+    if seg:
+        regime_binding = {
+            "partition": doc["selection"]["partition"],
+            "strategy_id": doc["selection"]["process_strategy_id"],
+            "configuration_sha256": configuration_sha256(strategy, seg.get("regime") or {}),
+            "interval_start": _iso(start),
+            "interval_end": _iso(end),
+        }
+        market_for_regime = {
+            "interval": market_ctx.get("interval"),
+            "warmup_bars": (market.get("manifest") or {}).get("warmup_bars") if isinstance(market, dict) else None,
+        }
+        regime_context = resolve_regime_context(
+            seg, cin.get("capability_evidence") or {}, regime_binding, market_for_regime,
+            bool(stop_verdict.get("needs_labels")), mode, os.path.dirname(input_path))
+    matrix = (capability_matrix(seg, cin.get("capability_evidence", {}), market_ctx, stop_verdict, atr_verdict,
+                                regime_context, input_version, resting_rule)
               if seg else [])
     cap_refusals, cap_evidence = _decision_class(matrix)
     manual = strategy.get("type") == "manual"
@@ -2148,9 +2931,15 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
             continue
         if approx_ok and r["approximable"]:
             approximations.append({"feature": r["field"], "category": r["category"],
+                                   "reason_code": r.get("reason_code"),
                                    "assumption": r["reason"], "effect": "simulated with an unverified substitute"})
         else:
-            refusals.append({"reason": f"capability_{r['category']}", "field": r["field"], "detail": r["reason"]})
+            code = r.get("reason_code")
+            refusal = {"reason": code or f"capability_{r['category']}", "field": r["field"], "detail": r["reason"]}
+            if code:
+                refusal["reason_code"] = code
+                refusal["category"] = r["category"]
+            refusals.append(refusal)
     for r in stop_verdict["refusals"]:
         if approx_ok and r["approximable"]:
             approximations.append({"feature": r["field"], "category": "protection",
@@ -2185,7 +2974,8 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
                 open_name in market_ctx["observation_input_strategies"], has_close,
                 atr_method=atr_method,
                 stop_needs_atr=stop_verdict.get("owner") in STOP_OWNERS_NEEDING_ATR,
-                labels=stop_verdict.get("labels") if stop_verdict.get("needs_labels") else None)
+                labels=stop_verdict.get("labels") if stop_verdict.get("needs_labels") else None,
+                regime_prepare=(regime_context or {}).get("prepare"))
         except ValueError as exc:
             refusals.append({"reason": "strategy_rejected_inputs", "detail": f"{open_name}: {exc}"})
         else:
@@ -2209,6 +2999,12 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
                                    "be reproduced; execution-spec runs refuse seeded inventory",
                          "declared": inv_value, "booked_replay": replay_inv})
 
+    cost_resolution = None
+    if seg and not manual and strategy:
+        cost_resolution = resolve_comparison_cost_model(doc, start, end, strategy, mode)
+        refusals.extend(cost_resolution["refusals"])
+        approximations.extend(cost_resolution["approximations"])
+
     close_validation = None
     sim = None
     sim_status = {"status": "not_run", "reasons": []}
@@ -2220,30 +3016,56 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
     elif approx_ok and any(r["reason"] in ("input_binding", "seeded_inventory_unsupported",
                                            "configuration_transition_unsupported", "market_input_integrity",
                                            "market_manifest_hash_mismatch") + STOP_UNAPPROXIMABLE_REASONS
-                           + ATR_UNAPPROXIMABLE_REASONS
+                           + ATR_UNAPPROXIMABLE_REASONS + PAPER_COST_UNAPPROXIMABLE_REASONS
                            or r["reason"].startswith("capability_")
+                           or r.get("reason_code")
                            for r in refusals):
         can_sim = False
         sim_status["reasons"].append("an unapproximable refusal blocks simulation")
     if manual:
         sim_status["reasons"].append("manual owner: no signal model")
+    if can_sim and (cost_resolution is None or (cost_resolution["paper"] is None
+                                                and cost_resolution["partition"] != "live")):
+        can_sim = False
+        sim_status["reasons"].append("no comparison cost model was resolved")
+    use_spec = has_close and not strategy.get("allow_scale_in")
+    if can_sim and resting_rule is not None and resting_rule["enabled"] and not use_spec:
+        can_sim = False
+        refusals.append({"reason": "resting_rule_tick_unknown", "reason_code": "resting_rule_tick_unknown",
+                         "category": "take_profit_fill_model", "field": "resting_tp_trade_through",
+                         "detail": "the resting take-profit rule reads its tick grid from the execution spec, and "
+                                   "this run would not use one; the cost mode is never switched for the rule"})
+        sim_status["reasons"].append("the resting take-profit rule needs the execution spec")
     if can_sim:
-        use_spec = has_close and not strategy.get("allow_scale_in")
+        paper_cost = cost_resolution["paper"]
         if not use_spec:
             approximations.append({"feature": "execution_cost", "category": "execution_cost",
-                                   "assumption": "flat taker fee and combined spread/slippage from the manifest replace "
-                                                 "the lot- and minimum-aware execution spec",
+                                   "assumption": ("flat paper taker fee and paper slippage replace the lot- and "
+                                                  "minimum-aware execution spec" if paper_cost is not None else
+                                                  "flat taker fee and combined spread/slippage from the manifest "
+                                                  "replace the lot- and minimum-aware execution spec"),
                                    "effect": "fills are not lot-floored or minimum-checked"})
         plan = {
             "open_name": open_name, "params": dict(open_ref.get("params") or {}),
-            "close_refs": ((copy.deepcopy(stop_verdict["close_refs"]) if stop_verdict.get("close_refs") is not None
-                            else [strategy["close_strategy"]]) if has_close else None),
+            "close_refs": copy.deepcopy(plan_close_refs),
             "direction": direction, "invert_signal": invert,
             "atr_method": atr_method,
             "comparison_mode": mode, "initial_cash": float(cin["starting_state"]["cash_usd"]["value"]),
             "execution_spec": use_spec,
             "stop": stop_verdict,
+            "perps_sizing": _comparison_perps_sizing(strategy, cin.get("capability_evidence") or {}, input_version),
+            "liquidation_model": "none",
+            "venue_margin": None,
+            "regime_engine": (regime_context or {}).get("engine"),
+            "paper_cost_model": paper_cost,
+            "resting_tp_trade_through": bool(resting_rule is not None and resting_rule["enabled"]),
         }
+        if (plan["perps_sizing"] and _is_number(strategy.get("leverage")) and strategy.get("leverage") > 1
+                and _comparison_mode_name(strategy.get("args")) != "paper"
+                and _liquidation_refusal(strategy, cin.get("capability_evidence") or {}, market_ctx, input_version) is None
+                and market_ctx.get("venue_margin")):
+            plan["liquidation_model"] = "venue_isolated"
+            plan["venue_margin"] = market_ctx["venue_margin"]
         if approx_ok:
             if strategy.get("allow_scale_in"):
                 plan["allow_scale_in"] = True
@@ -2350,6 +3172,8 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
                 unverified.append({"input": "initial_stop_geometry", "reason": res["reason"],
                                    "booked_position_id": res["booked_position_id"]})
 
+    resting_fill = resting_fill_populations(resting_rule, booked, simulated, matched, booked_disp, sim_disp)
+
     pos_by_id = {p["position_id"]: p for p in booked["positions"]}
     booked_sections = {
         "matched_components": [c["booked_event_key"] for p in matched for c in p["components"]],
@@ -2423,6 +3247,7 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
         "strategy_totals_within_tolerance": bool(totals_ok),
         "initial_stop_geometry_consistent": initial_geometry is None or all(
             r["status"] in ("agreement", "unavailable") for r in initial_geometry["positions"]),
+        "resting_tier_closes_verified": resting_fill["verified"],
     }
     strict_success = all(strict_checks.values())
     if strict_success:
@@ -2436,6 +3261,17 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
     else:
         outcome = "mismatch"
 
+    regime_report = dict((regime_context or {}).get("report") or {})
+    if regime_report and strategy_checks is not None and "dataset" in market:
+        prepared = (regime_context or {}).get("prepare") or {}
+        columns = list(prepared.get("columns") or {})
+        if columns:
+            scored_labels = om.slice_window(strategy_checks["signals"], market["window"])
+            regime_report["scored_labels"] = [
+                {"timestamp": int(row["timestamp"]),
+                 **{col: str(row.get(col, "") or "") for col in columns}}
+                for _, row in scored_labels.iterrows()
+            ]
     present = doc["current_effective_configuration"]
     differences = []
     if seg:
@@ -2495,6 +3331,7 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
             "unverified": unverified,
             "approximations": approximations,
             "capability_matrix": matrix,
+            "regime": regime_report or None,
             "capability_evidence_used": [r["field"] for r in cap_evidence],
             "close_validation": close_validation,
             "market": {"status": market["status"], "checks": market.get("checks"),
@@ -2544,6 +3381,7 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
                             if e.get("event") == "arm"] if sim else None),
         },
         "initial_stop_geometry": initial_geometry,
+        "resting_fill": resting_fill,
         "matching": {
             "matched": matched,
             "ambiguous": ambiguous,

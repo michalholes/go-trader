@@ -74,14 +74,19 @@ def _hyperliquid_adapter():
 
 from atr import ensure_atr_indicator, latest_atr
 from closed_bar import (
+    FRAME_INTERVAL_ATTR,
+    FRAME_TIMESTAMP_KIND_ATTR,
     RULE_HYPERLIQUID_NATIVE,
     ClosedBarHold,
+    declare_frame_cadence,
     filter_records_to_boundary,
     hold_metadata,
     htf_closed_fetcher,
     hyperliquid_rows_and_timings,
+    rows_sha256,
     sealed_frame_timings,
     select_closed,
+    timings_timestamp_kind,
     unsupported_open_strategy_reason,
 )
 from hl_user_fills import apply_user_fills_lookup
@@ -108,6 +113,10 @@ def _make_dataframe(candles):
     return df
 
 
+def _frame_with_cadence(rows, timeframe, timings=None):
+    return declare_frame_cadence(_make_dataframe(rows), timeframe, timings_timestamp_kind(rows, timings))
+
+
 def _position_ctx_from_args(args):
     ctx = {}
     side = (args.position_side or "").lower()
@@ -130,6 +139,10 @@ def _position_ctx_from_args(args):
 
 
 TP_MODEL_RESTING_LIMIT = "resting_limit"
+
+FULL_PRECISION_INDICATOR_PREFIXES = ("eom_", "mfi_")
+
+TEXT_INDICATOR_COLUMNS = ("eom_reason",)
 
 BATCH_PROTOCOL_VERSION = 1
 
@@ -180,6 +193,7 @@ def _signal_check_deps():
     apply_strategy = _strategies.apply_strategy
     get_strategy = _strategies.get_strategy
     list_strategies = _strategies.list_strategies
+    validate_params = _strategies.validate_params
     from close_registry_loader import (
         evaluate as close_evaluate,
         get_strategy as get_close_strategy,
@@ -194,12 +208,14 @@ def _signal_check_deps():
         admit_configured_strategies,
         parse_allow_no_edge_value,
         parse_raw_gate_mode,
+        preflight_reference_params,
     )
 
     return SimpleNamespace(
         apply_strategy=apply_strategy,
         get_strategy=get_strategy,
         list_strategies=list_strategies,
+        validate_params=validate_params,
         close_evaluate=close_evaluate,
         get_close_strategy=get_close_strategy,
         list_close_strategies=list_close_strategies,
@@ -211,6 +227,7 @@ def _signal_check_deps():
         admit_configured_strategies=admit_configured_strategies,
         parse_allow_no_edge_value=parse_allow_no_edge_value,
         parse_raw_gate_mode=parse_raw_gate_mode,
+        preflight_reference_params=preflight_reference_params,
     )
 
 
@@ -302,9 +319,10 @@ def slot_admission(slot, deps):
     )
 
 
-def _validate_slot_strategy_names(deps, strategy_name, open_strategy, close_strategies, admission):
+def _validate_slot_strategy_names(deps, strategy_name, open_strategy, close_strategies, admission,
+                                  params=None, close_params_by_name=None):
     gate_mode, acknowledgement = admission
-    deps.admit_configured_strategies(
+    references = deps.admit_configured_strategies(
         strategy_name,
         open_strategy,
         close_strategies,
@@ -315,6 +333,20 @@ def _validate_slot_strategy_names(deps, strategy_name, open_strategy, close_stra
         deps.list_strategies,
         deps.list_close_strategies,
     )
+    deps.preflight_reference_params(
+        references, params, close_params_by_name, deps.get_strategy, deps.validate_params)
+
+
+def preflight_signal_slot(slot, deps):
+    _validate_slot_strategy_names(
+        deps,
+        slot["strategy"],
+        slot.get("open_strategy") or None,
+        slot.get("close_strategies") or None,
+        slot_admission(slot, deps),
+        slot.get("params") or None,
+        slot.get("close_params_by_name") or None,
+    )
 
 
 def build_shared_signal_state(symbol, timeframe, *, adapter=None, df=None,
@@ -322,9 +354,12 @@ def build_shared_signal_state(symbol, timeframe, *, adapter=None, df=None,
                               regime_enabled=False, regime_windows_spec=None,
                               regime_payload_json=None, mode="paper",
                               regime_period=14, regime_adx_threshold=20.0,
-                              market=None, closed_bar=False, decision_regime_timeframe=""):
+                              market=None, closed_bar=False, decision_regime_timeframe="",
+                              timed_rows=False):
+    timed = bool(closed_bar or timed_rows)
     closed = {
         "requested": bool(closed_bar),
+        "timed": timed,
         "cutoff_ms": 0,
         "rows": None,
         "timings": None,
@@ -332,7 +367,7 @@ def build_shared_signal_state(symbol, timeframe, *, adapter=None, df=None,
     }
     if market is not None:
         validate_market_payload(market, MarketPayloadError)
-        if closed_bar:
+        if timed:
             all_rows, timing = market_frame_rows_with_timing(
                 market, symbol, timeframe, MarketPayloadError, limit=ohlcv_limit + 1)
             rows = all_rows[-ohlcv_limit:]
@@ -346,16 +381,19 @@ def build_shared_signal_state(symbol, timeframe, *, adapter=None, df=None,
             rows = market_frame_rows(market, symbol, timeframe, MarketPayloadError, limit=ohlcv_limit)
         if len(rows) < 30:
             raise InsufficientCandlesError(len(rows))
-        df = _make_dataframe(rows)
+        df = _frame_with_cadence(rows, timeframe)
         adapter = None
-    elif closed_bar and df is not None:
-        closed["hold"] = "a prebuilt candle frame carries no bar timing"
+    elif df is not None:
+        if timed:
+            closed["hold"] = "a prebuilt candle frame carries no bar timing"
+        if FRAME_INTERVAL_ATTR not in df.attrs:
+            df = declare_frame_cadence(df.copy(), timeframe, df.attrs.get(FRAME_TIMESTAMP_KIND_ATTR))
 
     if df is None:
         if adapter is None:
             raise SharedSignalStateError("no adapter and no prebuilt DataFrame")
         print(f"Fetching {symbol} {timeframe} from Hyperliquid ({mode})...", file=sys.stderr)
-        if closed_bar:
+        if timed:
             closed["cutoff_ms"] = int(time.time() * 1000)
             raw_candles = adapter.get_ohlcv_candles(symbol, interval=timeframe, limit=ohlcv_limit + 1)
             try:
@@ -368,7 +406,7 @@ def build_shared_signal_state(symbol, timeframe, *, adapter=None, df=None,
             candles = adapter.get_ohlcv(symbol, interval=timeframe, limit=ohlcv_limit)
         if not candles or len(candles) < 30:
             raise InsufficientCandlesError(len(candles) if candles else 0)
-        df = _make_dataframe(candles)
+        df = _frame_with_cadence(candles, timeframe)
 
     price_override = 0.0
     if mark_price and mark_price > 0:
@@ -604,6 +642,178 @@ def _shared_decision_funding_records(shared, symbol, start_ms, boundary_ms):
     return out
 
 
+RESTING_RULE_REQUEST_KEYS = frozenset({"v", "k_ticks", "sz_decimals", "entry_time_ms", "stop_trigger_px", "hold_reason",
+                                       "scanned_through_ms", "prior_reach_px"})
+
+
+def _request_int(raw, field, minimum=None, maximum=None, allow_none=False):
+    if raw is None and allow_none:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(f"resting_tp_rule.{field} must be an integer, got {raw!r}")
+    if (minimum is not None and raw < minimum) or (maximum is not None and raw > maximum):
+        raise ValueError(f"resting_tp_rule.{field} is out of range: {raw!r}")
+    return raw
+
+
+def parse_resting_rule_request(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError as e:
+            raise ValueError(f"resting_tp_rule is not valid JSON: {e}")
+    if not isinstance(raw, dict):
+        raise ValueError(f"resting_tp_rule must be a JSON object, got {type(raw).__name__}")
+    unknown = sorted(set(raw) - RESTING_RULE_REQUEST_KEYS)
+    missing = sorted(RESTING_RULE_REQUEST_KEYS - set(raw))
+    if unknown or missing:
+        raise ValueError(f"resting_tp_rule keys must be exactly {sorted(RESTING_RULE_REQUEST_KEYS)}; unknown={unknown} missing={missing}")
+    from close_registry_loader import resting_rule_helpers
+    helpers = resting_rule_helpers()
+    if _request_int(raw["v"], "v") != helpers.RESTING_TP_RULE_VERSION:
+        raise ValueError(f"resting_tp_rule.v {raw['v']!r} is not {helpers.RESTING_TP_RULE_VERSION}")
+    if _request_int(raw["k_ticks"], "k_ticks", minimum=1) != helpers.RESTING_TP_TRADE_THROUGH_TICKS:
+        raise ValueError(f"resting_tp_rule.k_ticks {raw['k_ticks']!r} is not the shared constant {helpers.RESTING_TP_TRADE_THROUGH_TICKS}")
+    stop = raw["stop_trigger_px"]
+    if isinstance(stop, bool) or not isinstance(stop, (int, float)) or not math.isfinite(float(stop)) or float(stop) < 0:
+        raise ValueError(f"resting_tp_rule.stop_trigger_px must be a finite number >= 0, got {stop!r}")
+    if not isinstance(raw["hold_reason"], str):
+        raise ValueError(f"resting_tp_rule.hold_reason must be a string, got {raw['hold_reason']!r}")
+    scanned_through = _request_int(raw["scanned_through_ms"], "scanned_through_ms", minimum=0)
+    prior = raw["prior_reach_px"]
+    if prior is not None and (isinstance(prior, bool) or not isinstance(prior, (int, float))
+                              or not math.isfinite(float(prior)) or float(prior) <= 0):
+        raise ValueError(f"resting_tp_rule.prior_reach_px must be null or a finite number > 0, got {prior!r}")
+    if prior is not None and scanned_through == 0:
+        raise ValueError("resting_tp_rule.prior_reach_px needs a scanned_through_ms watermark")
+    return {
+        "scanned_through_ms": scanned_through,
+        "prior_reach_px": prior,
+        "v": raw["v"],
+        "k_ticks": raw["k_ticks"],
+        "sz_decimals": _request_int(raw["sz_decimals"], "sz_decimals", minimum=0, maximum=12, allow_none=True),
+        "entry_time_ms": _request_int(raw["entry_time_ms"], "entry_time_ms", minimum=0),
+        "stop_trigger_px": stop,
+        "hold_reason": raw["hold_reason"].strip(),
+    }
+
+
+def _resting_rule_refusal(mode, close_names):
+    if mode == "live":
+        return "resting_tp_rule is paper-only: the venue decides live take-profit fills"
+    from close_registry_loader import resting_rule_helpers
+    helpers = resting_rule_helpers()
+    for name in close_names or []:
+        if name in helpers.RESTING_TP_UNSUPPORTED_CLOSES:
+            return f"resting_tp_rule does not support {name}"
+    return ""
+
+
+def _resting_rule_observation(shared, request, side):
+    from close_registry_loader import resting_rule_helpers
+    helpers = resting_rule_helpers()
+    obs = {
+        "hold_reason": request["hold_reason"],
+        "cutoff_ms": int(shared["closed"]["cutoff_ms"] or 0),
+        "entry_bar_open_ms": 0,
+        "coverage": "complete",
+        "rows": [],
+        "timings": [],
+        "bars": [],
+    }
+    if not obs["hold_reason"] and request["entry_time_ms"] <= 0:
+        obs["hold_reason"] = "entry_time_unknown"
+    if not obs["hold_reason"] and side not in ("long", "short"):
+        obs["hold_reason"] = "position_missing"
+    if not obs["hold_reason"]:
+        primary = _shared_closed_decision(shared)
+        if primary["hold"]:
+            obs["hold_reason"] = "closed_history_unavailable: " + primary["hold"]
+        else:
+            selection = primary["selection"]
+            entry_ms = request["entry_time_ms"]
+            scanned_through = request["scanned_through_ms"]
+            interval = int(selection.interval_ms)
+            start = None
+            entry_idx = None
+            for i, timing in enumerate(selection.timings):
+                if timing.open_ms <= entry_ms < timing.open_ms + interval:
+                    obs["entry_bar_open_ms"] = int(timing.open_ms)
+                    if not scanned_through:
+                        entry_idx = i
+                        start = i
+                        break
+                if scanned_through and timing.open_ms > scanned_through:
+                    start = i
+                    break
+                if not scanned_through and timing.open_ms > entry_ms:
+                    start = i
+                    break
+            if start is not None:
+                if scanned_through:
+                    if int(selection.timings[start].open_ms) > scanned_through + interval:
+                        obs["coverage"] = "frame_truncated"
+                elif entry_idx is None:
+                    obs["coverage"] = "frame_truncated"
+                obs["rows"] = selection.rows[start:]
+                obs["timings"] = selection.timings[start:]
+                obs["bars"] = [
+                    helpers.resting_rule_bar(
+                        timing.open_ms, row[2], row[3], row[4], side,
+                        entry_bar=(start + i) == entry_idx, walk_mode=True,
+                    )
+                    for i, (row, timing) in enumerate(zip(obs["rows"], obs["timings"]))
+                ]
+    obs["rule"] = helpers.build_resting_rule(
+        sz_decimals=request["sz_decimals"], bars=obs["bars"],
+        stop_trigger_px=request["stop_trigger_px"], coverage=obs["coverage"],
+        prior_reach_px=request["prior_reach_px"],
+        held=bool(obs["hold_reason"]), hold_reason=obs["hold_reason"],
+    )
+    obs["next_scanned_through_ms"] = request["scanned_through_ms"]
+    obs["next_reach_px"] = request["prior_reach_px"]
+    obs["stop_reached_bar_open_ms"] = 0
+    if not obs["hold_reason"]:
+        scan = helpers.resting_rule_scan(helpers.resting_rule_input({helpers.RESTING_TP_RULE_KEY: obs["rule"]}), side)
+        if scan["last_scanned_open_ms"]:
+            obs["next_scanned_through_ms"] = int(scan["last_scanned_open_ms"])
+        if scan["best"] is not None:
+            obs["next_reach_px"] = float(scan["best"])
+        obs["stop_reached_bar_open_ms"] = int(scan["stop_bar"] or 0)
+    return obs
+
+
+def _resting_rule_echo(request, obs, decision):
+    evidence = (decision or {}).get("close_resting_fill") or {}
+    timings = obs["timings"]
+    return {
+        "v": request["v"],
+        "enabled": True,
+        "held": bool(obs["hold_reason"]),
+        "hold_reason": obs["hold_reason"],
+        "k_ticks": request["k_ticks"],
+        "sz_decimals": request["sz_decimals"],
+        "cutoff_ms": obs["cutoff_ms"],
+        "entry_time_ms": request["entry_time_ms"],
+        "entry_bar_open_ms": obs["entry_bar_open_ms"],
+        "stop_trigger_px": request["stop_trigger_px"],
+        "coverage": obs["coverage"],
+        "observed_bars": len(obs["bars"]),
+        "first_observed_open_ms": int(timings[0].open_ms) if timings else 0,
+        "last_observed_open_ms": int(timings[-1].open_ms) if timings else 0,
+        "observed_rows_sha256": rows_sha256(obs["rows"], timings) if timings else "",
+        "scanned_through_ms": request["scanned_through_ms"],
+        "prior_reach_px": request["prior_reach_px"],
+        "next_scanned_through_ms": obs["next_scanned_through_ms"],
+        "next_reach_px": obs["next_reach_px"],
+        "reach_bar_open_ms": int(evidence.get("reach_bar_open_ms") or 0),
+        "stop_reached_bar_open_ms": obs["stop_reached_bar_open_ms"],
+        "verdict": str(evidence.get("verdict") or ""),
+    }
+
+
 def evaluate_signal_slot(shared, slot, deps=None, admission=None):
     if deps is None:
         deps = _signal_check_deps()
@@ -626,7 +836,15 @@ def evaluate_signal_slot(shared, slot, deps=None, admission=None):
     invert_present = "invert_open_signal" in slot
     invert_open_signal = deps.parse_invert_open_signal(slot.get("invert_open_signal")) if invert_present else False
 
-    _validate_slot_strategy_names(deps, strategy_name, open_strategy, close_strategies, admission)
+    _validate_slot_strategy_names(deps, strategy_name, open_strategy, close_strategies, admission,
+                                  strategy_params_override, close_params_by_name)
+    resting_request = parse_resting_rule_request(slot.get("resting_tp_rule"))
+    if resting_request is not None:
+        refusal = _resting_rule_refusal(mode, deps.parse_close_strategies(close_strategies))
+        if refusal:
+            raise ValueError(refusal)
+        if not shared["closed"].get("timed"):
+            raise ValueError("resting_tp_rule slot reached a shared state built without bar timing")
 
     symbol = shared["symbol"]
     timeframe = shared["timeframe"]
@@ -692,7 +910,7 @@ def evaluate_signal_slot(shared, slot, deps=None, admission=None):
             print(f"Closed-bar decision held for {symbol} {timeframe}: {hold}", file=sys.stderr)
         else:
             closed_meta = selection.metadata()
-            decision_df = _make_dataframe(selection.rows)
+            decision_df = _frame_with_cadence(selection.rows, timeframe, selection.timings)
             strategy_params = decision_params
     else:
         strategy_params = {}
@@ -709,6 +927,12 @@ def evaluate_signal_slot(shared, slot, deps=None, admission=None):
         merged = {**strategy_params_override, **strategy_params}
         strategy_params = merged
     decision = None
+    resting_obs = None
+    if resting_request is not None:
+        resting_obs = _resting_rule_observation(
+            shared, resting_request, str((position_ctx or {}).get("side") or position_side or "").strip().lower())
+        if resting_obs["hold_reason"]:
+            print(f"Resting take-profit rule held for {symbol} {timeframe}: {resting_obs['hold_reason']}", file=sys.stderr)
     if open_close_enabled:
         market_ctx = {"mark_price": float(df["close"].iloc[-1])}
         atr_now = shared["atr"]
@@ -716,6 +940,8 @@ def evaluate_signal_slot(shared, slot, deps=None, admission=None):
             market_ctx["atr"] = atr_now
         if live_regime:
             market_ctx["regime"] = live_regime
+        if resting_obs is not None:
+            market_ctx["resting_tp_rule"] = resting_obs["rule"]
         evaluation = deps.evaluate_open_close(
             deps.apply_strategy,
             deps.get_strategy,
@@ -795,6 +1021,7 @@ def evaluate_signal_slot(shared, slot, deps=None, admission=None):
         signal = decision["signal"]
 
     indicators = {}
+    indicator_labels = {}
     skip_cols = {
         "open", "high", "low", "close", "volume",
         "timestamp", "signal", "position", "datetime",
@@ -804,11 +1031,16 @@ def evaluate_signal_slot(shared, slot, deps=None, admission=None):
             if col in skip_cols:
                 continue
             val = last.get(col)
+            if col in TEXT_INDICATOR_COLUMNS:
+                if isinstance(val, str):
+                    indicator_labels[col] = val
+                continue
             if val is not None:
                 try:
                     fval = float(val)
                     if math.isfinite(fval):
-                        indicators[col] = round(fval, 6)
+                        indicators[col] = (fval if col.startswith(FULL_PRECISION_INDICATOR_PREFIXES)
+                                           else round(fval, 6))
                 except (ValueError, TypeError):
                     pass
 
@@ -829,8 +1061,12 @@ def evaluate_signal_slot(shared, slot, deps=None, admission=None):
         "platform": "hyperliquid",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if indicator_labels:
+        output["indicator_labels"] = indicator_labels
     if decision:
         output.update(decision)
+    if resting_request is not None:
+        output["resting_tp_rule"] = _resting_rule_echo(resting_request, resting_obs, decision)
     if closed_meta is not None:
         output["closed_bar_decision"] = closed_meta
         if decision_regime_payload is not None:
@@ -852,12 +1088,14 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                      invert_open_signal=None,
                      mode_args=None,
                      closed_bar=False,
-                     decision_regime_timeframe=""):
+                     decision_regime_timeframe="",
+                     resting_tp_rule=None):
     try:
         deps = _signal_check_deps()
         from strategy_composition import parse_allow_no_edge_tokens
         admission = (deps.parse_raw_gate_mode(mode_args), parse_allow_no_edge_tokens(mode_args))
-        _validate_slot_strategy_names(deps, strategy_name, open_strategy, close_strategies, admission)
+        _validate_slot_strategy_names(deps, strategy_name, open_strategy, close_strategies, admission,
+                                      strategy_params_override, close_params_by_name)
 
         adapter = None
         if market is None:
@@ -876,6 +1114,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             market=market,
             closed_bar=closed_bar,
             decision_regime_timeframe=decision_regime_timeframe,
+            timed_rows=resting_tp_rule is not None,
         )
         slot = {
             "id": strategy_name,
@@ -895,6 +1134,8 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             slot["invert_open_signal"] = invert_open_signal
         if closed_bar:
             slot["closed_bar_decisions"] = True
+        if resting_tp_rule is not None:
+            slot["resting_tp_rule"] = resting_tp_rule
         output = evaluate_signal_slot(shared, slot, deps=deps, admission=admission)
         print(json.dumps(output, cls=SafeEncoder))
 
@@ -984,6 +1225,8 @@ def parse_batch_request(raw_stdin):
             raise ValueError(f"slot {slot_id!r} allow_no_edge must be a JSON boolean, got {slot['allow_no_edge']!r}")
         if "closed_bar_decisions" in slot and not isinstance(slot["closed_bar_decisions"], bool):
             raise ValueError(f"slot {slot_id!r} closed_bar_decisions must be a JSON boolean, got {slot['closed_bar_decisions']!r}")
+        if "resting_tp_rule" in slot and not isinstance(slot["resting_tp_rule"], dict):
+            raise ValueError(f"slot {slot_id!r} resting_tp_rule must be a JSON object, got {slot['resting_tp_rule']!r}")
         refs = slot.get("strategy_refs")
         if refs:
             from strategy_composition import parse_strategy_refs_arg
@@ -1035,6 +1278,21 @@ def run_batch_signal_check(symbol, timeframe, slots, *, ohlcv_limit=200, atr_met
     }
     try:
         deps = _signal_check_deps()
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        envelope["error"] = str(e)
+        envelope["error_scope"] = "shared_state"
+        return envelope, 1
+
+    preflight_errors = {}
+    for idx, slot in enumerate(slots):
+        try:
+            preflight_signal_slot(slot, deps)
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            preflight_errors[idx] = str(e)
+
+    try:
         if market is not None:
             adapter = None
             df = None
@@ -1053,6 +1311,7 @@ def run_batch_signal_check(symbol, timeframe, slots, *, ohlcv_limit=200, atr_met
             market=market,
             closed_bar=any(slot.get("closed_bar_decisions") is True for slot in slots),
             decision_regime_timeframe=decision_regime_timeframe,
+            timed_rows=any("resting_tp_rule" in slot for slot in slots),
         )
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
@@ -1061,7 +1320,12 @@ def run_batch_signal_check(symbol, timeframe, slots, *, ohlcv_limit=200, atr_met
         return envelope, 1
 
     failed = False
-    for slot in slots:
+    for idx, slot in enumerate(slots):
+        if idx in preflight_errors:
+            failed = True
+            envelope["results"].append(
+                _batch_slot_error(slot, symbol, timeframe, preflight_errors[idx]))
+            continue
         try:
             output = evaluate_signal_slot(shared, slot, deps=deps)
             output["id"] = slot.get("id", "")
@@ -2841,6 +3105,8 @@ def main():
             help="#1712: decide signals and entry ATR on the last closed bar; protection keeps current inputs.")
         parser.add_argument("--decision-regime-timeframe", default="",
             help="#1712: regime timeframe for the closed-bar decision view; defaults to the strategy timeframe.")
+        parser.add_argument("--resting-tp-rule-json", default=None,
+            help="#1727: paper-only resting take-profit trade-through rule request from Go; live mode refuses it.")
         parser.add_argument("--probe-only", action="store_true",
             help="Startup compatibility probe (#645): validate argv shape and exit 0.")
         args = parser.parse_args()
@@ -2874,6 +3140,27 @@ def main():
         close_params_by_name = refs["close_params_by_name"] if refs else None
         position_ctx = _position_ctx_from_args(args)
         regime_windows_spec = parse_regime_windows_spec_json(args.regime_windows_spec_json or None)
+        resting_rule = None
+        if args.resting_tp_rule_json is not None:
+            try:
+                resting_rule = json.loads(args.resting_tp_rule_json)
+                if not isinstance(resting_rule, dict):
+                    raise ValueError("--resting-tp-rule-json must be a JSON object")
+            except ValueError as e:
+                print(json.dumps({
+                    "strategy": args.strategy,
+                    "symbol": args.symbol,
+                    "timeframe": args.timeframe,
+                    "signal": 0,
+                    "price": 0,
+                    "indicators": {},
+                    "regime": None,
+                    "mode": args.mode,
+                    "platform": "hyperliquid",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error": f"invalid --resting-tp-rule-json: {e}",
+                }, cls=SafeEncoder))
+                sys.exit(1)
         run_signal_check(
             args.strategy, args.symbol, args.timeframe, args.mode,
             args.htf_filter, params_override, open_strategy_name,
@@ -2893,6 +3180,7 @@ def main():
             mode_args=sys.argv[1:],
             closed_bar=args.closed_bar_decisions,
             decision_regime_timeframe=args.decision_regime_timeframe,
+            resting_tp_rule=resting_rule,
         )
 
 

@@ -29,48 +29,41 @@ OBSERVATION_INPUT_STRATEGIES = {"open_interest_breakout"}
 FUNDING_ACCRUAL_STRATEGIES = {"delta_neutral_funding"}
 
 
-_SYMBOL_LEVERAGE_MAP = {
-    "BTC/USDT": 150, "ETH/USDT": 150, "SOL/USDT": 125, "BNB/USDT": 125,
-    "HYPE/USDT": 75, "1000BONK/USDT": 75, "SPX6900/USDT": 75,
-    "XAU/USDT": 100, "USO/USDT": 20,
-    "AAPL/USDT": 50, "NVDA/USDT": 50, "META/USDT": 50, "MSFT/USDT": 50,
-    "AMZN/USDT": 50, "GOOGL/USDT": 50, "TSLA/USDT": 50,
-    "SPY/USDT": 50, "QQQ/USDT": 50,
-    "USELESS/USDT": 75, "ZEC/USDT": 75, "WLD/USDT": 75,
-    "BEAT/USDT": 75, "MAGIC/USDT": 75,
-    "SPCX/USDT": 50, "SPCE/USDT": 50,
-}
+def attach_backtest_funding(*args, **kwargs):
+    """Re-export of the shared helper for callers that import run_backtest."""
+    from funding_fetcher import attach_backtest_funding as impl
+    return impl(*args, **kwargs)
 
 
-def _get_leverage_for_symbol(symbol: str) -> float:
-    return _SYMBOL_LEVERAGE_MAP.get(symbol, 75)
-
-
-def _attach_funding_if_needed(df, strategy_name, symbol, since, store=True):
-    if strategy_name not in FUNDING_COLUMN_STRATEGIES or df.empty:
+def _attach_funding_if_needed(df, strategy_name, symbol, since,
+                              platform="hyperliquid", strategy_type="perps",
+                              mode="charge", timeframe=None):
+    if df is None or getattr(df, "empty", True):
         return df
-    from funding_fetcher import (attach_funding_accrual_column,
-                                 attach_funding_column, load_cached_funding)
-    coin = symbol.split("/")[0]
-    try:
-        funding = load_cached_funding(coin, since, end_date=df.index[-1], store=store)
-    except Exception as e:
-        print(f"[WARN] funding history fetch failed for {coin}: {e} — "
-              f"'{strategy_name}' will produce zero entries.")
-        funding = None
-    out = attach_funding_column(df, funding)
-    have = int(out["funding_rate"].notna().sum())
-    if have == 0:
-        print(f"[WARN] no funding data attached for {coin} since {since} — "
-              f"'{strategy_name}' will produce zero entries.")
-    else:
-        print(f"  Funding: {have}/{len(out)} bars covered (HL hourly, coin={coin})")
-    if strategy_name in FUNDING_ACCRUAL_STRATEGIES:
-        out = attach_funding_accrual_column(out, funding)
+    from funding_fetcher import attach_backtest_funding as impl
+    coin = str(symbol).split("/")[0]
+    out, block = impl(
+        df, coin, timeframe, platform, strategy_type, strategy_name,
+        mode=mode, since=since,
+    )
+    if strategy_name in FUNDING_COLUMN_STRATEGIES:
+        if not block.get("available"):
+            print(f"[WARN] funding history fetch failed for {coin}: "
+                  f"{block.get('error', 'no rows')} — "
+                  f"'{strategy_name}' will produce zero entries.")
+        else:
+            rate = out["funding_rate"] if "funding_rate" in out.columns else None
+            have = int(rate.notna().sum()) if rate is not None else 0
+            if have == 0:
+                print(f"[WARN] no funding data attached for {coin} since {since} — "
+                      f"'{strategy_name}' will produce zero entries.")
+            else:
+                print(f"  Funding: {have}/{len(out)} bars covered (HL hourly, coin={coin})")
     return out
 from htf_filter import get_default_htf, apply_htf_filter
 from registry_loader import load_registry
 from backtester import (Backtester, CapabilityContext, CloseCapabilityError,
+                        FundingIncompleteError, _LABELS_UNSET,
                         STOP_FIELD_KEYS, STOP_GEOMETRY_INPUT_KEYS,
                         STOP_PERCENT_FIELD_KEYS, STOP_REGIME_FIELD_KEYS,
                         STOP_SCALAR_FIELD_KEYS, STOP_UNITS_LIVE_CONFIG,
@@ -247,30 +240,50 @@ def _resolve_backtestable_hurst_gate(
     return resolved
 
 
-def _validate_allowed_regimes_vocabulary(
+def allowed_regimes_vocabulary_error(
     allowed_regimes: Optional[List[str]],
-    windows_spec: Optional[dict],
-) -> None:
+    classifier: str,
+    window_key: Optional[str] = None,
+) -> Optional[str]:
     if not allowed_regimes:
-        return
-    classifier = _primary_window_classifier(windows_spec)
+        return None
     valid = valid_labels_for_classifier(classifier)
     invalid = [lab for lab in allowed_regimes if lab not in valid]
     if not invalid:
-        return
-    msg = (
-        f"--allowed-regimes {invalid!r}: not valid label(s) for the primary "
-        f"regime window's {classifier!r} classifier. Valid: "
-        f"{', '.join(sorted(valid))}."
-    )
+        return None
+    if window_key:
+        msg = (
+            f"allowed_regimes {invalid!r}: not valid label(s) for gate window "
+            f"{window_key!r} ({classifier!r} classifier). Valid: "
+            f"{', '.join(sorted(valid))}."
+        )
+    else:
+        msg = (
+            f"--allowed-regimes {invalid!r}: not valid label(s) for the primary "
+            f"regime window's {classifier!r} classifier. Valid: "
+            f"{', '.join(sorted(valid))}."
+        )
     if classifier == CLASSIFIER_ADX and any(lab in VALID_LABELS_COMPOSITE for lab in invalid):
         msg += (
             " (Composite 9-state labels require a composite primary window — "
             "supply --regime-windows-spec-json with a composite classifier, or "
             "use --config.)"
         )
-    print(msg)
-    sys.exit(1)
+    return msg
+
+
+def _validate_allowed_regimes_vocabulary(
+    allowed_regimes: Optional[List[str]],
+    windows_spec: Optional[dict],
+    window_key: Optional[str] = None,
+    classifier: Optional[str] = None,
+) -> None:
+    if classifier is None:
+        classifier = _primary_window_classifier(windows_spec)
+    msg = allowed_regimes_vocabulary_error(allowed_regimes, classifier, window_key)
+    if msg:
+        print(msg)
+        sys.exit(1)
 
 
 def _build_profile_label_series(df: pd.DataFrame, window_spec: dict) -> pd.Series:
@@ -705,7 +718,7 @@ _LIVE_DEFAULT_STOP_LOSS_ATR_MULT = 1.0
 
 
 LIVE_STOP_KWARG_KEYS = STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS + (
-    "stop_platform", "capability_context")
+    "stop_platform", "capability_context", "perps_sizing", "liquidation_model", "venue_margin")
 
 
 def live_stop_kwargs(loaded: dict) -> dict:
@@ -715,6 +728,9 @@ def live_stop_kwargs(loaded: dict) -> dict:
 def stop_context_to_json(loaded: dict) -> dict:
     out = {k: deepcopy(loaded[k]) for k in STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS
            + ("stop_platform", "strategy_type") if loaded.get(k) is not None}
+    for key in ("perps_sizing", "liquidation_model", "venue_margin"):
+        if loaded.get(key) is not None:
+            out[key] = deepcopy(loaded[key])
     context = loaded.get("capability_context")
     if context is not None:
         out["capability_context"] = context.to_dict()
@@ -730,7 +746,8 @@ def stop_kwargs_from_json(payload) -> dict:
             "stop_context.stop_units must be 'engine_fraction' (the translator already "
             f"converted live percent units once), got {payload.get('stop_units')!r}")
     allowed = set(STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS) | {
-        "stop_platform", "strategy_type", "capability_context", "stop_units"}
+        "stop_platform", "strategy_type", "capability_context", "stop_units",
+        "perps_sizing", "liquidation_model", "venue_margin"}
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValueError(f"stop_context has unknown key(s) {unknown}")
@@ -786,14 +803,24 @@ def apply_live_scalar_stop_default(cfg: dict, sc: dict, platform: str, strategy_
     sc["stop_loss_atr_mult"] = default
 
 
-def _atr_window_evidence(sc: dict, regime_cfg: dict) -> dict:
+def _atr_window_evidence(sc: dict, regime_cfg: dict,
+                         prepared_windows: Optional[set] = None) -> dict:
+    """Admit a non-primary ATR window only when the caller prepared its column.
+
+    `prepared_windows is None` keeps the ledger and raw-config path primary-only:
+    a named non-primary window stays `missing` and the stop stays refused.
+    """
     window = str(sc.get("regime_atr_window") or "").strip().lower()
     if window in ("", "default"):
         return {"status": "verified", "source": "regime_atr_window", "value": window or None}
     windows = regime_cfg.get("windows") if regime_cfg.get("enabled") else None
     names = sorted(str(k).strip().lower() for k in (windows or {}))
     primary = "medium" if "medium" in names else (names[0] if names else "")
-    status = "verified" if window == primary else "missing"
+    prepared = {str(k).strip().lower() for k in (prepared_windows or set())}
+    if prepared_windows is None:
+        status = "verified" if window == primary else "missing"
+    else:
+        status = "verified" if window in prepared else "missing"
     return {"status": status, "source": "regime_atr_window", "value": window}
 
 
@@ -832,7 +859,8 @@ def live_stop_engine_inputs(resolved: dict, *, raw_fields: dict, source: str,
 
 
 def live_stop_resolution(cfg: dict, sc: dict, raw_fields: dict, *, platform: str,
-                         strategy_type: str, close_refs: list, regime_cfg: dict):
+                         strategy_type: str, close_refs: list, regime_cfg: dict,
+                         prepared_windows: Optional[set] = None):
     apply_live_scalar_stop_default(cfg, sc, platform, strategy_type, close_refs)
     resolved = {k: sc.get(k) for k in STOP_FIELD_KEYS}
     resolved["max_drawdown_pct"] = _live_max_drawdown_pct(cfg, sc, platform, strategy_type)
@@ -846,7 +874,8 @@ def live_stop_resolution(cfg: dict, sc: dict, raw_fields: dict, *, platform: str
         lev = leverage_evidence(raw_leverage, "config", True)
     kwargs, context = live_stop_engine_inputs(
         resolved, raw_fields=raw_fields, source=STOP_UNITS_LIVE_CONFIG, leverage=lev,
-        extra_evidence={"atr_regime_window": _atr_window_evidence(sc, regime_cfg)})
+        extra_evidence={"atr_regime_window": _atr_window_evidence(
+            sc, regime_cfg, prepared_windows)})
     kwargs["stop_platform"] = platform
     return kwargs, context
 
@@ -854,11 +883,12 @@ def live_stop_resolution(cfg: dict, sc: dict, raw_fields: dict, *, platform: str
 def live_stop_preflight(kwargs: dict, context, *, platform: str, strategy_type: str,
                         close_refs: list, regime_windows_spec, risk_per_trade_pct,
                         comparison_mode=None, consumer: str = "engine",
-                        phase: str = "preflight"):
+                        phase: str = "preflight", regime_labels=_LABELS_UNSET):
     preflight = build_stop_capability_context(
         platform=platform, strategy_type=strategy_type, close_refs=close_refs,
         fields=kwargs, regime_windows_spec=regime_windows_spec,
-        risk_per_trade_pct=risk_per_trade_pct, capability_context=context)
+        risk_per_trade_pct=risk_per_trade_pct, capability_context=context,
+        regime_labels=regime_labels)
     return validate_close_capabilities(
         close_refs=close_refs, comparison_mode=comparison_mode, platform=platform,
         strategy_type=strategy_type, consumer=consumer, phase=phase,
@@ -903,7 +933,8 @@ def strategy_close_refs(sc: dict, label: str) -> list:
 
 
 def resolve_live_strategy_stops(cfg: dict, sc: dict, user_defaults: Optional[dict], *,
-                                inject_user_defaults: bool, label: str) -> dict:
+                                inject_user_defaults: bool, label: str,
+                                prepared_windows: Optional[set] = None) -> dict:
     raw_stop_fields = stop_raw_fields(sc)
     close_refs = strategy_close_refs(sc, label)
     if inject_user_defaults:
@@ -915,7 +946,8 @@ def resolve_live_strategy_stops(cfg: dict, sc: dict, user_defaults: Optional[dic
     strategy_type = str(sc.get("type") or "perps")
     kwargs, context = live_stop_resolution(
         cfg, sc, raw_stop_fields, platform=platform, strategy_type=strategy_type,
-        close_refs=close_refs, regime_cfg=regime_cfg)
+        close_refs=close_refs, regime_cfg=regime_cfg,
+        prepared_windows=prepared_windows)
     return {
         "raw_stop_fields": raw_stop_fields,
         "close_refs": close_refs,
@@ -939,10 +971,216 @@ def resolve_raw_config_stops(cfg: dict, strategy_id: str, label: str) -> dict:
     raise ValueError(f"{label}: no strategy with id={strategy_id!r}")
 
 
+_UNIFIED_CLOSE_NAMES = (
+    "tiered_tp_atr_regime",
+    "tiered_tp_atr_live_regime",
+    "tiered_tp_atr_live_regime_dynamic",
+)
+_MAX_AUTO_STOP_LOSS_PCT = 50.0
+
+
+def _args_mode(args) -> str:
+    if not isinstance(args, list):
+        return ""
+    for i, arg in enumerate(args):
+        text = str(arg)
+        if text.startswith("--mode="):
+            return text.split("=", 1)[1]
+        if text == "--mode" and i + 1 < len(args):
+            return str(args[i + 1])
+    return ""
+
+
+def _is_live_args(args) -> bool:
+    return _args_mode(args) == "live"
+
+
+def resting_tp_trade_through_from_config(config_path: str, strategy_id: str) -> tuple:
+    import json as _json
+    with open(config_path) as fh:
+        cfg = _json.load(fh)
+    for sc in cfg.get("strategies", []) or []:
+        if not isinstance(sc, dict) or sc.get("id") != strategy_id:
+            continue
+        live = _is_live_args(sc.get("args"))
+        if "resting_tp_trade_through" not in sc:
+            return False, live
+        value = sc["resting_tp_trade_through"]
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"{config_path}: strategy {strategy_id!r} resting_tp_trade_through must be "
+                f"the JSON literal true or false, got {_json.dumps(value)}")
+        if value and live:
+            raise ValueError(
+                f"{config_path}: strategy {strategy_id!r} sets resting_tp_trade_through on a "
+                "live strategy; the venue decides live fills, so the flag is paper-only "
+                "(use --resting-tp-trade-through to model a live strategy)")
+        return value, live
+    raise ValueError(f"{config_path}: no strategy with id={strategy_id!r}")
+
+
+def resolve_resting_tp_trade_through(*, cli: bool, config_path: Optional[str],
+                                     strategy_id: str, mode: str, manifest: Optional[str]) -> bool:
+    configured = False
+    if config_path:
+        configured, live = resting_tp_trade_through_from_config(config_path, strategy_id)
+        if cli and not live and not configured:
+            raise ValueError(
+                f"--resting-tp-trade-through disagrees with paper strategy {strategy_id!r}, "
+                "whose resting_tp_trade_through is false; a paper strategy's own flag owns "
+                "the rule (set it in the config or drop the option)")
+    enabled = bool(cli or configured)
+    if not enabled:
+        return False
+    if mode != "single":
+        raise ValueError("the resting take-profit trade-through rule needs --mode single")
+    if not manifest:
+        raise ValueError(
+            "the resting take-profit trade-through rule needs --manifest: the tick grid "
+            "comes from the manifest execution spec's size decimals, so without it the "
+            "tick is unknown")
+    return True
+
+
+def _unified_regime_close(close_refs) -> bool:
+    for ref in close_refs or []:
+        if not isinstance(ref, dict):
+            continue
+        name = str(ref.get("name") or "").strip().lower()
+        params = ref.get("params") or {}
+        if name in _UNIFIED_CLOSE_NAMES and isinstance(params, dict) and "trend_regime" in params:
+            return True
+    return False
+
+
+def _positive(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:
+        return 0.0
+    return number if number > 0 else 0.0
+
+
+def refuse_live_isolated_bankruptcy(sc: dict, close_refs) -> None:
+    """Mirror validateHLStopWithinBankruptcyBound. Paper, cross, and non-live skip."""
+    if live_strategy_platform(sc) != "hyperliquid" or sc.get("type") != "perps":
+        return
+    if not _is_live_args(sc.get("args")):
+        return
+    if str(sc.get("margin_mode") or "").strip().lower() == "cross":
+        return
+    lev = _positive(sc.get("leverage")) or 1.0
+    bound = 100.0 / lev
+    unified = _unified_regime_close(close_refs)
+    errs = []
+
+    def report(field, pct):
+        if pct <= 0 or pct < bound:
+            return
+        errs.append(
+            f"{field} = {pct:g}% is at or beyond the isolated-margin bankruptcy "
+            f"distance (100 / leverage = {bound:g}% at leverage {lev:g})")
+
+    if not unified:
+        if sc.get("stop_loss_pct") is not None:
+            report("stop_loss_pct", _positive(sc.get("stop_loss_pct")))
+        margin_pct = _positive(sc.get("stop_loss_margin_pct"))
+        if margin_pct > 0:
+            report("derived stop-loss price %% (stop_loss_margin_pct / leverage)", margin_pct / lev)
+    drawdown_fallback = (
+        not unified
+        and _positive(sc.get("trailing_stop_atr_mult")) <= 0
+        and _positive(sc.get("stop_loss_atr_mult")) <= 0
+        and not sc.get("stop_loss_atr_mult_regime")
+        and not sc.get("trailing_stop_atr_mult_regime")
+        and sc.get("trailing_stop_pct") is None
+        and sc.get("stop_loss_pct") is None
+        and sc.get("stop_loss_margin_pct") is None
+        and _positive(sc.get("max_drawdown_pct")) > 0
+    )
+    if drawdown_fallback:
+        fallback = _positive(sc.get("max_drawdown_pct"))
+        if fallback > _MAX_AUTO_STOP_LOSS_PCT:
+            fallback = _MAX_AUTO_STOP_LOSS_PCT
+        report("max_drawdown_pct", fallback)
+    if errs:
+        raise ValueError("; ".join(errs))
+
+
+def shared_wallet_pool(cfg: dict) -> tuple:
+    """Mirror validateConfiguredSharedWalletPools. Returns (pooled ids, errors)."""
+    groups = {}
+    for sc in cfg.get("strategies") or []:
+        if not isinstance(sc, dict):
+            continue
+        platform = live_strategy_platform(sc)
+        if platform not in ("hyperliquid", "okx") or sc.get("type") != "perps":
+            continue
+        if not _is_live_args(sc.get("args")):
+            continue
+        groups.setdefault(platform, []).append(sc)
+    pooled = set()
+    errs = []
+    for platform, members in groups.items():
+        if len(members) < 2:
+            continue
+        if not any(_positive(sc.get("capital")) == 0 and _positive(sc.get("capital_pct")) == 0
+                   for sc in members):
+            continue
+        for sc in members:
+            sid = sc.get("id")
+            if _positive(sc.get("capital")) != 0 or _positive(sc.get("capital_pct")) != 0:
+                errs.append(
+                    f"shared-wallet pool {platform}/perps: strategy[{sid}] uses a virtual "
+                    "capital allocation; every member must omit capital and capital_pct")
+                continue
+            pooled.add(sid)
+            if _positive(sc.get("margin_per_trade_usd")) <= 0:
+                errs.append(
+                    f"strategy[{sid}]: shared-wallet pool members require positive "
+                    "margin_per_trade_usd as the per-open hard cap")
+            if _positive(sc.get("initial_capital")) != 0:
+                errs.append(
+                    f"strategy[{sid}]: initial_capital is not supported in shared-wallet pool mode")
+            if _positive(sc.get("risk_per_trade_pct")) > 0:
+                errs.append(
+                    f"strategy[{sid}]: risk_per_trade_pct requires a per-strategy capital "
+                    "denominator and is not supported in shared-wallet pool mode")
+    return pooled, errs
+
+
+def resolve_perps_sizing(cfg: dict, sc: dict) -> Optional[dict]:
+    """Live sizing contract for a Hyperliquid perps --config strategy. None otherwise."""
+    if live_strategy_platform(sc) != "hyperliquid" or sc.get("type") != "perps":
+        return None
+    pooled, errs = shared_wallet_pool(cfg)
+    sid = sc.get("id")
+    own = [e for e in errs if f"strategy[{sid}]" in e or f"[{sid}]" in e]
+    if own:
+        raise ValueError("; ".join(own))
+    exchange = _positive(sc.get("leverage")) or 1.0
+    sizing = _positive(sc.get("sizing_leverage")) or exchange
+    margin = _positive(sc.get("margin_per_trade_usd"))
+    mode = str(sc.get("margin_mode") or "isolated").strip().lower() or "isolated"
+    budget = "shared_wallet_pool" if sid in pooled else "strategy_cash"
+    raw = {
+        "exchange_leverage": exchange,
+        "sizing_leverage": sizing,
+        "margin_per_trade_usd": margin if margin > 0 else None,
+        "margin_mode": mode,
+        "budget_source": budget,
+        "pool_evidence": "unverified" if budget == "shared_wallet_pool" else "verified",
+        "provenance": "load_strategy_config",
+    }
+    from backtester import normalize_perps_sizing
+    return normalize_perps_sizing(raw, exchange)
+
+
 def load_strategy_config(config_path: str, strategy_id: str,
                          inject_user_defaults: bool = False,
                          include_promotion_baseline: bool = False,
-                         include_runtime_inputs: bool = False,
                          comparison_mode: Optional[str] = None) -> dict:
     import json as _json
     with open(config_path) as fh:
@@ -1010,31 +1248,18 @@ def load_strategy_config(config_path: str, strategy_id: str,
                 f"strategy. Set hedge.enabled=false (or remove the block) to "
                 f"backtest the primary leg alone."
             )
+        from regime_label_columns import (prepared_window_keys,
+                                          resolve_feature_windows)
+        label_plan = resolve_feature_windows(
+            sc, regime_cfg, label=f"{config_path}: strategy {strategy_id!r}")
+        prepared = prepared_window_keys(label_plan) if regime_cfg.get("enabled") else None
         stops = resolve_live_strategy_stops(
             cfg, sc, user_defaults, inject_user_defaults=inject_user_defaults,
-            label=f"{config_path}: strategy {strategy_id!r}")
+            label=f"{config_path}: strategy {strategy_id!r}",
+            prepared_windows=prepared)
         close_refs = stops["close_refs"]
         stop_kwargs = stops["stop_kwargs"]
         stop_context = stops["stop_context"]
-        for ref in close_refs:
-            if ref.get("name") == "tiered_tp_atr_live_regime_dynamic":
-                if str(sc.get("platform") or "").strip().lower() != "blofin":
-                    # Other platforms: leave it to the close-capability policy
-                    # (HL-live-only refusal), which reports a structured error.
-                    continue
-                if str(sc.get("type") or "perps").strip().lower() != "perps":
-                    raise ValueError(
-                        f"{config_path}: strategy {strategy_id!r} uses "
-                        f"tiered_tp_atr_live_regime_dynamic, which is backtestable "
-                        f"here only for BloFin perps with the scheduler-managed "
-                        f"virtual stop."
-                    )
-                if not (cfg.get("regime") or {}).get("enabled"):
-                    raise ValueError(
-                        f"{config_path}: strategy {strategy_id!r} uses "
-                        "tiered_tp_atr_live_regime_dynamic, which requires "
-                        "regime.enabled=true."
-                    )
         direction = _effective_direction(sc)
         invert_signal = bool(sc.get("invert_signal"))
         strategy_type = stops["strategy_type"]
@@ -1047,6 +1272,8 @@ def load_strategy_config(config_path: str, strategy_id: str,
                 regime_windows_spec=stops["regime_windows_spec"],
                 risk_per_trade_pct=sc.get("risk_per_trade_pct"),
                 comparison_mode=comparison_mode,
+                regime_labels=(label_plan["parser_labels"]["atr"]
+                               if regime_cfg.get("enabled") else _LABELS_UNSET),
             )
         except CloseCapabilityError as exc:
             raise exc.with_context(
@@ -1114,20 +1341,15 @@ def load_strategy_config(config_path: str, strategy_id: str,
             raise ValueError(
                 f"{config_path}: strategy {strategy_id!r} {exc}"
             ) from exc
-        gate_window = str(sc.get("regime_gate_window") or "").strip().lower()
-        if (
-            allowed_regimes
-            and regime_cfg.get("enabled")
-            and gate_window not in ("", "default")
-        ):
-            raise ValueError(
-                f"{config_path}: strategy {strategy_id!r} gates allowed_regimes "
-                f"on regime_gate_window={gate_window!r}, but the backtester models "
-                f"only the legacy single-lookback regime (regime.period / "
-                f"regime.adx_threshold) — a named gate window has no bar-level "
-                f"parity path. Gate on the default lookback (remove "
-                f"regime_gate_window) or drop allowed_regimes for backtesting."
+        if allowed_regimes and regime_cfg.get("enabled"):
+            vocab_err = allowed_regimes_vocabulary_error(
+                allowed_regimes,
+                label_plan["classifiers"]["gate"],
+                label_plan["windows"]["gate"],
             )
+            if vocab_err:
+                raise ValueError(
+                    f"{config_path}: strategy {strategy_id!r} {vocab_err}")
         hurst_gate_cfg = sc.get("hurst_gate")
         if isinstance(hurst_gate_cfg, dict) and hurst_gate_cfg.get("enabled"):
             hurst_gate_cfg = _resolve_backtestable_hurst_gate(
@@ -1241,6 +1463,8 @@ def load_strategy_config(config_path: str, strategy_id: str,
                 _certs, cert_symbol, cert_timeframe, _clf,
             )
             regime_directional_certified = regime_directional_certified_states is not None
+        refuse_live_isolated_bankruptcy(sc, close_refs)
+        perps_sizing = resolve_perps_sizing(cfg, sc)
         out = {
             "open_strategy": {
                 "name": open_name,
@@ -1250,7 +1474,6 @@ def load_strategy_config(config_path: str, strategy_id: str,
             **stop_kwargs,
             "capability_context": stop_context,
             "strategy_type": strategy_type,
-            "platform": str(sc.get("platform") or "").strip().lower(),
             "direction": direction,
             "invert_signal": invert_signal,
             "regime_directional_policy": regime_directional_policy,
@@ -1261,6 +1484,7 @@ def load_strategy_config(config_path: str, strategy_id: str,
             "regime_adx_threshold": float(regime_cfg.get("adx_threshold", 20.0) or 20.0),
             "regime_timeframe": regime_timeframe,
             "regime_windows_spec": _resolve_regime_windows_spec(regime_cfg),
+            "regime_label_windows": label_plan if regime_cfg.get("enabled") else None,
             "allowed_regimes": allowed_regimes,
             "regime_gate_on_failure": regime_gate_on_failure,
             "hurst_gate": hurst_gate_cfg,
@@ -1271,22 +1495,8 @@ def load_strategy_config(config_path: str, strategy_id: str,
             "atr_method": atr_method,
             "platform": live_strategy_platform(sc),
             "comparison_mode": close_validation.mode,
+            "perps_sizing": perps_sizing,
         }
-        if include_runtime_inputs:
-            out.update({
-                "symbol": (
-                    str(sc.get("symbol") or (cfg_args[1] if len(cfg_args) > 1 else "")).strip()
-                    or None
-                ),
-                "timeframe": (
-                    str(sc.get("timeframe") or (cfg_args[2] if len(cfg_args) > 2 else "")).strip()
-                    or None
-                ),
-                "capital": sc.get("capital"),
-                "leverage": sc.get("leverage"),
-                "margin_per_trade_usd": sc.get("margin_per_trade_usd"),
-                "max_drawdown_pct": sc.get("max_drawdown_pct"),
-            })
         if include_promotion_baseline:
             out["promotion_baseline"] = promotion_baseline
         return out
@@ -1335,8 +1545,6 @@ def run_single_backtest(
     allow_scale_in: bool = False,
     scale_in: Optional[dict] = None,
     atr_method: str = "simple",
-    stop_platform: Optional[str] = None,
-    capability_context: Optional[CapabilityContext] = None,
     manifest_path: Optional[str] = None,
     manifest_dataset: Optional[str] = None,
     manifest_window: Optional[str] = None,
@@ -1345,16 +1553,19 @@ def run_single_backtest(
     leverage: Optional[float] = None,
     max_drawdown_pct: Optional[float] = None,
     trailing_stop_min_move_pct: Optional[float] = None,
-    circuit_breaker_max_drawdown_pct: Optional[float] = None,
-    save: bool = False,
-    margin_per_trade_usd: Optional[float] = None,
+    stop_platform: Optional[str] = None,
+    capability_context: Optional[CapabilityContext] = None,
+    funding_mode: str = "charge",
+    perps_sizing: Optional[dict] = None,
+    liquidation_model: str = "none",
+    venue_margin: Optional[dict] = None,
+    regime_label_plan: Optional[dict] = None,
+    resting_tp_trade_through: bool = False,
 ) -> Optional[dict]:
-    """Run a single backtest and print results.
-
-    ``platform`` selects the exchange fee model (``"binanceus"``,
-    ``"hyperliquid"``, ``"blofin"``, ``"robinhood"``, ``"luno"``, ``"okx"``,
-    ``"okx-perps"``), matching ``scheduler/fees.go:CalculatePlatformSpotFee``.
-    """
+    if resting_tp_trade_through and not manifest_path:
+        raise SystemExit(
+            "the resting take-profit trade-through rule needs --manifest (the tick grid "
+            "comes from the manifest execution spec)")
     manifest = None
     manifest_dataset_entry = None
     if manifest_path:
@@ -1403,6 +1614,20 @@ def run_single_backtest(
         strategy_type=strategy_type,
         phase="preflight",
     )
+    reg = load_registry(registry)
+    strat = reg.STRATEGY_REGISTRY.get(strategy_name)
+    if not strat:
+        print(f"Unknown strategy '{strategy_name}' in '{registry}' registry")
+        print(f"Available: {reg.list_strategies()}")
+        return None
+
+    strat_params = params or strat["default_params"]
+    print(f"\n▶ Strategy: {strat['description']}")
+    print(f"  Params: {strat_params}")
+    print(f"  Symbol: {symbol} | Timeframe: {timeframe} | Since: {since}")
+    if close_strategies:
+        print(f"  Close strategies: {[r.get('name') for r in close_strategies]}")
+
     window_spec = None
     execution_spec = None
     observation_params = {}
@@ -1428,29 +1653,15 @@ def run_single_backtest(
         print(f"  Funding coverage: {funding_cov}")
         print(f"  Execution spec: {execution_spec}")
     else:
-        df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since, store=save)
+        df = load_cached_data(symbol, timeframe, start_date=since)
         if df.empty:
             print("No data available!")
             return None
-        df = _attach_funding_if_needed(df, strategy_name, symbol, since, store=save)
-    reg = load_registry(registry)
-    strat = reg.STRATEGY_REGISTRY.get(strategy_name)
-    if not strat:
-        print(f"Unknown strategy '{strategy_name}' in '{registry}' registry")
-        print(f"Available: {reg.list_strategies()}")
-        return None
-
-    strat_params = params or strat["default_params"]
-    print(f"\n▶ Strategy: {strat['description']}")
-    print(f"  Params: {strat_params}")
-    print(f"  Symbol: {symbol} | Timeframe: {timeframe} | Since: {since}")
-    if close_strategies:
-        print(f"  Close strategies: {[r.get('name') for r in close_strategies]}")
-        # Keep the current BloFin live evaluator default (TP enabled); the
-        # legacy false default remains for other platform cohorts.
-        for cr in close_strategies:
-            cr_params = cr.setdefault("params", {})
-            cr_params.setdefault("tp_enabled", str(platform or "").lower() == "blofin")
+        df = _attach_funding_if_needed(
+            df, strategy_name, symbol, since,
+            platform=platform, strategy_type=strategy_type,
+            mode=funding_mode, timeframe=timeframe,
+        )
 
     print(f"  Data: {len(df)} candles from {df.index[0]} to {df.index[-1]}")
 
@@ -1492,7 +1703,22 @@ def run_single_backtest(
         df_signals = _apply_htf_filter_to_df(df_signals, symbol, timeframe)
         print(f"  HTF filter: applied (HTF={get_default_htf(timeframe)})")
 
-    if regime_enabled:
+    label_columns = None
+    if regime_enabled and regime_label_plan:
+        from regime_label_columns import (attach_regime_label_columns,
+                                          feature_label_kwargs)
+        regime_frame = None
+        regime_tf = str(regime_timeframe or "").strip().lower()
+        trade_tf = str(timeframe or "").strip().lower()
+        if regime_tf and regime_tf != trade_tf:
+            regime_frame = load_cached_data(symbol, regime_tf, start_date=since)
+            if regime_frame.empty:
+                print(f"No regime data available for {symbol} {regime_tf}")
+                return None
+        df_signals, label_columns = attach_regime_label_columns(
+            df_signals, regime_label_plan,
+            regime_frame=regime_frame if regime_frame is not None else None)
+    elif regime_enabled:
         df_signals = _apply_regime_timeframe_override(
             df_signals,
             symbol,
@@ -1535,10 +1761,17 @@ def run_single_backtest(
                   f"(matches live; #1076 negative result).")
     regime_directional_certified = bool(regime_directional_certified)
 
-    resolved_margin = margin_per_trade_usd if margin_per_trade_usd is not None else 10.0  # default 0 like Go
-    resolved_leverage = leverage if leverage is not None else _get_leverage_for_symbol(symbol)
-    print(f"  Margin: /trade | Leverage: {resolved_leverage:.0f}x")
-
+    if liquidation_model not in ("none", "venue_isolated"):
+        raise SystemExit(f"liquidation_model must be none or venue_isolated, got {liquidation_model!r}")
+    if liquidation_model == "venue_isolated":
+        if manifest is None:
+            raise SystemExit("--liquidation-model venue_isolated requires --manifest")
+        if venue_margin is None:
+            import offline_manifest as om
+            try:
+                venue_margin = om.venue_margin(manifest, manifest_dataset_entry)
+            except om.ManifestError as exc:
+                raise SystemExit(f"manifest error: {exc}")
     bt = Backtester(
         initial_capital=capital, platform=platform,
         open_strategy={"name": strategy_name, "params": dict(strat_params or {})},
@@ -1557,6 +1790,7 @@ def run_single_backtest(
         trailing_stop_pct=trailing_stop_pct,
         stop_loss_atr_mult_regime=stop_loss_atr_mult_regime,
         trailing_stop_atr_mult_regime=trailing_stop_atr_mult_regime,
+        leverage=leverage,
         max_drawdown_pct=max_drawdown_pct,
         trailing_stop_min_move_pct=trailing_stop_min_move_pct,
         stop_platform=stop_platform,
@@ -1573,24 +1807,55 @@ def run_single_backtest(
         allow_scale_in=allow_scale_in,
         scale_in=scale_in,
         atr_method=atr_method,
-        circuit_breaker_max_drawdown_pct=circuit_breaker_max_drawdown_pct,
-        margin_per_trade_usd=resolved_margin,
-        leverage=resolved_leverage,
         execution_spec=execution_spec,
         comparison_mode=comparison_mode,
+        perps_sizing=perps_sizing,
+        liquidation_model=liquidation_model,
+        venue_margin=venue_margin,
+        resting_tp_trade_through=resting_tp_trade_through,
+        regime_label_columns=label_columns,
+        **(feature_label_kwargs(regime_label_plan) if label_columns else {}),
     )
+    if manifest is None:
+        from funding_fetcher import rejoin_funding_columns
+        df_signals = rejoin_funding_columns(df_signals, df)
     results = bt.run(
         df_signals,
         strategy_name=strategy_name,
         symbol=symbol,
         timeframe=timeframe,
         params=strat_params,
-        save=save,
+        save=manifest is None,
         indicator_frame=indicator_frame,
     )
 
     print(format_single_report(results))
+    margin = results.get("margin") if isinstance(results, dict) else None
+    if margin:
+        exchange = margin.get("exchange_leverage")
+        budget = margin.get("margin_per_trade_usd")
+        if budget:
+            print(f"  Sizing model: {margin.get('sizing_model')}; "
+                  f"open notional = min({budget}, sizing cash) × {exchange}")
+        else:
+            print(f"  Sizing model: {margin.get('sizing_model')}; "
+                  f"open notional = sizing cash × {margin.get('sizing_leverage')}")
+        print(f"  Liquidation model: {margin.get('liquidation_model')} "
+              f"({margin.get('liquidation_formula')})")
+        if margin.get("pool_cap_unverified"):
+            print("  Pool cap: pool_cap_unverified (no per-entry available wallet margin)")
+    if regime_label_plan and isinstance(results, dict):
+        from regime_label_columns import regime_label_report
+        results["regime_label_windows"] = regime_label_report(regime_label_plan)
     return results
+
+
+def _funding_refusal(strategy: str, symbol: str, exc: FundingIncompleteError) -> dict:
+    """Record one charge-mode refusal. The caller keeps going and exits 1 later."""
+    block = (exc.metrics or {}).get("funding") or {}
+    print(f"  FUNDING REFUSED: {strategy} {symbol}")
+    print(json.dumps(block, sort_keys=True, default=str))
+    return {"strategy": strategy, "symbol": symbol, "funding": block}
 
 
 def run_all_strategies(
@@ -1610,11 +1875,9 @@ def run_all_strategies(
     direction: Optional[str] = None,
     intrabar_resolution: str = "ohlc_walk",
     atr_method: str = "simple",
-    circuit_breaker_max_drawdown_pct: Optional[float] = None,
-    margin_per_trade_usd: Optional[float] = None,
-    leverage: Optional[float] = None,
     comparison_mode: Optional[str] = None,
-) -> list:
+    funding_mode: str = "charge",
+) -> tuple:
     validate_close_capabilities(close_refs=close_strategies,
                                 comparison_mode=comparison_mode,
                                 platform=platform, phase="preflight")
@@ -1626,22 +1889,25 @@ def run_all_strategies(
     print(f"{'#'*60}")
 
     all_results = []
+    refused = []
     for name in strat_list:
-        result = run_single_backtest(
-            name, symbol, timeframe, since, capital,
-            registry=registry, platform=platform, htf_filter=htf_filter,
-            close_strategies=close_strategies,
-            regime_enabled=regime_enabled, regime_period=regime_period,
-            regime_adx_threshold=regime_adx_threshold,
-            allowed_regimes=allowed_regimes,
-            direction=direction,
-            intrabar_resolution=intrabar_resolution,
-            atr_method=atr_method,
-            circuit_breaker_max_drawdown_pct=circuit_breaker_max_drawdown_pct,
-            margin_per_trade_usd=margin_per_trade_usd,
-            leverage=leverage,
-            comparison_mode=comparison_mode,
-        )
+        try:
+            result = run_single_backtest(
+                name, symbol, timeframe, since, capital,
+                registry=registry, platform=platform, htf_filter=htf_filter,
+                close_strategies=close_strategies,
+                regime_enabled=regime_enabled, regime_period=regime_period,
+                regime_adx_threshold=regime_adx_threshold,
+                allowed_regimes=allowed_regimes,
+                direction=direction,
+                intrabar_resolution=intrabar_resolution,
+                atr_method=atr_method,
+                comparison_mode=comparison_mode,
+                funding_mode=funding_mode,
+            )
+        except FundingIncompleteError as exc:
+            refused.append(_funding_refusal(name, symbol, exc))
+            continue
         if result:
             all_results.append(result)
 
@@ -1649,8 +1915,11 @@ def run_all_strategies(
         print(format_comparison_report(all_results))
         print("  " + format_close_validation(aggregate_close_validations(
             r.get("close_validation") for r in all_results)))
+    if refused:
+        listed = ", ".join(sorted(item["strategy"] for item in refused))
+        print(f"  FUNDING REFUSED strategies: {listed}")
 
-    return all_results
+    return all_results, refused
 
 
 def run_multi_asset(
@@ -1671,7 +1940,8 @@ def run_multi_asset(
     intrabar_resolution: str = "ohlc_walk",
     atr_method: str = "simple",
     comparison_mode: Optional[str] = None,
-) -> dict:
+    funding_mode: str = "charge",
+) -> tuple:
     validate_close_capabilities(close_refs=close_strategies,
                                 comparison_mode=comparison_mode,
                                 platform=platform, phase="preflight")
@@ -1686,24 +1956,30 @@ def run_multi_asset(
     print(f"{'#'*60}")
 
     results_by_asset = {}
+    refused = []
     for symbol in sym_list:
         print(f"\n{'─'*40}")
         print(f"  Asset: {symbol}")
         print(f"{'─'*40}")
         results_by_asset[symbol] = []
         for strat_name in strat_list:
-            result = run_single_backtest(
-                strat_name, symbol, timeframe, since, capital,
-                registry=registry, platform=platform, htf_filter=htf_filter,
-                close_strategies=close_strategies,
-                regime_enabled=regime_enabled, regime_period=regime_period,
-                regime_adx_threshold=regime_adx_threshold,
-                allowed_regimes=allowed_regimes,
-                direction=direction,
-                intrabar_resolution=intrabar_resolution,
-                atr_method=atr_method,
-                comparison_mode=comparison_mode,
-            )
+            try:
+                result = run_single_backtest(
+                    strat_name, symbol, timeframe, since, capital,
+                    registry=registry, platform=platform, htf_filter=htf_filter,
+                    close_strategies=close_strategies,
+                    regime_enabled=regime_enabled, regime_period=regime_period,
+                    regime_adx_threshold=regime_adx_threshold,
+                    allowed_regimes=allowed_regimes,
+                    direction=direction,
+                    intrabar_resolution=intrabar_resolution,
+                    atr_method=atr_method,
+                    comparison_mode=comparison_mode,
+                    funding_mode=funding_mode,
+                )
+            except FundingIncompleteError as exc:
+                refused.append(_funding_refusal(strat_name, symbol, exc))
+                continue
             if result:
                 results_by_asset[symbol].append(result)
 
@@ -1711,7 +1987,11 @@ def run_multi_asset(
     print("  " + format_close_validation(aggregate_close_validations(
         r.get("close_validation")
         for results in results_by_asset.values() for r in results)))
-    return results_by_asset
+    if refused:
+        listed = ", ".join(sorted(
+            f"{item['strategy']} {item['symbol']}" for item in refused))
+        print(f"  FUNDING REFUSED symbols: {listed}")
+    return results_by_asset, refused
 
 
 def run_walk_forward(
@@ -1734,6 +2014,8 @@ def run_walk_forward(
     optimize_metric: str = "sharpe_ratio",
     direction: Optional[str] = None,
     comparison_mode: Optional[str] = None,
+    strategy_type: str = "perps",
+    funding_mode: str = "charge",
 ) -> Optional[dict]:
     for stack in (close_stack_grid or [{"close_strategies": close_strategies}]):
         validate_close_capabilities(close_refs=stack.get("close_strategies"),
@@ -1756,11 +2038,15 @@ def run_walk_forward(
             print(f"[warn] '{strategy_name}' has no default_params either — skipping.")
             return None
 
-    df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since)
+    df = load_cached_data(symbol, timeframe, start_date=since)
     if df.empty:
         print("No data available!")
         return None
-    df = _attach_funding_if_needed(df, strategy_name, symbol, since)
+    df = _attach_funding_if_needed(
+        df, strategy_name, symbol, since,
+        platform=platform, strategy_type=strategy_type,
+        mode=funding_mode, timeframe=timeframe,
+    )
 
     result = walk_forward_optimize(
         df, strategy_name, param_ranges,
@@ -1784,6 +2070,10 @@ def run_walk_forward(
         comparison_mode=comparison_mode,
     )
 
+    print(f"  Funding-skipped folds: {int(result.get('funding_skipped_folds') or 0)}")
+    print(f"  Funding-skipped candidates: {int(result.get('funding_skipped_candidates') or 0)}")
+    if result.get("error"):
+        print(f"  {result['error']}")
     print(format_walk_forward_report(result))
     return result
 
@@ -1794,8 +2084,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Strategy name or 'all'")
     parser.add_argument("--registry", choices=["spot", "futures"], default="spot",
                         help="Strategy registry to load (spot or futures)")
+    parser.add_argument("--funding",
+                        choices=["charge", "partial", "off"],
+                        default="charge",
+                        help="Hyperliquid perps funding: charge refuses an "
+                             "incomplete result, partial keeps a flagged "
+                             "result, off reproduces the pre-change numbers "
+                             "(cash still includes delta-neutral accrual; "
+                             "per-trade statistics stay on price PnL)")
     parser.add_argument("--platform",
-                        choices=["binanceus", "hyperliquid", "blofin", "robinhood",
+                        choices=["binanceus", "hyperliquid", "robinhood",
                                  "luno", "okx", "okx-perps"],
                         default=None,
                         help="Exchange fee model (matches fees.go). Default: "
@@ -1828,6 +2126,12 @@ def _build_parser() -> argparse.ArgumentParser:
                              "Repeat for multiple. Each runs per-bar against the simulated position; "
                              "max close_fraction wins. Replaces the pre-#641 --close-strategy NAME + "
                              "--close-params JSON pair.")
+    parser.add_argument("--liquidation-model", choices=["none", "venue_isolated"],
+                        default="none",
+                        help="Hyperliquid isolated liquidation model. venue_isolated "
+                             "requires --manifest and a perps_sizing contract; strict "
+                             "comparison still refuses until a recorded liquidation price "
+                             "verifies the formula.")
     parser.add_argument("--config", default=None,
                         help="Path to a live go-trader config.json. Loads a single strategy by "
                              "--strategy ID and uses its open_strategy/close_strategies refs verbatim "
@@ -1931,6 +2235,14 @@ def _build_parser() -> argparse.ArgumentParser:
                              "detected on the close only, filled at the next "
                              "bar's open) for reproducing documented "
                              "baselines. Single mode only.")
+    parser.add_argument("--resting-tp-trade-through", dest="resting_tp_trade_through",
+                        action="store_true", default=False,
+                        help="#1727 Hyperliquid resting take-profit rule: a tier fills "
+                             "only when a completed bar traded at least one tick beyond "
+                             "the adapter-rounded limit (the entry bar counts only its "
+                             "close). Needs --mode single and --manifest. A paper "
+                             "--config strategy uses its own resting_tp_trade_through "
+                             "flag; this option models a live strategy. Default: off.")
     parser.add_argument("--comparison-mode", dest="comparison_mode", default=None,
                         metavar="MODE",
                         help="#1683 close comparison mode, every --mode. Omitted = "
@@ -1971,34 +2283,17 @@ def _resolve_defaults_mode(args) -> str:
     return "user" if args.config else "system"
 
 
-def main(argv=None):
+def main():
     try:
-        _main(argv)
+        _main()
     except CloseCapabilityError as exc:
         print(str(exc))
         print(json.dumps(exc.to_dict(), sort_keys=True))
         sys.exit(1)
 
 
-def _main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    platform_explicit = any(
-        a == "--platform" or str(a).startswith("--platform=") for a in argv
-    )
-    symbol_explicit = any(
-        a == "--symbol" or str(a).startswith("--symbol=") for a in argv
-    )
-    timeframe_explicit = any(
-        a in ("--timeframe", "-tf") or str(a).startswith("--timeframe=")
-        for a in argv
-    )
-    capital_explicit = any(
-        a == "--capital" or str(a).startswith("--capital=") for a in argv
-    )
-    registry_explicit = any(
-        a == "--registry" or str(a).startswith("--registry=") for a in argv
-    )
-    args = _build_parser().parse_args(argv)
+def _main():
+    args = _build_parser().parse_args()
     args.defaults = _resolve_defaults_mode(args)
 
     if args.mode != "single":
@@ -2043,31 +2338,26 @@ def _main(argv=None):
     open_params: Optional[dict] = None
     live_stop_kwargs: dict = {}
     config_platform = ""
+    try:
+        resting_tp_trade_through = resolve_resting_tp_trade_through(
+            cli=args.resting_tp_trade_through, config_path=args.config,
+            strategy_id=args.strategy, mode=args.mode, manifest=args.manifest)
+    except (OSError, ValueError) as exc:
+        print(exc)
+        sys.exit(1)
     if args.config:
         if args.mode != "single":
             print("--config is only valid with --mode single (loads one strategy by --strategy <id>)")
             sys.exit(1)
-        live_kwargs = load_strategy_config(
-            args.config, args.strategy,
-            inject_user_defaults=(args.defaults == "user"),
-            include_runtime_inputs=True,
-            comparison_mode=args.comparison_mode,
-        )
-        if not platform_explicit:
-            live_platform = str(live_kwargs.get("platform") or "").strip().lower()
-            if live_platform:
-                args.platform = live_platform
+        try:
+            live_kwargs = load_strategy_config(
+                args.config, args.strategy,
+                inject_user_defaults=(args.defaults == "user"),
+                comparison_mode=args.comparison_mode)
+        except ValueError as exc:
+            print(exc)
+            sys.exit(1)
         config_platform = live_kwargs.get("platform", "")
-        if not symbol_explicit and live_kwargs.get("symbol"):
-            args.symbol = live_kwargs["symbol"]
-        if not timeframe_explicit and live_kwargs.get("timeframe"):
-            args.timeframe = live_kwargs["timeframe"]
-        if not capital_explicit and live_kwargs.get("capital") is not None:
-            args.capital = float(live_kwargs["capital"])
-        if not registry_explicit and live_kwargs.get("strategy_type") == "perps":
-            args.registry = "futures"
-        # Live config refs take precedence; --close-strategy on top is rejected
-        # to avoid silent overrides.
         if close_refs:
             print("--close-strategy is not allowed alongside --config (refs come from the live config)")
             sys.exit(1)
@@ -2122,16 +2412,11 @@ def _main(argv=None):
             "trailing_stop_min_move_pct",
             "stop_platform",
             "capability_context",
+            "perps_sizing",
+            "liquidation_model",
+            "venue_margin",
         )
         live_stop_kwargs = {k: live_kwargs[k] for k in stop_keys if k in live_kwargs}
-        for key in ("margin_per_trade_usd", "leverage"):
-            value = live_kwargs.get(key)
-            if value is not None:
-                live_stop_kwargs[key] = float(value)
-        if live_kwargs.get("max_drawdown_pct") is not None:
-            live_stop_kwargs["circuit_breaker_max_drawdown_pct"] = float(
-                live_kwargs["max_drawdown_pct"]
-            )
         args.regime_enabled = live_kwargs.get("regime_enabled", args.regime_enabled)
         args.regime_period = live_kwargs.get("regime_period", args.regime_period)
         args.regime_adx_threshold = live_kwargs.get(
@@ -2140,11 +2425,23 @@ def _main(argv=None):
         args.allowed_regimes = live_kwargs.get(
             "allowed_regimes", args.allowed_regimes,
         )
-        _validate_allowed_regimes_vocabulary(
-            args.allowed_regimes, live_kwargs.get("regime_windows_spec"))
+        label_plan = live_kwargs.get("regime_label_windows")
+        if label_plan:
+            _validate_allowed_regimes_vocabulary(
+                args.allowed_regimes, label_plan.get("windows_spec"),
+                window_key=label_plan["windows"]["gate"],
+                classifier=label_plan["classifiers"]["gate"])
+            if any(label_plan["named"].values()) and args.mode != "single":
+                print(f"--mode {args.mode} cannot model a named regime window; "
+                      "use --mode single")
+                sys.exit(1)
+            live_stop_kwargs["regime_label_plan"] = label_plan
+        else:
+            _validate_allowed_regimes_vocabulary(
+                args.allowed_regimes, live_kwargs.get("regime_windows_spec"))
 
     if args.platform is None:
-        args.platform = config_platform if config_platform in ("hyperliquid", "blofin") else "binanceus"
+        args.platform = "hyperliquid" if config_platform == "hyperliquid" else "binanceus"
 
     if args.stop_loss_atr_mult is not None:
         live_stop_kwargs.setdefault("stop_loss_atr_mult", args.stop_loss_atr_mult)
@@ -2191,55 +2488,70 @@ def _main(argv=None):
         if args.strategy == "all":
             print("Specify a strategy for single mode: --strategy <name>")
             sys.exit(1)
-        run_single_backtest(args.strategy, args.symbol, args.timeframe,
-                            args.since, args.capital,
-                            params=open_params,
-                            registry=args.registry, platform=args.platform,
-                            htf_filter=args.htf_filter,
-                            close_strategies=close_refs,
-                            regime_enabled=args.regime_enabled,
-                            regime_period=args.regime_period,
-                            regime_adx_threshold=args.regime_adx_threshold,
-                            allowed_regimes=args.allowed_regimes,
-                            manifest_path=args.manifest,
-                            manifest_dataset=args.manifest_dataset,
-                            manifest_window=args.manifest_window,
-                            cost_multiplier=args.cost_multiplier,
-                            comparison_mode=args.comparison_mode,
-                            **live_stop_kwargs)
+        try:
+            run_single_backtest(args.strategy, args.symbol, args.timeframe,
+                                args.since, args.capital,
+                                params=open_params,
+                                registry=args.registry, platform=args.platform,
+                                htf_filter=args.htf_filter,
+                                close_strategies=close_refs,
+                                regime_enabled=args.regime_enabled,
+                                regime_period=args.regime_period,
+                                regime_adx_threshold=args.regime_adx_threshold,
+                                allowed_regimes=args.allowed_regimes,
+                                manifest_path=args.manifest,
+                                manifest_dataset=args.manifest_dataset,
+                                manifest_window=args.manifest_window,
+                                cost_multiplier=args.cost_multiplier,
+                                comparison_mode=args.comparison_mode,
+                                funding_mode=args.funding,
+                                liquidation_model=args.liquidation_model,
+                                resting_tp_trade_through=resting_tp_trade_through,
+                                **live_stop_kwargs)
+        except FundingIncompleteError as exc:
+            _funding_refusal(args.strategy, args.symbol, exc)
+            sys.exit(1)
 
     elif args.mode == "compare":
         strategies = None if args.strategy == "all" else [args.strategy]
-        run_all_strategies(args.symbol, args.timeframe, args.since, args.capital,
-                           strategies,
-                           registry=args.registry, platform=args.platform,
-                           htf_filter=args.htf_filter,
-                           close_strategies=close_refs,
-                           regime_enabled=args.regime_enabled,
-                           regime_period=args.regime_period,
-                           regime_adx_threshold=args.regime_adx_threshold,
-                           allowed_regimes=args.allowed_regimes,
-                           direction=args.direction,
-                           intrabar_resolution=args.intrabar_resolution,
-                           atr_method=args.atr_method or "simple",
-                           comparison_mode=args.comparison_mode)
+        _results, refused = run_all_strategies(
+            args.symbol, args.timeframe, args.since, args.capital,
+            strategies,
+            registry=args.registry, platform=args.platform,
+            htf_filter=args.htf_filter,
+            close_strategies=close_refs,
+            regime_enabled=args.regime_enabled,
+            regime_period=args.regime_period,
+            regime_adx_threshold=args.regime_adx_threshold,
+            allowed_regimes=args.allowed_regimes,
+            direction=args.direction,
+            intrabar_resolution=args.intrabar_resolution,
+            atr_method=args.atr_method or "simple",
+            comparison_mode=args.comparison_mode,
+            funding_mode=args.funding)
+        if refused:
+            sys.exit(1)
 
     elif args.mode == "multi":
         strategies = None if args.strategy == "all" else [args.strategy]
         symbols = args.symbols or DEFAULT_SYMBOLS
-        run_multi_asset(strategies, symbols, args.timeframe, args.since,
-                        args.capital,
-                        registry=args.registry, platform=args.platform,
-                        htf_filter=args.htf_filter,
-                        close_strategies=close_refs,
-                        regime_enabled=args.regime_enabled,
-                        regime_period=args.regime_period,
-                        regime_adx_threshold=args.regime_adx_threshold,
-                        allowed_regimes=args.allowed_regimes,
-                        direction=args.direction,
-                        intrabar_resolution=args.intrabar_resolution,
-                        atr_method=args.atr_method or "simple",
-                        comparison_mode=args.comparison_mode)
+        _results, refused = run_multi_asset(
+            strategies, symbols, args.timeframe, args.since,
+            args.capital,
+            registry=args.registry, platform=args.platform,
+            htf_filter=args.htf_filter,
+            close_strategies=close_refs,
+            regime_enabled=args.regime_enabled,
+            regime_period=args.regime_period,
+            regime_adx_threshold=args.regime_adx_threshold,
+            allowed_regimes=args.allowed_regimes,
+            direction=args.direction,
+            intrabar_resolution=args.intrabar_resolution,
+            atr_method=args.atr_method or "simple",
+            comparison_mode=args.comparison_mode,
+            funding_mode=args.funding)
+        if refused:
+            sys.exit(1)
 
     elif args.mode == "optimize":
         close_stack_grid = None
@@ -2285,7 +2597,9 @@ def _main(argv=None):
                                  close_stack_grid=close_stack_grid,
                                  optimize_metric=args.optimize_metric,
                                  direction=args.direction,
-                                 comparison_mode=args.comparison_mode)
+                                 comparison_mode=args.comparison_mode,
+                                 strategy_type=live_stop_kwargs.get("strategy_type", "perps"),
+                                 funding_mode=args.funding)
         else:
             run_walk_forward(args.strategy, args.symbol, args.timeframe,
                              args.since, args.splits, args.capital,
@@ -2300,7 +2614,9 @@ def _main(argv=None):
                              close_stack_grid=close_stack_grid,
                              optimize_metric=args.optimize_metric,
                              direction=args.direction,
-                             comparison_mode=args.comparison_mode)
+                             comparison_mode=args.comparison_mode,
+                             strategy_type=live_stop_kwargs.get("strategy_type", "perps"),
+                             funding_mode=args.funding)
 
 
 if __name__ == "__main__":

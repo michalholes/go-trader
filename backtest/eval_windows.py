@@ -52,8 +52,11 @@ def trade_samples_from_results(results: dict) -> List[dict]:
     for t in results.get("trades") or []:
         gross = float(t["pnl_pct"])
         notional = float(t.get("shares") or 0.0) * float(t.get("entry_price") or 0.0)
-        net = (float(t["pnl"]) / notional * 100.0
-               if notional > 0 and t.get("pnl") is not None else gross)
+        if notional > 0 and t.get("pnl") is not None:
+            funding = float(t.get("funding_pnl") or 0.0)
+            net = (float(t["pnl"]) + funding) / notional * 100.0
+        else:
+            net = gross
         out.append({"entry_date": str(t["entry_date"]), "pnl_pct": gross,
                     "pnl_pct_net": round(net, 6)})
     return out
@@ -74,7 +77,8 @@ def positions_from_results(results: dict) -> List[dict]:
         g = grouped[key]
         shares = float(t.get("shares") or 0.0)
         g["exit_date"] = str(t["exit_date"])
-        g["net_pnl"] += float(t.get("pnl") or 0.0)
+        g["net_pnl"] += (float(t.get("pnl") or 0.0)
+                         + float(t.get("funding_pnl") or 0.0))
         g["fees"] += float(t.get("entry_fee") or 0.0) + float(t.get("exit_fee") or 0.0)
         g["entry_notional"] += shares * float(t.get("entry_price") or 0.0)
         g["exit_notional"] += shares * float(t.get("exit_price") or 0.0)
@@ -156,6 +160,7 @@ def incumbent_bars(incumbent_legs: dict) -> dict:
             "sharpe": round(statistics.median(l["sharpe"] for l in present), 3),
             "ddadj": round(statistics.median(l["ddadj"] for l in present), 3),
             "n": len(present),
+            "funding_incomplete": any(l.get("funding_incomplete") for l in present),
         }
     return bars
 
@@ -186,7 +191,14 @@ def score_candidate(candidate_legs: dict, bars: dict) -> dict:
     degenerate = traded < math.ceil(len(scored) / 2)
     beats_both = (mean_sharpe > mean_bar_sharpe) and (mean_ddadj > mean_bar_ddadj)
 
-    if degenerate:
+    incomplete = any(
+        ((r["leg"] or {}).get("funding_incomplete")
+         or (r["bar"] or {}).get("funding_incomplete"))
+        for r in rows
+    )
+    if incomplete:
+        verdict = "funding_incomplete"
+    elif degenerate:
         verdict = "degenerate"
     elif beats_both:
         verdict = "pass"
@@ -270,11 +282,15 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
             commission_pct: Optional[float] = None,
             slippage_pct: Optional[float] = None,
             keep_trades: bool = False,
+            keep_positions: bool = False,
             intrabar_resolution: str = "ohlc_walk",
             exchange_id: Optional[str] = None,
             manifest_ctx: Optional[dict] = None,
             comparison_mode: Optional[str] = None,
-            stop_kwargs: Optional[dict] = None) -> Optional[dict]:
+            stop_kwargs: Optional[dict] = None,
+            regime_label_plan: Optional[dict] = None,
+            regime_gate_on_failure: str = "open",
+            funding_mode: str = "charge") -> Optional[dict]:
     from atr import ensure_atr_indicator
     import pandas as pd
     from data_fetcher import load_cached_data
@@ -353,8 +369,12 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
             df = df[df.index < pd.Timestamp(end)]
             if df.empty:
                 return None
-        if name in FUNDING_COLUMN_STRATEGIES:
-            df = _attach_funding_if_needed(df, name, symbol, start)
+        strategy_type = str((stop_kwargs or {}).get("strategy_type") or "perps")
+        df = _attach_funding_if_needed(
+            df, name, symbol, start,
+            platform=FEE_PLATFORM, strategy_type=strategy_type,
+            mode=funding_mode, timeframe=timeframe,
+        )
 
     strat = reg.STRATEGY_REGISTRY.get(name)
     if strat is None:
@@ -382,6 +402,24 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
         if close_strategies:
             df_signals = ensure_atr_indicator(df_signals)
 
+    label_columns = None
+    feature_labels = {}
+    if regime_label_plan:
+        from regime_label_columns import (attach_regime_label_columns,
+                                          feature_label_kwargs)
+        plan_tf = str(regime_label_plan.get("timeframe") or "").strip().lower()
+        chart_tf = str(timeframe or "").strip().lower()
+        if plan_tf and plan_tf != chart_tf:
+            raise ValueError(
+                f"regime.timeframe {plan_tf!r} differs from chart timeframe "
+                f"{timeframe!r}; refusing to score a named window without the "
+                "regime-timeframe candles")
+        df_signals, label_columns = attach_regime_label_columns(
+            df_signals, regime_label_plan)
+        feature_labels = feature_label_kwargs(regime_label_plan)
+        if regime_windows_spec is None:
+            regime_windows_spec = regime_label_plan.get("windows_spec")
+
     use_regime = (regime_enabled or bool(allowed_regimes)
                   or bool(regime_windows_spec)
                   or bool(regime_directional_policy))
@@ -389,7 +427,7 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
     indicator_frame = None
     if manifest_window is not None:
         import offline_manifest as om
-        if use_regime and "regime" not in df_signals.columns:
+        if use_regime and label_columns is None and "regime" not in df_signals.columns:
             from regime import ensure_regime_columns
             ensure_regime_columns(
                 df_signals,
@@ -413,6 +451,8 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
         regime_adx_threshold=regime_adx_threshold,
         allowed_regimes=allowed_regimes,
         regime_windows_spec=regime_windows_spec,
+        regime_gate_on_failure=regime_gate_on_failure,
+        regime_label_columns=label_columns,
         commission_pct=commission_pct,
         intrabar_resolution=intrabar_resolution,
         comparison_mode=comparison_mode,
@@ -431,6 +471,10 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
                     f"stop_kwargs.{key}={value!r} disagrees with {key}={bt_kwargs[key]!r}")
             continue
         bt_kwargs[key] = value
+    bt_kwargs.update(feature_labels)
+    if manifest_ctx is None:
+        from funding_fetcher import rejoin_funding_columns
+        df_signals = rejoin_funding_columns(df_signals, df)
     bt = Backtester(**bt_kwargs)
     results = bt.run(df_signals, strategy_name=name, symbol=symbol,
                      timeframe=timeframe, params=strat_params, save=False,
@@ -446,16 +490,26 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
     leg["close_validation"] = results.get("close_validation")
     if keep_trades:
         leg["trade_samples"] = trade_samples_from_results(results)
+    if keep_positions:
+        leg["positions"] = positions_from_results(results)
     if manifest_info is not None:
         leg["manifest"] = manifest_info
         leg["execution"] = execution_metrics(results, capital)
+    block = results.get("funding")
+    if isinstance(block, dict):
+        leg["funding"] = block
+        mode = str(block.get("mode") or "")
+        unpriced = int(results.get("funding_unpriced_held_hours") or 0)
+        if (mode == "charge" and unpriced > 0) or (mode == "partial" and not block.get("complete")):
+            leg["funding_incomplete"] = True
     return leg
 
 
 def compute_incumbent_legs(reg, datasets: List[tuple], window: tuple,
                            capital: float, *,
                            intrabar_resolution: str = "ohlc_walk",
-                           manifest_ctx: Optional[dict] = None) -> dict:
+                           manifest_ctx: Optional[dict] = None,
+                           funding_mode: str = "charge") -> dict:
     out = {}
     for symbol, timeframe in datasets:
         ds = dataset_key(symbol, timeframe)
@@ -464,7 +518,8 @@ def compute_incumbent_legs(reg, datasets: List[tuple], window: tuple,
             out[ds][name] = run_leg(reg, name, None, symbol, timeframe,
                                     window, capital=capital,
                                     intrabar_resolution=intrabar_resolution,
-                                    manifest_ctx=manifest_ctx)
+                                    manifest_ctx=manifest_ctx,
+                                    funding_mode=funding_mode)
     return out
 
 
@@ -526,6 +581,30 @@ def validate_candidate(candidate: dict) -> dict:
                 "candidate.profile_allocation needs an inline 'window_spec' "
                 "({classifier, period[, thresholds|adx_threshold]}) so the "
                 "harness can compute the switch label series.")
+
+    plan = candidate.get("regime_label_windows")
+    if plan is not None:
+        if not isinstance(plan, dict) or not isinstance(plan.get("windows"), dict):
+            raise ValueError(
+                "candidate.regime_label_windows must be the resolved window plan")
+        named = plan.get("named") or {}
+        if not isinstance(named, dict):
+            raise ValueError("candidate.regime_label_windows.named must be an object")
+    for field in ("regime_gate_window", "regime_directional_window",
+                  "regime_atr_window"):
+        raw = str(candidate.get(field) or "").strip().lower()
+        if raw not in ("", "default") and not plan:
+            raise ValueError(
+                f"candidate {field}={raw!r} needs regime_label_windows; "
+                "refusing a named window with no column plan")
+    gate_failure = candidate.get("regime_gate_on_failure")
+    if gate_failure is not None:
+        from regime import normalize_regime_gate_on_failure
+        try:
+            candidate["regime_gate_on_failure"] = normalize_regime_gate_on_failure(
+                gate_failure)
+        except ValueError as exc:
+            raise ValueError(f"candidate.regime_gate_on_failure: {exc}") from exc
 
     ar = candidate.get("allowed_regimes")
     if ar is not None:
@@ -631,7 +710,8 @@ def run_candidate_leg(reg, candidate: dict, symbol: str, timeframe: str,
                       window: tuple, capital: float = DEFAULT_CAPITAL, *,
                       keep_trades: bool = False,
                       intrabar_resolution: str = "ohlc_walk",
-                      manifest_ctx: Optional[dict] = None) -> Optional[dict]:
+                      manifest_ctx: Optional[dict] = None,
+                      funding_mode: str = "charge") -> Optional[dict]:
     return run_leg(
         reg, candidate["name"], candidate.get("params"),
         symbol, timeframe, window, capital=capital,
@@ -653,6 +733,9 @@ def run_candidate_leg(reg, candidate: dict, symbol: str, timeframe: str,
         manifest_ctx=manifest_ctx,
         comparison_mode=candidate.get("comparison_mode"),
         stop_kwargs=candidate_stop_kwargs(candidate),
+        regime_label_plan=candidate.get("regime_label_windows"),
+        regime_gate_on_failure=candidate.get("regime_gate_on_failure") or "open",
+        funding_mode=funding_mode,
     )
 
 
@@ -661,7 +744,8 @@ def evaluate_window(reg, candidate: dict, datasets: List[tuple],
                     bars_memo: dict, *,
                     intrabar_resolution: str = "ohlc_walk",
                     manifest: Optional[dict] = None,
-                    cost_multiplier: float = 1.0) -> dict:
+                    cost_multiplier: float = 1.0,
+                    funding_mode: str = "charge") -> dict:
     validate_candidate(candidate)
     manifest_ctx = None
     if manifest is not None:
@@ -670,13 +754,14 @@ def evaluate_window(reg, candidate: dict, datasets: List[tuple],
                         "cost_multiplier": cost_multiplier}
     else:
         window = WINDOWS[window_name]
-    memo_key = (window_name if manifest is None
-                else (manifest["path"], window_name, cost_multiplier))
+    memo_key = ((window_name, funding_mode) if manifest is None
+                else (manifest["path"], window_name, cost_multiplier, funding_mode))
     if memo_key not in bars_memo:
         bars_memo[memo_key] = incumbent_bars(
             compute_incumbent_legs(reg, datasets, window, capital,
                                    intrabar_resolution=intrabar_resolution,
-                                   manifest_ctx=manifest_ctx))
+                                   manifest_ctx=manifest_ctx,
+                                   funding_mode=funding_mode))
     bars = bars_memo[memo_key]
 
     candidate_legs = {}
@@ -685,7 +770,8 @@ def evaluate_window(reg, candidate: dict, datasets: List[tuple],
         candidate_legs[ds] = run_candidate_leg(
             reg, candidate, symbol, timeframe, window, capital=capital,
             intrabar_resolution=intrabar_resolution,
-            manifest_ctx=manifest_ctx)
+            manifest_ctx=manifest_ctx,
+            funding_mode=funding_mode)
     score = score_candidate(candidate_legs, bars)
     score["window"] = window_name
     score["window_range"] = list(window)
@@ -852,6 +938,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Comma list of SYMBOL:TIMEFRAME (default: the six "
                         "audit datasets)")
     p.add_argument("--capital", type=float, default=DEFAULT_CAPITAL)
+    p.add_argument("--funding", choices=["charge", "partial", "off"],
+                   default="charge",
+                   help="Hyperliquid perps funding mode for every leg")
     p.add_argument("--sweep", action="append", default=None, metavar="P=V1,V2",
                    help="Plateau sweep over a param (repeatable; cartesian)")
     p.add_argument("--sweep-window", default=None,
@@ -985,7 +1074,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 args.capital, bars_memo,
                                 intrabar_resolution=args.intrabar_resolution,
                                 manifest=manifest,
-                                cost_multiplier=args.cost_multiplier)
+                                cost_multiplier=args.cost_multiplier,
+                                funding_mode=args.funding)
         window_scores.append(score)
         print(format_window_report(score))
 
@@ -1005,7 +1095,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                     args.capital, bars_memo,
                                     intrabar_resolution=args.intrabar_resolution,
                                     manifest=manifest,
-                                    cost_multiplier=args.cost_multiplier)
+                                    cost_multiplier=args.cost_multiplier,
+                                    funding_mode=args.funding)
             sweep_rows.append({"label": label, "params": params, "score": score})
         print(format_sweep_report(sweep_rows, sweep_window))
 
@@ -1020,6 +1111,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "cost_multiplier": args.cost_multiplier,
             }
         payload = {
+            "funding_mode": args.funding,
             "candidate": candidate,
             "registry": args.registry,
             "incumbents": INCUMBENTS,

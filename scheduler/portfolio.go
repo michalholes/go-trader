@@ -41,6 +41,9 @@ type Position struct {
 	SLAdjustedTiersProcessed        int               `json:"sl_adjusted_tiers_processed,omitempty"`
 	SLAfterMoved                    bool              `json:"sl_after_moved,omitempty"`
 	SLAfterTriggerPx                float64           `json:"sl_after_trigger_px,omitempty"`
+	RestingTPScannedOpenMs          int64             `json:"resting_tp_scanned_open_ms,omitempty"`
+	RestingTPReachPx                float64           `json:"resting_tp_reach_px,omitempty"`
+	RestingTPStopTriggerPx          float64           `json:"resting_tp_stop_trigger_px,omitempty"`
 	TPConsumptions                  []TPConsumption   `json:"tp_consumptions,omitempty"`
 	PostTPTrailingATRMult           *float64          `json:"post_tp_trailing_atr_mult,omitempty"`
 	ScaleInCount                    int               `json:"scale_in_count,omitempty"`
@@ -207,6 +210,14 @@ func bookPerpsClose(s *StrategyState, symbol string, closePx float64, reason, de
 }
 
 func bookPerpsCloseWithFillFee(s *StrategyState, symbol string, closePx, fillFee float64, useFillFee bool, exchangeOrderID, reason, detailsPrefix, logPrefix string, logger *StrategyLogger) bool {
+	var booked bool
+	mutatePaperPerpsBook(s, symbol, func() {
+		booked = bookPerpsCloseWithFillFeeInner(s, symbol, closePx, fillFee, useFillFee, exchangeOrderID, reason, detailsPrefix, logPrefix, logger)
+	})
+	return booked
+}
+
+func bookPerpsCloseWithFillFeeInner(s *StrategyState, symbol string, closePx, fillFee float64, useFillFee bool, exchangeOrderID, reason, detailsPrefix, logPrefix string, logger *StrategyLogger) bool {
 	if closePx <= 0 {
 		return false
 	}
@@ -315,6 +326,14 @@ func bookPerpsCloseWithFillFee(s *StrategyState, symbol string, closePx, fillFee
 }
 
 func bookPerpsPartialCloseWithFillFee(s *StrategyState, symbol string, closeQty, closePx, fillFee float64, useFillFee bool, exchangeOrderID, reason, detailsPrefix, logPrefix string, logger *StrategyLogger) bool {
+	var booked bool
+	mutatePaperPerpsBook(s, symbol, func() {
+		booked = bookPerpsPartialCloseWithFillFeeInner(s, symbol, closeQty, closePx, fillFee, useFillFee, exchangeOrderID, reason, detailsPrefix, logPrefix, logger)
+	})
+	return booked
+}
+
+func bookPerpsPartialCloseWithFillFeeInner(s *StrategyState, symbol string, closeQty, closePx, fillFee float64, useFillFee bool, exchangeOrderID, reason, detailsPrefix, logPrefix string, logger *StrategyLogger) bool {
 	if closeQty <= 0 || closePx <= 0 {
 		return false
 	}
@@ -486,8 +505,9 @@ type Trade struct {
 	IsClose     bool    `json:"is_close,omitempty"`
 	RealizedPnL float64 `json:"realized_pnl,omitempty"`
 
-	PnLGross  bool   `json:"pnl_gross,omitempty"`
-	FeeSource string `json:"fee_source,omitempty"`
+	PnLGross         bool   `json:"pnl_gross,omitempty"`
+	FeeSource        string `json:"fee_source,omitempty"`
+	CostModelVersion int    `json:"cost_model_version,omitempty"`
 
 	Regime               string `json:"regime,omitempty"`
 	RegimeDivergenceNote string `json:"-"`
@@ -1001,6 +1021,18 @@ func logHLPaperLotHold(logger *StrategyLogger, action, symbol string, d hlPaperL
 }
 
 func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, closeAttribution *CloseAttribution, recordOpen func(Trade), lot *hlPaperLotPolicy) (int, string, error) {
+	var (
+		trades int
+		hold   string
+		err    error
+	)
+	mutatePaperPerpsBook(s, symbol, func() {
+		trades, hold, err = executePerpsSignalWithLeverageInner(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, closeAttribution, recordOpen, lot)
+	})
+	return trades, hold, err
+}
+
+func executePerpsSignalWithLeverageInner(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, closeAttribution *CloseAttribution, recordOpen func(Trade), lot *hlPaperLotPolicy) (int, string, error) {
 	if direction == "" {
 		direction = DirectionLong
 	}
@@ -1065,7 +1097,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			if fillQty > 0 {
 				execPrice = price
 			} else {
-				execPrice = ApplySlippage(price)
+				execPrice = ApplyAdverseSlippage(price, true)
 			}
 			pnl := closeQty * posMult(pos) * (pos.AvgCost - execPrice)
 			terminalClose := closeOnlyAction || !allowsLong
@@ -1154,7 +1186,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				return tradesExecuted, "", nil
 			}
 		} else {
-			execPrice = ApplySlippage(price)
+			execPrice = ApplyAdverseSlippage(price, true)
 			if execPrice <= 0 {
 				return tradesExecuted, "", nil
 			}
@@ -1259,7 +1291,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			if fillQty > 0 {
 				execPrice = price
 			} else {
-				execPrice = ApplySlippage(price)
+				execPrice = ApplyAdverseSlippage(price, false)
 			}
 			pnl := closeQty * posMult(pos) * (execPrice - pos.AvgCost)
 			terminalClose := closeOnlyAction || !allowsShort
@@ -1348,7 +1380,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				return tradesExecuted, "", nil
 			}
 		} else {
-			execPrice = ApplySlippage(price)
+			execPrice = ApplyAdverseSlippage(price, false)
 			if execPrice <= 0 {
 				return tradesExecuted, "", nil
 			}
@@ -1544,7 +1576,7 @@ func executeSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, p
 			if fillQty > 0 {
 				execPrice = price
 			} else {
-				execPrice = ApplySlippage(price)
+				execPrice = ApplyAdverseSlippage(price, true)
 			}
 			buyCost := closeQty * execPrice
 			useFillMetadata := fillQty > 0 && !fillMetadataUsed
@@ -1618,7 +1650,7 @@ func executeSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, p
 			execPrice = price
 			qty = fillQty
 		} else {
-			execPrice = ApplySlippage(price)
+			execPrice = ApplyAdverseSlippage(price, true)
 			if execPrice <= 0 {
 				out.TradesExecuted = tradesExecuted
 				return out, nil
@@ -1692,7 +1724,7 @@ func executeSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, p
 			if fillQty > 0 {
 				execPrice = price
 			} else {
-				execPrice = ApplySlippage(price)
+				execPrice = ApplyAdverseSlippage(price, false)
 			}
 			saleValue := closeQty * execPrice
 			useFillMetadata := fillQty > 0 && !fillMetadataUsed
@@ -1809,7 +1841,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 			if fillContracts > 0 {
 				execPrice = price
 			} else {
-				execPrice = ApplySlippage(price)
+				execPrice = ApplyAdverseSlippage(price, true)
 			}
 			pnl := float64(contracts) * multiplier * (pos.AvgCost - execPrice)
 			useFillMetadata := fillContracts > 0 && !fillMetadataUsed
@@ -1879,7 +1911,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 				marginPerContract = price * multiplier
 			}
 		} else {
-			execPrice = ApplySlippage(price)
+			execPrice = ApplyAdverseSlippage(price, true)
 			if marginPerContract <= 0 {
 				marginPerContract = execPrice * multiplier
 			}
@@ -1954,7 +1986,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 			if fillContracts > 0 {
 				execPrice = price
 			} else {
-				execPrice = ApplySlippage(price)
+				execPrice = ApplyAdverseSlippage(price, false)
 			}
 			pnl := float64(contracts) * multiplier * (execPrice - pos.AvgCost)
 			useFillMetadata := fillContracts > 0 && !fillMetadataUsed
@@ -2025,7 +2057,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 					marginPerContract = price * multiplier
 				}
 			} else {
-				execPrice = ApplySlippage(price)
+				execPrice = ApplyAdverseSlippage(price, false)
 				if marginPerContract <= 0 {
 					marginPerContract = execPrice * multiplier
 				}
@@ -2088,7 +2120,7 @@ func stampOpenTradeFromPosition(s *StrategyState, db *StateDB, symbol string, po
 	}
 	for i := len(s.TradeHistory) - 1; i >= 0; i-- {
 		t := &s.TradeHistory[i]
-		if t.Symbol != symbol {
+		if t.Symbol != symbol || t.TradeType == TradeTypeFunding {
 			continue
 		}
 		if t.IsClose {

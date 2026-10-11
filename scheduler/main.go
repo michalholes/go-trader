@@ -34,6 +34,8 @@ var knownSubcommands = []string{
 	"feed-fetch",
 	"record-observations",
 	"version",
+	"supervise",
+	"healthcheck",
 }
 
 func validateDaemonInvocation(extra []string) error {
@@ -51,6 +53,13 @@ func validateDaemonInvocation(extra []string) error {
 }
 
 func main() {
+	policy, policyErr := resolveRuntimePolicy(os.Getenv(runtimeEnvVar))
+	if policyErr != nil {
+		fmt.Fprintln(os.Stderr, policyErr)
+		os.Exit(2)
+	}
+	processRuntime = policy
+
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "init":
@@ -90,8 +99,11 @@ func main() {
 		case "record-observations":
 			os.Exit(runRecordObservations(os.Args[2:]))
 		case "version", "--version", "-version":
-			fmt.Println(Version)
-			os.Exit(0)
+			os.Exit(runVersion(os.Args[2:]))
+		case "supervise":
+			os.Exit(runSupervise(os.Args[2:]))
+		case "healthcheck":
+			os.Exit(runHealthcheck(os.Args[2:]))
 		}
 	}
 
@@ -100,6 +112,7 @@ func main() {
 	summary := flag.String("summary", "", "Post snapshot summary for the specified channel (e.g., hyperliquid, spot, options) and exit")
 	leaderboard := flag.Bool("leaderboard", false, "Post pre-computed daily leaderboard and exit")
 	statusPortFlag := flag.Int("status-port", 0, fmt.Sprintf("HTTP status server port (overrides config, default: %d)", DefaultStatusPort))
+	statusBindFlag := flag.String("status-bind", "", fmt.Sprintf("HTTP status server bind address (overrides %s, default: %s); non-loopback needs the container runtime", statusBindEnvVar, defaultStatusBindHost))
 	flag.Parse()
 
 	if err := validateDaemonInvocation(flag.Args()); err != nil {
@@ -108,12 +121,38 @@ func main() {
 	}
 
 	if role, roleErr := peekConfigRole(*configPath); roleErr == nil && role == configRoleFeed {
+		if inContainerRuntime() {
+			fmt.Fprintln(os.Stderr, "role \"feed\" (a shared market feed service) is not supported in the container deployment")
+			os.Exit(1)
+		}
+		if host := resolveStatusBindHost(*statusBindFlag); !isLoopbackBindHost(host) {
+			fmt.Fprintf(os.Stderr, "[server] CRITICAL: refusing to start: status bind %q is not a loopback address; a feed service binds loopback only\n", host)
+			os.Exit(1)
+		}
 		os.Exit(runFeedRole(*configPath, *statusPortFlag, *once, *summary, *leaderboard))
+	}
+
+	if inContainerRuntime() {
+		if issues := containerVolumeIssues(); len(issues) > 0 {
+			for _, issue := range issues {
+				fmt.Fprintf(os.Stderr, "[container] %s\n", issue)
+			}
+			os.Exit(1)
+		}
 	}
 
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+	statusBindHost := resolveStatusBindHost(*statusBindFlag)
+	if err := validateStatusBind(statusBindHost, cfg.StatusToken); err != nil {
+		fmt.Fprintf(os.Stderr, "[server] CRITICAL: refusing to start: %v\n", err)
+		os.Exit(1)
+	}
+	if err := validateContainerStatusPortFlag(*statusPortFlag); err != nil {
+		fmt.Fprintf(os.Stderr, "[server] CRITICAL: refusing to start: %v\n", err)
 		os.Exit(1)
 	}
 	if err := applyAlertThrottleFromConfig(cfg); err != nil {
@@ -347,6 +386,9 @@ func main() {
 			pruned = true
 		}
 	}
+	for _, line := range syncPaperFundingEligibility(state, cfg.Strategies, paperFundingClock()) {
+		fmt.Println(line)
+	}
 	for _, orphan := range storageOrphans {
 		fmt.Printf("  Pruned stale strategy: %s [%s state file, %d position(s)]\n", orphan.StorageID, orphan.Role, orphan.PositionCount)
 		if orphan.PositionCount > 0 {
@@ -464,7 +506,8 @@ func main() {
 	if tuningManager != nil {
 		go tuningManager.run(shutdownReadOnlyCtx)
 	}
-	server.Start(statusPort)
+	armMainLoopDeadline(mainLoopWorkBudget)
+	server.Start(statusBindHost, statusPort)
 
 	diagWorker := newTradeDiagnosticsWorker(FetchUICandles, store.UpdateTradeDiagnosticsMetrics)
 	diagWorker.splitStorage = store.Split()
@@ -478,8 +521,12 @@ func main() {
 
 	stopCh := make(chan struct{})
 	go func() {
-		sig := <-sigCh
-		fmt.Printf("\nReceived %s, draining...\n", sig)
+		select {
+		case sig := <-sigCh:
+			fmt.Printf("\nReceived %s, draining...\n", sig)
+		case <-containerRestartCh:
+			fmt.Println("\n[restart] container restart: draining...")
+		}
 		beginDrain()
 		close(stopCh)
 	}()
@@ -659,7 +706,7 @@ func main() {
 	var lastNotifiedHash string
 
 	if cfg.AutoUpdate != "off" {
-		checkForUpdates(notifier, &lastNotifiedHash)
+		checkForUpdates(cfg, notifier, &lastNotifiedHash, &mu, state, store)
 	}
 
 	deribitPricer := NewDeribitPricer()
@@ -754,7 +801,11 @@ func main() {
 		}
 		tickSeconds = schedulerTickSeconds(cfg)
 		drawdownWarnThresholdPct = configuredDrawdownWarnThresholdPct(cfg)
+		paperFundingSyncLines := syncPaperFundingEligibility(state, cfg.Strategies, paperFundingClock())
 		mu.Unlock()
+		for _, line := range paperFundingSyncLines {
+			fmt.Println("[reload] " + line)
+		}
 
 		diagWorker.UpdateStrategies(cfg.Strategies)
 
@@ -829,6 +880,7 @@ func main() {
 			fmt.Println("[shutdown] draining, exiting trading loop.")
 			return
 		}
+		armMainLoopDeadline(mainLoopWorkBudget)
 
 		processConfigReloads()
 
@@ -913,6 +965,7 @@ func main() {
 				if minTick := time.Duration(tickSeconds) * time.Second; delay < minTick {
 					delay = minTick
 				}
+				armMainLoopDeadline(delay + mainLoopWakeGrace)
 				timer := time.NewTimer(delay)
 				select {
 				case <-timer.C:
@@ -929,6 +982,7 @@ func main() {
 				}
 			}
 			delay := cycleSchedulerDelay(cfg, intervals, lastRun, lastEvaluated, time.Now(), tickSeconds, deadlineFeed, sharedFeedScheduleFor(cfg, sharedClient))
+			armMainLoopDeadline(delay + mainLoopWakeGrace)
 			timer := time.NewTimer(delay)
 			select {
 			case <-timer.C:
@@ -1044,6 +1098,12 @@ func main() {
 				}
 			}
 		}
+		paperFundingMarks := make(map[string]float64, len(hlPerpsCoins))
+		for _, coin := range hlPerpsCoins {
+			if px, ok := prices[coin]; ok {
+				paperFundingMarks[coin] = px
+			}
+		}
 		if len(okxPerpsCoins) > 0 {
 			okxMarks, err := fetchOKXPerpsMids(okxPerpsCoins)
 			if err != nil {
@@ -1090,6 +1150,8 @@ func main() {
 		if len(prices) > 0 && debugLogging() {
 			fmt.Println(formatPricesLogLine(prices))
 		}
+
+		runPaperFundingCycle(shutdownReadOnlyCtx, state, cfg, store, &mu, websocketFeed || sharedFeed, feedCtx.Snapshot, paperFundingMarks, notifier)
 
 		var totalPV float64
 		sharedWallets := detectSharedWallets(cfg.Strategies)
@@ -1899,6 +1961,7 @@ func main() {
 			})
 			recordHeldStrategies(dueStrategies, scopeRisk, store, time.Now())
 			dueUnlatched := dueStrategiesPersistable(store, dueStrategiesNotLatched(dueStrategies, scopeRisk))
+			ensureRestingTPLotMetadata(dueUnlatched)
 			hlBatchResults := runHyperliquidBatchPrePass(dueUnlatched, state, &mu, cfg, prices, notifier, func(format string, a ...any) {
 				fmt.Printf(format+"\n", a...)
 			}, feedCtx)
@@ -2594,6 +2657,11 @@ func main() {
 						}
 					} else if result, signalStr, price, ok := runHyperliquidCheck(&sc, prices, hlPosCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger, hlBatchResults, feedCtx); ok {
 						prices[result.Symbol] = price
+						if hlPosCtx.RestingTP != nil {
+							mu.Lock()
+							recordRestingTPScan(stratState, result.Symbol, hlPosCtx.RestingTP, result.StrategyDecisionFields)
+							mu.Unlock()
+						}
 						hlStep = beginHyperliquidStepTradeAlerts(sc, stratState, &mu)
 						guardSameSideClose(sc, result, hlPosSide, hlPosQty, notifier, logger)
 						if cbManageOnly {
@@ -2677,11 +2745,12 @@ func main() {
 						var execResult *HyperliquidExecuteResult
 						liveExecFailed := false
 						hedgeFreshExposureQty := 0.0
+						var manageRatchetAlert *RatchetTriggerAlert
+						var manageStopEvidence ratchetStopEvidence
 						manageRatchetTightened := false
 						if result.Signal == 0 && hlPosQty > 0 && strategyUsesTrailingTPRatchetClose(sc) {
-							ratchetAlert := applyTrailingTPRatchet(sc, stratState, result.Symbol, price, &mu, logger)
-							notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
-							manageRatchetTightened = ratchetAlert != nil
+							manageRatchetAlert = applyTrailingTPRatchet(sc, stratState, result.Symbol, price, &mu, logger)
+							manageRatchetTightened = manageRatchetAlert != nil
 							mu.RLock()
 							if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos != nil {
 								hlPosSnapshot = hyperliquidProtectionPositionSnapshot(pos)
@@ -2696,6 +2765,7 @@ func main() {
 						}
 						if !hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && effectiveTrailingStopPct(sc, hlPosSnapshot) > 0 {
 							newHighWater, newTrigger, breach, breachPx := runHyperliquidTrailingStopPaper(sc, hlPosSide, hlPosSnapshot, price, hlStopLossHighWaterPx, hlStopLossTriggerPx, trailingReplacePolicy{ratchetTightened: manageRatchetTightened})
+							manageStopEvidence = ratchetStopEvidence{Ran: true, Live: false}
 							mu.Lock()
 							if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos.Quantity > 0 && pos.Side == hlPosSide {
 								if breach {
@@ -2703,6 +2773,7 @@ func main() {
 										pos.StopLossTriggerPx = newTrigger
 									}
 									stopAt := hlStep.historyLenLocked()
+									breachPx = paperStopBookPx(hlPosSide, breachPx)
 									if recordPerpsStopLossClose(stratState, result.Symbol, breachPx, paperStopReasonTrailing, logger) {
 										hlStep.bindWindowLocked(stopAt, fmt.Sprintf("[%s] PAPER TRAILING SL %s @ $%.2f", sc.ID, result.Symbol, breachPx))
 									}
@@ -2731,6 +2802,7 @@ func main() {
 								}
 								forceResize := hlScaleInResizePending && !capped
 								newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, result.Symbol, hlPosSide, slEffectiveQty, hlPosSnapshot, price, hlStopLossHighWaterPx, hlStopLossTriggerPx, hlStopLossOID, trailingReplacePolicy{forceResize: forceResize, ratchetTightened: manageRatchetTightened, liquidationPx: hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, result.Symbol, hlPosSide)}, notifier, logger)
+								manageStopEvidence = ratchetStopEvidence{Ran: true, Live: true, Confirmed: updateConfirmed, Result: slUpdate}
 								mu.Lock()
 								stopAt := hlStep.historyLenLocked()
 								if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, result.Symbol, hlPosSide, hlStopLossOID, newHighWater, updateConfirmed, slUpdate, "trailing_stop_loss_immediate", logger, slEffectiveQty); immediateFill {
@@ -2744,6 +2816,7 @@ func main() {
 								mu.Unlock()
 							}
 						}
+						completeAndNotifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), manageRatchetAlert, sc, stratState, result.Symbol, &mu, manageStopEvidence)
 						if !hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && effectiveTrailingStopPct(sc, hlPosSnapshot) <= 0 {
 							newTrigger, breach, breachPx, stopReason := runHyperliquidFixedStopLossPaper(sc, hlPosSide, hlPosSnapshot, price, hlStopLossTriggerPx)
 							mu.Lock()
@@ -2755,6 +2828,7 @@ func main() {
 								}
 								if breach {
 									stopAt := hlStep.historyLenLocked()
+									breachPx = paperStopBookPx(hlPosSide, breachPx)
 									if recordPerpsStopLossClose(stratState, result.Symbol, breachPx, stopReason, logger) {
 										hlStep.bindWindowLocked(stopAt, fmt.Sprintf("[%s] %s %s @ $%.2f", sc.ID, paperStopLossDetailLabel(stopReason), result.Symbol, breachPx))
 									}
@@ -2939,11 +3013,13 @@ func main() {
 							}
 							hlStep.bindExecuteLocked(execAt, execDetail)
 							mu.Unlock()
-							notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
+							var postTradeStopEvidence ratchetStopEvidence
 							ratchetWalkerOwnedByScaleIn := scaleInAddQty > 0 && execResult != nil && execTrades > 0
 							if ratchetAlert != nil && !ratchetWalkerOwnedByScaleIn {
 								walkerAt := hlStep.historyLen(&mu)
-								if extraTrades, slDetail := runTrailingStopUpdateAfterRatchetTighten(sc, stratState, result.Symbol, price, hlCycle, hlLiquidationPx, hlNetSideByCoin, &mu, notifier, logger); extraTrades > 0 {
+								extraTrades, slDetail, ev := runTrailingStopUpdateAfterRatchetTighten(sc, stratState, result.Symbol, price, hlCycle, hlLiquidationPx, hlNetSideByCoin, &mu, notifier, logger)
+								postTradeStopEvidence = ev
+								if extraTrades > 0 {
 									hlStep.bindWindow(&mu, walkerAt, slDetail)
 								}
 							}
@@ -2966,7 +3042,11 @@ func main() {
 									}
 									hedgeFreshExposureQty = filledAddQty
 									resizeAt := hlStep.historyLen(&mu)
-									if extraTrades, slDetail := scaleInResizeTrailingSLNow(sc, stratState, result.Symbol, price, hlCycle, hlLiquidationPx, hlNetSideByCoin, ratchetAlert != nil, &mu, notifier, logger); extraTrades > 0 {
+									extraTrades, slDetail, ev := scaleInResizeTrailingSLNow(sc, stratState, result.Symbol, price, hlCycle, hlLiquidationPx, hlNetSideByCoin, ratchetAlert != nil, &mu, notifier, logger)
+									if ratchetWalkerOwnedByScaleIn {
+										postTradeStopEvidence = ev
+									}
+									if extraTrades > 0 {
 										hlStep.bindWindow(&mu, resizeAt, slDetail)
 									}
 								} else {
@@ -3001,6 +3081,7 @@ func main() {
 							if paperHLHeldPartialCloseNeedsQuietMaintenance(sc, result, execTrades, hlPosQty) {
 								runPaperHLQuietCycleMaintenance(sc, stratState, stratDB, result.Symbol, price, cfg, &mu, notifier, logger, hlStep)
 							}
+							completeAndNotifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert, sc, stratState, result.Symbol, &mu, postTradeStopEvidence)
 						}
 						if hlProfileResolved {
 							mu.Lock()
@@ -3165,16 +3246,19 @@ func main() {
 							hlStep.bindWindow(&mu, postTPAt, slDetail)
 						}
 						mark := prices[sc.Symbol]
+						var manualRatchetAlert *RatchetTriggerAlert
+						var manualStopEvidence ratchetStopEvidence
 						manualRatchetTightened := false
 						if mark > 0 && strategyUsesTrailingTPRatchetClose(sc) {
-							ratchetAlert := applyTrailingTPRatchet(sc, stratState, sc.Symbol, mark, &mu, logger)
-							notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
-							manualRatchetTightened = ratchetAlert != nil
+							manualRatchetAlert = applyTrailingTPRatchet(sc, stratState, sc.Symbol, mark, &mu, logger)
+							manualRatchetTightened = manualRatchetAlert != nil
 						}
 						trailAt := hlStep.historyLen(&mu)
-						if manualFills, manualDetail := runManualTrailingStopUpdate(sc, stratState, state.Strategies, hlReconcileAll, hlCycle, hlLiquidationPx, hlNetSideByCoin, mark, manualRatchetTightened, &mu, notifier, logger); manualFills > 0 {
+						manualFills, manualDetail, manualStopEvidence := runManualTrailingStopUpdate(sc, stratState, state.Strategies, hlReconcileAll, hlCycle, hlLiquidationPx, hlNetSideByCoin, mark, manualRatchetTightened, &mu, notifier, logger)
+						if manualFills > 0 {
 							hlStep.bindWindow(&mu, trailAt, manualDetail)
 						}
+						completeAndNotifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), manualRatchetAlert, sc, stratState, sc.Symbol, &mu, manualStopEvidence)
 					}
 					if manualOK && closeFraction > 0 {
 						mu.RLock()
@@ -3523,9 +3607,9 @@ func main() {
 		}
 
 		if cfg.AutoUpdate == "heartbeat" {
-			checkForUpdates(notifier, &lastNotifiedHash)
+			checkForUpdates(cfg, notifier, &lastNotifiedHash, &mu, state, store)
 		} else if cfg.AutoUpdate == "daily" && time.Since(lastAutoUpdateCheck) >= 24*time.Hour {
-			checkForUpdates(notifier, &lastNotifiedHash)
+			checkForUpdates(cfg, notifier, &lastNotifiedHash, &mu, state, store)
 			lastAutoUpdateCheck = time.Now()
 		}
 
@@ -3538,6 +3622,7 @@ func main() {
 		endIntervals := effectiveStrategyIntervals(cfg.Strategies, state.Strategies, cfg.IntervalSeconds, drawdownWarnThresholdPct)
 		mu.RUnlock()
 		delay := cycleSchedulerDelay(cfg, endIntervals, lastRun, lastEvaluated, time.Now(), tickSeconds, deadlineFeed, sharedFeedScheduleFor(cfg, sharedClient))
+		armMainLoopDeadline(delay + mainLoopWakeGrace)
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
@@ -4024,6 +4109,12 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 	args = appendRegimePayloadArg(args, *sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
 	args = appendClosedBarDecisionArgs(args, *sc, regime)
+	withRule, ruleErr := appendRestingTPRuleArg(args, posCtx)
+	if ruleErr != nil {
+		logger.Error("Resting take-profit rule request could not be encoded: %v - skipping this strategy this cycle (#1727)", ruleErr)
+		return nil, "", 0, false
+	}
+	args = withRule
 	if refsArgs, err := buildStrategyRefsArg(*sc, closeOwner, sentInvert); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
@@ -4075,6 +4166,10 @@ func finishHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCt
 			errMsg = msg
 			mode = scriptFailureError
 			result = nil
+		} else if msg := restingTPRuleContractError(posCtx.RestingTP, posCtx.Side, result.StrategyDecisionFields); msg != "" {
+			errMsg = msg
+			mode = scriptFailureError
+			result = nil
 		}
 	}
 	if errMsg != "" {
@@ -4097,6 +4192,7 @@ func finishHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCt
 	logger.ScriptStderr(stderr)
 	if result.Degraded == "" {
 		clearScriptFailure(notifier, *sc)
+		logRestingTPRule(*sc, posCtx, result.StrategyDecisionFields, logger)
 	}
 	overrides := applyCheckDirectionalOverrides(sc, regimePayloadValue(result.Regime), posCtx, regime)
 	if overrides.PolicyApplied {
@@ -4418,7 +4514,7 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 		if qty := paperTierFillQty(s.Positions[result.Symbol], result.CloseFraction); qty > 0 {
 			bookPrice = tierPx
 			fillQty = qty
-			logger.Info("Paper take-profit tier fill at tier price $%.4f qty=%.6f (mid was $%.4f)", tierPx, qty, price)
+			logger.Info("Paper take-profit tier fill at tier price $%.4f qty=%.6f (mid was $%.4f)%s", tierPx, qty, price, restingTPFillLogSuffix(result))
 		}
 	}
 
@@ -4474,6 +4570,9 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 			var pos *Position
 			if p, ok := s.Positions[result.Symbol]; ok {
 				pos = p
+			}
+			if pos != nil {
+				stopPx = paperStopBookPx(pos.Side, stopPx)
 			}
 			if recordPositionOpen(s, sc, openTrade, pos) {
 				openTrade = nil

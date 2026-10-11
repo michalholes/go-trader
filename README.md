@@ -44,7 +44,7 @@ DISCORD_DAILY_SUMMARY_CHANNEL_ID=                       # nightly summary
 
 A Go + Python hybrid trading system. A single Go binary (~8MB idle RAM) orchestrates 50+ strategies across spot, options, perpetual futures, and CME futures by spawning short-lived Python scripts. Both paper and live execution are supported per strategy.
 
-Supported platforms: Binance US, Deribit, IBKR/CME, Hyperliquid, TopStep, Robinhood (crypto + stock options), OKX (spot + perps + options), Luno. Per-platform Discord/Telegram channels post hourly summaries plus immediate trade alerts. When a new release ships, the bot DMs the configured owner — reply **yes** and it pulls, rebuilds, and restarts itself.
+Supported platforms: Binance US, Deribit, IBKR/CME, Hyperliquid, TopStep, Robinhood (crypto + stock options), OKX (spot + perps + options), Luno. Per-platform Discord/Telegram channels post hourly summaries plus immediate trade alerts. When a new release ships, a host deployment DMs the configured owner — reply **yes** and it pulls, rebuilds, and restarts itself. A Docker deployment updates by pulling a new image instead.
 
 Join the Discord: [https://discord.gg/46d7Fa2dXz](https://discord.gg/46d7Fa2dXz)
 
@@ -69,6 +69,19 @@ Give your AI agent [SKILL.md](SKILL.md) (raw: `https://raw.githubusercontent.com
 ```
 
 Walks asset/strategy/platform/capital/risk/Discord choices and writes `scheduler/config.json`. Defaults to a minimal BTC spot starter; risk prompts appear only when live trading is selected. Scripted: `./go-trader init --json '{"assets":["BTC"],"enableSpot":true,"spotStrategies":["sma_crossover"],"spotCapital":1000,"spotDrawdown":10}' --output config.json`
+
+### Docker (macOS, Windows, Linux)
+
+Run go-trader in a container with no Go, Python or uv on your computer. The guide covers install, paper-only setup, the dashboard, backups, upgrades and recovery: **[docs/DOCKER.md](docs/DOCKER.md)**.
+
+```bash
+git clone https://github.com/richkuo/go-trader.git && cd go-trader/docker
+cp env.example .env && cp go-trader.env.example go-trader.env   # set GO_TRADER_TAG and STATUS_AUTH_TOKEN
+docker compose run --rm cli init
+docker compose up -d
+```
+
+On a Linux server, the systemd service below stays the main production setup.
 
 ### Manual Setup
 
@@ -339,6 +352,7 @@ Values: `every` / `per_check` / `always`, `hourly`, `daily`, Go durations (`30m`
 | `interval_seconds` | Check interval (0 → global) | 0 |
 | `htf_filter` | Higher-timeframe trend filter | false |
 | `closed_bar_decisions` | Binance.US spot, OKX spot/perps, HL perps — signal, entry ATR and entry sizing use the last closed bar (as the backtester does); protection keeps current prices; restart-required | false |
+| `resting_tp_trade_through` | HL perps paper only — a tier take-profit books only after a completed bar since entry traded one tick past the venue-rounded limit (the backtester models the same rule with `--resting-tp-trade-through`); live is unchanged; JSON `true`/`false` only; restart-required | false |
 | `open_strategy` | Co-located ref `{name, params}` overriding entry; falls back to `args[0]` | null |
 | `close_strategy` | Single `{name, params}` close evaluator ref | null |
 | `leverage` | Perps — exchange leverage (also sizing if `sizing_leverage` omitted) | 1 |
@@ -531,15 +545,15 @@ Capture runs on Linux only: SQLite reads each file through `VACUUM INTO` from a 
 
 | Market | Fee | Slippage |
 |--------|-----|----------|
-| Binance US Spot | 0.1% taker | ±0.05% |
+| Binance US Spot | 0.1% taker | 0.05% against the trade (paper and backtest) |
 | Deribit Options | 0.03% of premium | — |
 | IBKR/CME Options | $0.25/contract | — |
-| Hyperliquid Perps | 0.045% taker / 0.015% maker (base tier) | ±0.05% |
-| TopStep Futures | Per-contract (configurable) | ±0.05% |
-| Robinhood Crypto | No commission (spread embedded) | ±0.05% |
+| Hyperliquid Perps | 0.045% taker (also on resting take-profit tier fills); 0.015% maker constant, unverified and not applied to tier fills | 0.05% against the trade (paper and backtest) |
+| TopStep Futures | Per-contract (configurable) | 0.05% against the trade (paper and backtest) |
+| Robinhood Crypto | No commission (spread embedded) | 0.05% against the trade (paper and backtest) |
 | Robinhood Options | $0.03/contract (regulatory fee) | — |
 
-Live fills record exchange-reported fees and order IDs.
+Live fills record exchange-reported fees and order IDs. The fee rates are the code constants. An operator check of a 2026-10-06 live capture ([issue 1726](https://github.com/richkuo/go-trader/issues/1726#issuecomment-6055361624)) reports every booked fee group at or below the 0.045% taker constant and could not classify take-profit tier fills as maker, so paper and the backtester without a maker rate charge taker on tier fills. The live ledger comparison is the one exception: it charges the manifest `maker_fee_pct` on simulated tier fills. The capture is private, so the repository cannot verify this check; the exact account rate and the maker rate stay unverified.
 
 ---
 

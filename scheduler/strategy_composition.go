@@ -29,6 +29,8 @@ type StrategyDecisionFields struct {
 	Regime             *RegimePayload     `json:"regime,omitempty"`
 	ClosedBar          *ClosedBarDecision `json:"closed_bar_decision,omitempty"`
 	DecisionRegime     *RegimePayload     `json:"decision_regime,omitempty"`
+	RestingTPRule      *RestingTPRuleEcho `json:"resting_tp_rule,omitempty"`
+	CloseRestingFill   json.RawMessage    `json:"close_resting_fill,omitempty"`
 }
 
 type PositionCtx struct {
@@ -56,6 +58,11 @@ type PositionCtx struct {
 	StopLossHighWaterPx            float64
 	PostTPTrailingATRMult          float64
 	SLAdjustedTiersProcessed       int
+	RatchetFallbackNormalizePending bool
+	RestingTPScannedOpenMs          int64
+	RestingTPReachPx                float64
+	RestingTPStopTriggerPx          float64
+	RestingTP                       *restingTPRuleRequest
 }
 
 func usesOpenCloseConfig(sc StrategyConfig) bool {
@@ -207,6 +214,10 @@ func positionCtxFromPosition(pos *Position) PositionCtx {
 		StopLossTriggerPx:              pos.StopLossTriggerPx,
 		StopLossHighWaterPx:            pos.StopLossHighWaterPx,
 		SLAdjustedTiersProcessed:       pos.SLAdjustedTiersProcessed,
+		RatchetFallbackNormalizePending: pos.RatchetFallbackNormalizePending,
+		RestingTPScannedOpenMs:          pos.RestingTPScannedOpenMs,
+		RestingTPReachPx:                pos.RestingTPReachPx,
+		RestingTPStopTriggerPx:          pos.RestingTPStopTriggerPx,
 	}
 	if pos.PostTPTrailingATRMult != nil {
 		ctx.PostTPTrailingATRMult = *pos.PostTPTrailingATRMult

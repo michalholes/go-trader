@@ -185,7 +185,13 @@ _PREVIEW_LEVERAGE_SOURCES = {
 }
 
 
-def _preview_stop_kwargs(cfg: dict) -> dict:
+class ArmRefusal(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _preview_stop_kwargs(cfg: dict, prepared_windows=None) -> dict:
     resolved = {k: cfg.get(k) for k in STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS}
     resolved["stop_loss_atr_mult_regime"] = _resolve_atr_regime_stop(
         cfg, "stop_loss_atr_mult_regime")
@@ -209,7 +215,15 @@ def _preview_stop_kwargs(cfg: dict) -> dict:
     else:
         lev = {"status": "verified" if _PREVIEW_LEVERAGE_SOURCES[source] else "unverified",
                "source": source, "value": float(leverage)}
-    window_evidence = _atr_window_evidence(cfg, dict(cfg.get("regime") or {}))
+    if prepared_windows is None:
+        regime_cfg = dict(cfg.get("regime") or {})
+        if regime_cfg.get("enabled") and regime_cfg.get("windows"):
+            from regime_label_columns import (prepared_window_keys,
+                                              resolve_feature_windows)
+            prepared_windows = prepared_window_keys(
+                resolve_feature_windows(cfg, regime_cfg))
+    window_evidence = _atr_window_evidence(
+        cfg, dict(cfg.get("regime") or {}), prepared_windows)
     kwargs, context = live_stop_engine_inputs(
         resolved, raw_fields=stop_raw_fields(resolved), source=STOP_UNITS_PREVIEW,
         leverage=lev, extra_evidence={"atr_regime_window": window_evidence})
@@ -269,8 +283,19 @@ def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
     regime_enabled = bool(regime_cfg.get("enabled"))
     allowed = list(cfg.get("allowed_regimes") or [])
     gate_on_failure = _resolve_gate_on_failure(cfg, regime_cfg)
-
-    bt = Backtester(
+    from regime_label_columns import (attach_regime_label_columns,
+                                      feature_label_kwargs,
+                                      prepared_window_keys,
+                                      resolve_feature_windows)
+    label_plan = resolve_feature_windows(cfg, regime_cfg)
+    label_columns = None
+    feature_labels = {}
+    prepared = None
+    if regime_enabled:
+        df_signals, label_columns = attach_regime_label_columns(df_signals, label_plan)
+        feature_labels = feature_label_kwargs(label_plan)
+        prepared = prepared_window_keys(label_plan)
+    bt_kwargs = dict(
         initial_capital=float(cfg.get("initial_capital") or 1000),
         platform=_fee_platform(platform, strategy_type),
         open_strategy={"name": open_name, "params": merged_params},
@@ -282,16 +307,58 @@ def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
         allowed_regimes=allowed,
         regime_gate_on_failure=gate_on_failure,
         strategy_type=strategy_type,
-        **_preview_stop_kwargs(cfg),
+        regime_label_columns=label_columns,
     )
-    results = bt.run(
-        df_signals,
-        strategy_name=open_name,
-        symbol=symbol,
-        timeframe=timeframe,
-        params=merged_params,
-        save=False,
-    )
+    policy = cfg.get("regime_directional_policy")
+    if regime_enabled and policy:
+        bt_kwargs["regime_directional_policy"] = policy
+        bt_kwargs["regime_directional_certified_states"] = dict(
+            cfg.get("regime_directional_certified_states") or {})
+    bt_kwargs.update(feature_labels)
+    bt_kwargs.update(_preview_stop_kwargs(cfg, prepared))
+    sizing = cfg.get("perps_sizing")
+    if sizing is not None:
+        if not isinstance(sizing, dict):
+            raise ValueError("perps_sizing must be an object")
+        evidence = str(sizing.get("pool_evidence") or "")
+        if evidence == "invalid":
+            raise ValueError("pool configuration refused: "
+                             + str(sizing.get("pool_evidence_reason") or "invalid shared-wallet pool"))
+        if sizing.get("budget_source") == "shared_wallet_pool" and evidence != "verified":
+            raise ValueError(
+                "pool_cap_unverified: strategy simulation has no per-entry available "
+                "wallet margin, so it will not size from strategy cash")
+        from backtester import normalize_perps_sizing
+        lev = bt_kwargs.get("leverage")
+        if isinstance(lev, bool) or not isinstance(lev, (int, float)) or lev <= 0:
+            lev = None
+        bt_kwargs["perps_sizing"] = normalize_perps_sizing(sizing, lev)
+    try:
+        bt = Backtester(**bt_kwargs)
+    except ValueError as exc:
+        if policy and "regime_directional_policy" in str(exc):
+            raise ArmRefusal(f"regime_directional_policy cannot be previewed: {exc}") from exc
+        raise
+    plan_tf = str(label_plan.get("timeframe") or "").strip().lower()
+    chart_tf = str(timeframe or "").strip().lower()
+    if regime_enabled and plan_tf and plan_tf != chart_tf and (
+            any(label_plan["named"].values()) or bt.reads_regime_labels):
+        raise ArmRefusal(
+            f"regime.timeframe {plan_tf!r} differs from chart timeframe "
+            f"{timeframe!r}; the preview does not fetch regime-timeframe candles")
+    try:
+        results = bt.run(
+            df_signals,
+            strategy_name=open_name,
+            symbol=symbol,
+            timeframe=timeframe,
+            params=merged_params,
+            save=False,
+        )
+    except ValueError as exc:
+        if bt.regime_directional_policy is not None and "regime_directional_policy" in str(exc):
+            raise ArmRefusal(f"regime_directional_policy cannot be previewed: {exc}") from exc
+        raise
     markers: List[dict] = []
     for trade in results.get("trades") or []:
         markers.extend(_trade_to_markers(trade))
@@ -308,16 +375,21 @@ def _run_payload(payload: dict) -> dict:
         return {"error": "no configs supplied", "markers": {}}
 
     out: Dict[str, List[dict]] = {}
+    refusals: Dict[str, str] = {}
     for item in configs:
         label = str(item.get("label") or "default")
         cfg = dict(item.get("config") or item)
         try:
             out[label] = _simulate_one(cfg, candles)
+        except ArmRefusal as exc:
+            refusals[label] = exc.reason
         except CloseCapabilityError as exc:
             return {"error": f"{label}: {exc}", "markers": {},
                     "label": label, "close_capability": exc.to_dict()}
         except Exception as exc:
             return {"error": f"{label}: {exc}", "markers": out}
+    if refusals:
+        return {"markers": out, "refusals": refusals}
     return {"markers": out}
 
 

@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -32,131 +34,141 @@ type stratDef struct {
 }
 
 var knownShortNames = map[string]string{
-	"sma_crossover":               "sma",
-	"ema_crossover":               "ema",
-	"momentum":                    "momentum",
-	"rsi":                         "rsi",
-	"bollinger_bands":             "bb",
-	"macd":                        "macd",
-	"mean_reversion":              "mr",
-	"volume_weighted":             "vw",
-	"triple_ema":                  "tema",
-	"triple_ema_bidir":            "temab",
-	"tema_cross":                  "temac",
-	"tema_cross_bd":               "temacb",
-	"rsi_macd_combo":              "rmc",
-	"vol_mean_reversion":          "vol",
-	"momentum_options":            "mom",
-	"protective_puts":             "pput",
-	"covered_calls":               "ccall",
-	"breakout":                    "bo",
-	"breakout_retest":             "brt",
-	"atr_breakout":                "atrbo",
-	"stoch_rsi":                   "stochrsi",
-	"ichimoku_cloud":              "ichi",
-	"order_blocks":                "ob",
-	"vwap_reversion":              "vwap",
-	"anchored_vwap":               "avwap",
-	"anchored_vwap_channel":       "avwapch",
-	"anchored_vwap_reversion":     "avwaprev",
-	"chart_pattern":               "cpat",
-	"liquidity_sweeps":            "liqsw",
-	"parabolic_sar":               "psar",
-	"delta_neutral_funding":       "dnf",
-	"funding_skew":                "fskew",
-	"supertrend":                  "st",
-	"squeeze_momentum":            "sqm",
-	"heikin_ashi_ema":             "hae",
-	"range_scalper":               "rs",
-	"sweep_squeeze_combo":         "ssc",
-	"adx_trend":                   "adxt",
-	"donchian_breakout":           "dbo",
-	"session_breakout":            "sbo",
-	"bear_pullback_st":            "bps",
-	"vwap_rejection_st":           "vrs",
-	"momentum_pro":                "mompro",
-	"mean_reversion_pro":          "mrpro",
-	"rsi_bb_combo":                "rsibb",
-	"consolidation_range":         "cr",
-	"atr_band_revert":             "abr",
-	"mtf_confluence":              "mtfc",
-	"ob_touch":                    "obt",
-	"vol_momentum":                "volmom",
-	"regime_adaptive":             "regad",
-	"regime_adaptive_htf":         "rahtf",
-	"amd_ifvg":                    "amdifvg",
-	"pairs_spread":                "pairs",
-	"analog_retrieval":            "analog",
-	"awesome_oscillator":          "ao",
-	"chaikin_money_flow_breakout": "cmfbo",
-	"commodity_channel_trend":     "cci",
-	"connors_rsi_reversion":       "crsi",
-	"open_interest_breakout":      "oibo",
-	"relative_vigor_index":        "rvi",
-	"vortex_trend":                "vortex",
-	"hold":                        "hold",
+	"sma_crossover":                "sma",
+	"breakout_retest":               "brt",
+	"ob_touch":                      "obt",
+	"ema_crossover":                "ema",
+	"momentum":                     "momentum",
+	"rsi":                          "rsi",
+	"bollinger_bands":              "bb",
+	"macd":                         "macd",
+	"mean_reversion":               "mr",
+	"volume_weighted":              "vw",
+	"triple_ema":                   "tema",
+	"triple_ema_bidir":             "temab",
+	"tema_cross":                   "temac",
+	"tema_cross_bd":                "temacb",
+	"rsi_macd_combo":               "rmc",
+	"vol_mean_reversion":           "vol",
+	"momentum_options":             "mom",
+	"protective_puts":              "pput",
+	"covered_calls":                "ccall",
+	"breakout":                     "bo",
+	"atr_breakout":                 "atrbo",
+	"stoch_rsi":                    "stochrsi",
+	"ichimoku_cloud":               "ichi",
+	"order_blocks":                 "ob",
+	"vwap_reversion":               "vwap",
+	"anchored_vwap":                "avwap",
+	"anchored_vwap_channel":        "avwapch",
+	"anchored_vwap_reversion":      "avwaprev",
+	"chart_pattern":                "cpat",
+	"liquidity_sweeps":             "liqsw",
+	"parabolic_sar":                "psar",
+	"delta_neutral_funding":        "dnf",
+	"funding_skew":                 "fskew",
+	"supertrend":                   "st",
+	"squeeze_momentum":             "sqm",
+	"heikin_ashi_ema":              "hae",
+	"range_scalper":                "rs",
+	"sweep_squeeze_combo":          "ssc",
+	"adx_trend":                    "adxt",
+	"donchian_breakout":            "dbo",
+	"session_breakout":             "sbo",
+	"bear_pullback_st":             "bps",
+	"vwap_rejection_st":            "vrs",
+	"momentum_pro":                 "mompro",
+	"mean_reversion_pro":           "mrpro",
+	"rsi_bb_combo":                 "rsibb",
+	"consolidation_range":          "cr",
+	"atr_band_revert":              "abr",
+	"mtf_confluence":               "mtfc",
+	"vol_momentum":                 "volmom",
+	"regime_adaptive":              "regad",
+	"regime_adaptive_htf":          "rahtf",
+	"amd_ifvg":                     "amdifvg",
+	"pairs_spread":                 "pairs",
+	"analog_retrieval":             "analog",
+	"awesome_oscillator":           "ao",
+	"chaikin_money_flow_breakout":  "cmfbo",
+	"breakout_retest":               {"futures"},
+	"ob_touch":                      {"spot", "futures"},
+	"commodity_channel_trend":      "cci",
+	"connors_rsi_reversion":        "crsi",
+	"ease_of_movement_breakout":    "eombo",
+	"fisher_reversal":              "fisher",
+	"money_flow_index_reversal":    "mfi",
+	"on_balance_volume_divergence": "obvdiv",
+	"open_interest_breakout":       "oibo",
+	"relative_vigor_index":         "rvi",
+	"vortex_trend":                 "vortex",
+	"williams_r_reversal":          "wrr",
+	"hold":                         "hold",
 }
 
 var registeredOpenStrategyPlatforms = map[string][]string{
-	"adx_trend":                   {"spot", "futures"},
-	"amd_ifvg":                    {"spot", "futures"},
-	"analog_retrieval":            {"spot", "futures"},
-	"anchored_vwap":               {"spot", "futures"},
-	"anchored_vwap_channel":       {"spot", "futures"},
-	"anchored_vwap_reversion":     {"spot", "futures"},
-	"atr_band_revert":             {"spot", "futures"},
-	"atr_breakout":                {"spot", "futures"},
-	"awesome_oscillator":          {"futures"},
-	"bear_pullback_st":            {"futures"},
-	"bollinger_bands":             {"spot", "futures"},
-	"breakout":                    {"futures"},
-	"breakout_retest":             {"futures"},
-	"chaikin_money_flow_breakout": {"futures"},
-	"chart_pattern":               {"spot", "futures"},
-	"commodity_channel_trend":     {"futures"},
-	"connors_rsi_reversion":       {"futures"},
-	"consolidation_range":         {"futures"},
-	"delta_neutral_funding":       {"futures"},
-	"donchian_breakout":           {"spot", "futures"},
-	"ema_crossover":               {"spot", "futures"},
-	"funding_skew":                {"futures"},
-	"heikin_ashi_ema":             {"spot", "futures"},
-	"hold":                        {"spot", "futures"},
-	"ichimoku_cloud":              {"spot", "futures"},
-	"liquidity_sweeps":            {"spot", "futures"},
-	"macd":                        {"spot", "futures"},
-	"mean_reversion":              {"spot", "futures"},
-	"mean_reversion_pro":          {"spot", "futures"},
-	"momentum":                    {"spot", "futures"},
-	"momentum_pro":                {"spot", "futures"},
-	"mtf_confluence":              {"spot", "futures"},
-	"ob_touch":                    {"spot", "futures"},
-	"open_interest_breakout":      {"futures"},
-	"order_blocks":                {"spot", "futures"},
-	"pairs_spread":                {"spot"},
-	"parabolic_sar":               {"spot", "futures"},
-	"range_scalper":               {"spot", "futures"},
-	"regime_adaptive":             {"spot", "futures"},
-	"regime_adaptive_htf":         {"spot", "futures"},
-	"relative_vigor_index":        {"futures"},
-	"rsi":                         {"spot", "futures"},
-	"rsi_bb_combo":                {"spot", "futures"},
-	"rsi_macd_combo":              {"spot", "futures"},
-	"session_breakout":            {"futures"},
-	"sma_crossover":               {"spot", "futures"},
-	"squeeze_momentum":            {"spot", "futures"},
-	"stoch_rsi":                   {"spot", "futures"},
-	"supertrend":                  {"spot", "futures"},
-	"sweep_squeeze_combo":         {"spot", "futures"},
-	"tema_cross":                  {"spot", "futures"},
-	"tema_cross_bd":               {"futures"},
-	"triple_ema":                  {"spot", "futures"},
-	"triple_ema_bidir":            {"futures"},
-	"vol_momentum":                {"spot", "futures"},
-	"volume_weighted":             {"spot", "futures"},
-	"vortex_trend":                {"futures"},
-	"vwap_rejection_st":           {"futures"},
-	"vwap_reversion":              {"spot", "futures"},
+	"adx_trend":                    {"spot", "futures"},
+	"amd_ifvg":                     {"spot", "futures"},
+	"analog_retrieval":             {"spot", "futures"},
+	"anchored_vwap":                {"spot", "futures"},
+	"anchored_vwap_channel":        {"spot", "futures"},
+	"anchored_vwap_reversion":      {"spot", "futures"},
+	"atr_band_revert":              {"spot", "futures"},
+	"atr_breakout":                 {"spot", "futures"},
+	"awesome_oscillator":           {"futures"},
+	"bear_pullback_st":             {"futures"},
+	"bollinger_bands":              {"spot", "futures"},
+	"breakout":                     {"futures"},
+	"chaikin_money_flow_breakout":  {"futures"},
+	"chart_pattern":                {"spot", "futures"},
+	"commodity_channel_trend":      {"futures"},
+	"connors_rsi_reversion":        {"futures"},
+	"consolidation_range":          {"futures"},
+	"delta_neutral_funding":        {"futures"},
+	"donchian_breakout":            {"spot", "futures"},
+	"ease_of_movement_breakout":    {"futures"},
+	"ema_crossover":                {"spot", "futures"},
+	"fisher_reversal":              {"futures"},
+	"funding_skew":                 {"futures"},
+	"heikin_ashi_ema":              {"spot", "futures"},
+	"hold":                         {"spot", "futures"},
+	"ichimoku_cloud":               {"spot", "futures"},
+	"liquidity_sweeps":             {"spot", "futures"},
+	"macd":                         {"spot", "futures"},
+	"mean_reversion":               {"spot", "futures"},
+	"mean_reversion_pro":           {"spot", "futures"},
+	"momentum":                     {"spot", "futures"},
+	"momentum_pro":                 {"spot", "futures"},
+	"money_flow_index_reversal":    {"futures"},
+	"mtf_confluence":               {"spot", "futures"},
+	"on_balance_volume_divergence": {"futures"},
+	"open_interest_breakout":       {"futures"},
+	"order_blocks":                 {"spot", "futures"},
+	"pairs_spread":                 {"spot"},
+	"parabolic_sar":                {"spot", "futures"},
+	"range_scalper":                {"spot", "futures"},
+	"regime_adaptive":              {"spot", "futures"},
+	"regime_adaptive_htf":          {"spot", "futures"},
+	"relative_vigor_index":         {"futures"},
+	"rsi":                          {"spot", "futures"},
+	"rsi_bb_combo":                 {"spot", "futures"},
+	"rsi_macd_combo":               {"spot", "futures"},
+	"session_breakout":             {"futures"},
+	"sma_crossover":                {"spot", "futures"},
+	"squeeze_momentum":             {"spot", "futures"},
+	"stoch_rsi":                    {"spot", "futures"},
+	"supertrend":                   {"spot", "futures"},
+	"sweep_squeeze_combo":          {"spot", "futures"},
+	"tema_cross":                   {"spot", "futures"},
+	"tema_cross_bd":                {"futures"},
+	"triple_ema":                   {"spot", "futures"},
+	"triple_ema_bidir":             {"futures"},
+	"vol_momentum":                 {"spot", "futures"},
+	"volume_weighted":              {"spot", "futures"},
+	"vortex_trend":                 {"futures"},
+	"vwap_rejection_st":            {"futures"},
+	"vwap_reversion":               {"spot", "futures"},
+	"williams_r_reversal":          {"futures"},
 }
 
 func openStrategyRegisteredFor(name, registryPlatform string) bool {
@@ -169,35 +181,40 @@ func openStrategyRegisteredFor(name, registryPlatform string) bool {
 }
 
 var bidirectionalPerpsStrategies = map[string]bool{
-	"triple_ema_bidir":            true,
-	"tema_cross_bd":               true,
-	"session_breakout":            true,
-	"donchian_breakout":           true,
-	"chart_pattern":               true,
-	"liquidity_sweeps":            true,
-	"bear_pullback_st":            true,
-	"breakout_retest":             true,
-	"vwap_rejection_st":           true,
-	"anchored_vwap":               true,
-	"anchored_vwap_channel":       true,
-	"anchored_vwap_reversion":     true,
-	"momentum_pro":                true,
-	"mean_reversion_pro":          true,
-	"rsi_bb_combo":                true,
-	"consolidation_range":         true,
-	"atr_band_revert":             true,
-	"commodity_channel_trend":     true,
-	"mtf_confluence":              true,
-	"ob_touch":                    true,
-	"vol_momentum":                true,
-	"funding_skew":                true,
-	"regime_adaptive":             true,
-	"chaikin_money_flow_breakout": true,
-	"open_interest_breakout":      true,
-	"connors_rsi_reversion":       true,
-	"vortex_trend":                true,
-	"relative_vigor_index":        true,
-	"awesome_oscillator":          true,
+	"triple_ema_bidir":             true,
+	"tema_cross_bd":                true,
+	"session_breakout":             true,
+	"donchian_breakout":            true,
+	"chart_pattern":                true,
+	"liquidity_sweeps":             true,
+	"bear_pullback_st":             true,
+	"breakout_retest":               true,
+	"vwap_rejection_st":            true,
+	"anchored_vwap":                true,
+	"anchored_vwap_channel":        true,
+	"anchored_vwap_reversion":      true,
+	"momentum_pro":                 true,
+	"mean_reversion_pro":           true,
+	"rsi_bb_combo":                 true,
+	"consolidation_range":          true,
+	"atr_band_revert":              true,
+	"commodity_channel_trend":      true,
+	"mtf_confluence":               true,
+	"ob_touch":                      true,
+	"vol_momentum":                 true,
+	"funding_skew":                 true,
+	"regime_adaptive":              true,
+	"chaikin_money_flow_breakout":  true,
+	"open_interest_breakout":       true,
+	"connors_rsi_reversion":        true,
+	"vortex_trend":                 true,
+	"relative_vigor_index":         true,
+	"awesome_oscillator":           true,
+	"ease_of_movement_breakout":    true,
+	"fisher_reversal":              true,
+	"williams_r_reversal":          true,
+	"money_flow_index_reversal":    true,
+	"on_balance_volume_divergence": true,
 }
 
 func isBidirectionalPerpsStrategy(id string) bool {
@@ -443,6 +460,7 @@ type InitOptions struct {
 	PortfolioWarnThresholdPct   float64 `json:"portfolioWarnThresholdPct,omitempty"`
 	AllowNoEdge                 bool    `json:"allowNoEdge,omitempty"`
 	ClosedBarDecisions          bool    `json:"closedBarDecisions,omitempty"`
+	RestingTPTradeThrough       bool    `json:"restingTPTradeThrough,omitempty"`
 	DiscordEnabled              bool
 	DiscordOwnerID              string
 	SpotChannelID               string
@@ -855,6 +873,17 @@ func generateConfig(opts InitOptions) *Config {
 		}
 	}
 
+	if opts.RestingTPTradeThrough {
+		for i := range cfg.Strategies {
+			candidate := cfg.Strategies[i]
+			inferStrategyPlatform(&candidate)
+			candidate.RestingTPTradeThrough = true
+			if len(restingTPTradeThroughStrategyErrors(candidate, cfg)) == 0 {
+				cfg.Strategies[i].RestingTPTradeThrough = true
+			}
+		}
+	}
+
 	return cfg
 }
 
@@ -1037,6 +1066,10 @@ func runInitFromJSON(jsonStr string, outputPath string) int {
 	}
 
 	cfg := generateConfig(opts)
+	if err := applyContainerInitPolicy(cfg, opts.OutputPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -1055,10 +1088,21 @@ func runInitFromJSON(jsonStr string, outputPath string) int {
 func runInit(args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	jsonFlag := fs.String("json", "", "JSON blob of InitOptions for non-interactive config generation")
-	outputFlag := fs.String("output", "scheduler/config.json", "output config file path")
+	defaultOutput := "scheduler/config.json"
+	if inContainerRuntime() {
+		defaultOutput = containerConfigPath
+	}
+	outputFlag := fs.String("output", defaultOutput, "output config file path")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
 		return 1
+	}
+
+	if inContainerRuntime() {
+		if issue := containerMountIssue(containerDataDir, "config and state databases"); issue != "" {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", issue)
+			return 1
+		}
 	}
 
 	if *jsonFlag != "" {
@@ -1074,7 +1118,17 @@ func runInit(args []string) int {
 	fmt.Println("Interactive config setup. Press Enter to accept defaults.")
 	fmt.Println()
 
-	outputPath := p.String("Output config path", "scheduler/config.json")
+	outputPath := *outputFlag
+	if inContainerRuntime() {
+		if issue := containerDataPathIssue(outputPath); issue != "" {
+			fmt.Fprintf(os.Stderr, "Error: --output %q %s\n", outputPath, issue)
+			return 1
+		}
+		fmt.Printf("Config file: %s (in the data volume)\n", outputPath)
+		fmt.Println("Container setup creates paper strategies only. Live trading is a later config change (docs/DOCKER.md).")
+	} else {
+		outputPath = p.String("Output config path", *outputFlag)
+	}
 	if _, err := os.Stat(outputPath); err == nil {
 		if !p.YesNo(fmt.Sprintf("  %s already exists. Overwrite?", outputPath), false) {
 			fmt.Println("Aborted.")
@@ -1155,7 +1209,7 @@ func runInit(args []string) int {
 	}
 
 	perpsMode := "paper"
-	if enablePerps {
+	if enablePerps && !inContainerRuntime() {
 		modeOptions := []string{"paper (safe default)", "live (requires HYPERLIQUID_SECRET_KEY)"}
 		if p.Choice("\nPerps trading mode:", modeOptions, 0) == 1 {
 			perpsMode = "live"
@@ -1166,7 +1220,7 @@ func runInit(args []string) int {
 	var futuresSymbols []string
 	if enableFutures {
 		modeOptions := []string{"paper (safe default)", "live (requires TOPSTEP_API_KEY)"}
-		if p.Choice("\nFutures trading mode:", modeOptions, 0) == 1 {
+		if !inContainerRuntime() && p.Choice("\nFutures trading mode:", modeOptions, 0) == 1 {
 			futuresMode = "live"
 		}
 		symbolIdxs := p.MultiSelect("\nSelect futures symbols:", supportedFuturesSymbols, false)
@@ -1179,7 +1233,7 @@ func runInit(args []string) int {
 	}
 
 	robinhoodMode := "paper"
-	if enableRobinhood {
+	if enableRobinhood && !inContainerRuntime() {
 		modeOptions := []string{"paper (safe default — signal only, no orders)", "live (requires ROBINHOOD_USERNAME/PASSWORD/TOTP_SECRET)"}
 		if p.Choice("\nRobinhood trading mode:", modeOptions, 0) == 1 {
 			robinhoodMode = "live"
@@ -1187,7 +1241,7 @@ func runInit(args []string) int {
 	}
 
 	okxMode := "paper"
-	if enableOKX {
+	if enableOKX && !inContainerRuntime() {
 		modeOptions := []string{"paper (safe default)", "live (requires OKX_API_KEY/API_SECRET/PASSPHRASE)"}
 		if p.Choice("\nOKX trading mode:", modeOptions, 0) == 1 {
 			okxMode = "live"
@@ -1349,7 +1403,7 @@ func runInit(args []string) int {
 	manualCapital := 1000.0
 	manualDrawdown := 20.0
 	manualLeverage := 20.0
-	if p.YesNo("Do you plan to do any manual trading on Hyperliquid?", false) {
+	if !inContainerRuntime() && p.YesNo("Do you plan to do any manual trading on Hyperliquid?", false) {
 		enableManual = true
 		manualSymbol = strings.TrimSpace(p.String("Symbol for manual trades (e.g. ETH)", "ETH"))
 		manualTimeframe = strings.TrimSpace(p.String("Timeframe for TP evaluation", "1h"))
@@ -1372,6 +1426,10 @@ func runInit(args []string) int {
 	fmt.Println("Protection (stops, trailing stops, ratchets, take-profits) keeps current prices. Entries can start up to one bar later.")
 	fmt.Println("Supported: Binance.US spot, OKX spot/perps and Hyperliquid perps on fixed-duration timeframes; other strategies keep forming-bar decisions.")
 	closedBarDecisions := p.YesNo("Enable closed_bar_decisions on supported strategies?", false)
+
+	fmt.Println("\nThe resting take-profit rule books a paper Hyperliquid perps tier take-profit only after a completed bar trades one price tick past the venue-rounded limit.")
+	fmt.Println("Live trading is unchanged. Supported: paper Hyperliquid perps strategies with a tier take-profit close and a check interval at or below the bar.")
+	restingTPTradeThrough := p.YesNo("Enable resting_tp_trade_through on supported paper strategies?", false)
 
 	perpsStratIDs := make([]string, len(perpsStrategies))
 	for i, s := range perpsStrategies {
@@ -1459,6 +1517,7 @@ func runInit(args []string) int {
 		OKXDrawdown:               okxDrawdown,
 		HTFFilter:                 htfFilter,
 		ClosedBarDecisions:        closedBarDecisions,
+		RestingTPTradeThrough:     restingTPTradeThrough,
 		EnableManual:              enableManual,
 		ManualSymbol:              manualSymbol,
 		ManualTimeframe:           manualTimeframe,
@@ -1477,6 +1536,10 @@ func runInit(args []string) int {
 	}
 
 	cfg := generateConfig(opts)
+	if err := applyContainerInitPolicy(cfg, outputPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
 
 	fmt.Println("\n--- Summary ---")
 	fmt.Printf("Output:     %s\n", outputPath)
@@ -1504,6 +1567,38 @@ func runInit(args []string) int {
 	fmt.Printf("\nConfig written to %s\n", outputPath)
 	fmt.Println("Next steps:")
 	fmt.Println("  To enable Discord/Telegram notifications, edit the config or ask OpenClaw.")
+	if inContainerRuntime() {
+		fmt.Printf("  docker compose run --rm cli probe --config %s\n", outputPath)
+		fmt.Println("  docker compose up -d")
+		return 0
+	}
 	fmt.Printf("  ./go-trader --config %s --once\n", outputPath)
 	return 0
+}
+
+func applyContainerInitPolicy(cfg *Config, outputPath string) error {
+	if !inContainerRuntime() {
+		return nil
+	}
+	if issue := containerDataPathIssue(outputPath); issue != "" {
+		return fmt.Errorf("output %q %s; write the config under %s (default %s)", outputPath, issue, containerDataDir, containerConfigPath)
+	}
+	switch cfg.AutoUpdate {
+	case "", "off":
+		cfg.AutoUpdate = "off"
+	default:
+		return fmt.Errorf("autoUpdate %q is not allowed in the container deployment, which updates only by image; omit it or set \"off\"", cfg.AutoUpdate)
+	}
+	var live []string
+	for _, sc := range cfg.Strategies {
+		if isLiveArgs(sc.Args) || sc.Type == "manual" {
+			live = append(live, sc.ID)
+		}
+	}
+	if len(live) > 0 {
+		sort.Strings(live)
+		return fmt.Errorf("container setup creates paper strategies only, but these are live or manual: %s; set every mode to paper and leave manual trading off, then enable live trading later (docs/DOCKER.md)", strings.Join(live, ", "))
+	}
+	cfg.DBFile = filepath.Join(filepath.Dir(filepath.Clean(outputPath)), "state.db")
+	return nil
 }

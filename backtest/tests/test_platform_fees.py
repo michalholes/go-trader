@@ -1,3 +1,4 @@
+import inspect
 import re
 from pathlib import Path
 
@@ -5,11 +6,15 @@ import pandas as pd
 import pytest
 
 from backtester import (
+    DEFAULT_SLIPPAGE_PCT,
+    FILL_COST_MODEL_VERSION,
+    PAPER_FILL_COST_MODELS,
     Backtester,
     HYPERLIQUID_MAKER_FEE_PCT,
     PLATFORM_FEE_PCT,
     fee_pct_for_platform,
 )
+from backtest_pairs import PairsBacktester
 
 
 FEES_GO = Path(__file__).resolve().parents[2] / "scheduler" / "fees.go"
@@ -24,12 +29,19 @@ EXPECTED_RATES = {
     "okx-perps":   0.0005,
 }
 
+FROZEN_PAPER_FILL_COST_MODELS = {
+    0: {"taker_fee_pct": 0.00045, "tier_fee_pct": 0.00045, "slippage_pct": None,
+        "stop_slippage": False, "price_reproducible": False},
+    1: {"taker_fee_pct": 0.00045, "tier_fee_pct": 0.00045, "slippage_pct": 0.0005,
+        "stop_slippage": True, "price_reproducible": True},
+}
+
 
 def _scrape_fees_go_constants() -> dict:
     text = FEES_GO.read_text()
     const_pattern = re.compile(
         r"^\s*(BinanceSpotFeePct|HyperliquidTakerFeePct|HyperliquidMakerFeePct|"
-        r"LunoTakerFeePct|OKXSpotTakerFeePct|OKXPerpsTakerFeePct)\s*=\s*([0-9.]+)",
+        r"LunoTakerFeePct|OKXSpotTakerFeePct|OKXPerpsTakerFeePct|SlippagePct|FillCostModelVersion)\s*=\s*([0-9.]+)",
         re.MULTILINE,
     )
     return {m.group(1): float(m.group(2)) for m in const_pattern.finditer(text)}
@@ -49,12 +61,26 @@ def test_platform_fee_table_matches_fees_go():
     assert go_rates["LunoTakerFeePct"] == PLATFORM_FEE_PCT["luno"]
     assert go_rates["OKXSpotTakerFeePct"] == PLATFORM_FEE_PCT["okx"]
     assert go_rates["OKXPerpsTakerFeePct"] == PLATFORM_FEE_PCT["okx-perps"]
+    assert go_rates["SlippagePct"] == DEFAULT_SLIPPAGE_PCT
+    assert Backtester(platform="hyperliquid").slippage_pct == DEFAULT_SLIPPAGE_PCT
+    assert go_rates["FillCostModelVersion"] == FILL_COST_MODEL_VERSION
+    current = PAPER_FILL_COST_MODELS[FILL_COST_MODEL_VERSION]
+    assert current["taker_fee_pct"] == go_rates["HyperliquidTakerFeePct"] == PLATFORM_FEE_PCT["hyperliquid"]
+    assert current["tier_fee_pct"] == go_rates["HyperliquidTakerFeePct"]
+    assert current["slippage_pct"] == go_rates["SlippagePct"] == DEFAULT_SLIPPAGE_PCT
+    assert set(PAPER_FILL_COST_MODELS) == set(range(FILL_COST_MODEL_VERSION + 1))
+    for version, frozen in FROZEN_PAPER_FILL_COST_MODELS.items():
+        assert PAPER_FILL_COST_MODELS[version] == frozen, (
+            f"PAPER_FILL_COST_MODELS[{version}] changed after release; history entries are frozen literals")
 
 
 def test_hyperliquid_maker_rate_matches_fees_go():
     go_rates = _scrape_fees_go_constants()
     assert go_rates["HyperliquidMakerFeePct"] == HYPERLIQUID_MAKER_FEE_PCT
     assert HYPERLIQUID_MAKER_FEE_PCT < PLATFORM_FEE_PCT["hyperliquid"]
+    params = inspect.signature(PairsBacktester).parameters
+    assert params["taker_fee_pct"].default == PLATFORM_FEE_PCT["hyperliquid"] == go_rates["HyperliquidTakerFeePct"]
+    assert params["maker_fee_pct"].default == HYPERLIQUID_MAKER_FEE_PCT
 
 
 def test_audit_fee_axis_decoupled_from_data_axis():

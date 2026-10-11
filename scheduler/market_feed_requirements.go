@@ -85,6 +85,7 @@ type feedStrategyRequirement struct {
 	OpenInterest   bool
 	ObsWindowMs    int64
 	ClosedBar      bool
+	Timed          bool
 }
 
 func (e feedStrategyRequirement) observationNeeds() map[feedObservationKey]int64 {
@@ -103,6 +104,8 @@ type feedRequirements struct {
 	Strategies   map[string]feedStrategyRequirement
 	KeyCadences  map[marketFeedKey][]int
 	SignalKeys   map[marketFeedKey]bool
+
+	AccountingCoins []string
 }
 
 func (r *feedRequirements) addObservation(key feedObservationKey, windowMs int64) {
@@ -185,12 +188,17 @@ func deriveFeedRequirements(cfg *Config) (feedRequirements, error) {
 		if sc.ClosedBarDecisions {
 			closedBarExtra = 1
 		}
+		timedExtra := 0
+		if needsTimedSignalFrame(sc) {
+			timedExtra = 1
+		}
 		entry := feedStrategyRequirement{
 			ID:             sc.ID,
 			Signal:         feedKeyFor(symbol, timeframe),
-			SignalLookback: feedSignalLookback(rc) + closedBarExtra,
+			SignalLookback: feedSignalLookback(rc) + timedExtra,
 			Coin:           symbol,
 			ClosedBar:      sc.ClosedBarDecisions,
+			Timed:          needsTimedSignalFrame(sc),
 		}
 		req.addKey(entry.Signal, entry.SignalLookback)
 
@@ -251,6 +259,7 @@ func deriveFeedRequirements(cfg *Config) (feedRequirements, error) {
 	}
 	hlCoins, _ := collectPerpsMarkSymbols(cfg.Strategies)
 	req.MidCoins = hlCoins
+	req.AccountingCoins = paperFundingAccountingCoins(cfg.Strategies)
 	req.finalize()
 	return req, nil
 }
@@ -311,6 +320,7 @@ func (o *marketFeedOwner) ApplyGeneration(ctx context.Context, req feedRequireme
 		o.fundingNeeds[coin] = need
 	}
 	o.applyObservationNeedsLocked(req.Observations)
+	o.applyAccountingCoinsLocked(req.AccountingCoins)
 	o.subVersion++
 	o.applySeq++
 	token := o.applySeq

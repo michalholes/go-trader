@@ -666,6 +666,7 @@ type StrategyConfig struct {
 	IntervalSeconds             int                      `json:"interval_seconds,omitempty"`
 	HTFFilter                   bool                     `json:"htf_filter,omitempty"`
 	ClosedBarDecisions          bool                     `json:"closed_bar_decisions,omitempty"`
+	RestingTPTradeThrough       bool                     `json:"resting_tp_trade_through,omitempty"`
 	ATRMethod                   string                   `json:"atr_method,omitempty"`
 	InvertSignal                bool                     `json:"invert_signal,omitempty"`
 	AllowShorts                 bool                     `json:"allow_shorts,omitempty"`
@@ -1007,7 +1008,14 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	return loadConfigData(path, data, skipLiveCredentialChecks, readOnly)
+	cfg, err := loadConfigData(path, data, skipLiveCredentialChecks, readOnly)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateContainerRuntimeConfig(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func loadConfigData(path string, data []byte, skipLiveCredentialChecks bool, readOnly bool) (*Config, error) {
@@ -1760,6 +1768,8 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 	errs = append(errs, validateStorageIdentityConfig(cfg)...)
 
 	errs = append(errs, closedBarDecisionsConfigErrors(cfg)...)
+
+	errs = append(errs, restingTPTradeThroughConfigErrors(cfg)...)
 
 	if !validATRMethodValue(cfg.ATRMethod) {
 		errs = append(errs, fmt.Sprintf("atr_method must be %q or %q, got %q", ATRMethodSimple, ATRMethodWilder, cfg.ATRMethod))

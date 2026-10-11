@@ -39,6 +39,41 @@ def _load_regime():
     return _ensure_regime_fn
 
 
+REGIME_LABEL_COLUMN_KEYS = frozenset((
+    "gate", "directional", "directional_named", "atr", "atr_named", "payload_row", "gate_row",
+))
+REGIME_PAYLOAD_ROWS = ("decision_bar", "closed_candle")
+REGIME_GATE_ROWS = ("decision_bar", "payload")
+
+
+def _validated_regime_label_columns(columns: Optional[dict]) -> Optional[dict]:
+    if not columns:
+        return None
+    out = dict(columns)
+    unknown = sorted(set(out) - REGIME_LABEL_COLUMN_KEYS)
+    if unknown:
+        raise ValueError("unknown regime_label_columns keys: " + ", ".join(unknown))
+    for key in ("gate", "directional", "atr"):
+        name = out.get(key)
+        if name is not None and not (isinstance(name, str) and name.strip()):
+            raise ValueError(f"regime_label_columns.{key} must name a column")
+    if not out.get("gate"):
+        raise ValueError("regime_label_columns needs a gate column")
+    if out.get("directional_named") and not out.get("directional"):
+        raise ValueError("regime_label_columns.directional_named needs a directional column")
+    if out.get("atr_named") and not out.get("atr"):
+        raise ValueError("regime_label_columns.atr_named needs an atr column")
+    out["payload_row"] = out.get("payload_row") or "decision_bar"
+    if out["payload_row"] not in REGIME_PAYLOAD_ROWS:
+        raise ValueError("regime_label_columns.payload_row must be one of " + ", ".join(REGIME_PAYLOAD_ROWS))
+    out["gate_row"] = out.get("gate_row") or "decision_bar"
+    if out["gate_row"] not in REGIME_GATE_ROWS:
+        raise ValueError("regime_label_columns.gate_row must be one of " + ", ".join(REGIME_GATE_ROWS))
+    out["directional_named"] = bool(out.get("directional_named"))
+    out["atr_named"] = bool(out.get("atr_named"))
+    return out
+
+
 def _regime_allows_entry(allowed, bar_regime: str, on_failure: str = "open") -> bool:
     if _regime_allows_entry_fn is None:
         _load_regime()
@@ -151,13 +186,6 @@ def _resolve_regime_directional_entry(
     regime = str(current_regime or "").strip()
     if position_qty > 0 and str(position_regime or "").strip():
         regime = str(position_regime or "").strip()
-    # Exact match ONLY — deliberately no bare→sub fallback here. Runtime
-    # always resolves the ALREADY-GATED policy
-    # (_gate_directional_policy_by_states expands a bare ranging_directional
-    # entry onto its subs SUBJECT TO each sub's own per-state certification),
-    # so a bare-certified-but-sub-uncertified stamp must miss and fall back to
-    # base, mirroring live's fail-closed gatedDirectionalEntry (#1085/#1124
-    # exact-match cert, no family fallback).
     entry = policy.get(regime)
     return dict(entry) if isinstance(entry, dict) else None
 
@@ -240,6 +268,87 @@ _CLOSE_STRATEGIES_DIR = os.path.abspath(
 def _ensure_close_strategies_path() -> None:
     if _CLOSE_STRATEGIES_DIR not in sys.path:
         sys.path.insert(0, _CLOSE_STRATEGIES_DIR)
+
+
+RESTING_TP_TIER_CLOSES = (
+    "tiered_tp_atr",
+    "tiered_tp_atr_live",
+    "tiered_tp_atr_regime",
+    "tiered_tp_atr_live_regime",
+)
+RESTING_TP_UNSUPPORTED_CLOSE = "tiered_tp_atr_live_regime_dynamic"
+
+
+def _validate_resting_tp_trade_through(value, *, platform, strategy_type, execution,
+                                       close_names, allow_scale_in) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"resting_tp_trade_through must be a boolean, got {value!r}")
+    if not value:
+        return False
+    if str(platform or "").strip().lower() != "hyperliquid":
+        raise ValueError(
+            "resting_tp_trade_through models Hyperliquid resting take-profit "
+            f"limits; it needs platform='hyperliquid', got {platform!r}")
+    if str(strategy_type or "").strip().lower() != "perps":
+        raise ValueError(
+            "resting_tp_trade_through supports Hyperliquid perps only, got "
+            f"strategy_type={strategy_type!r}")
+    if execution is None:
+        raise ValueError(
+            "resting_tp_trade_through needs execution_spec: the tick grid comes "
+            "from its size_decimals, so without it the tick is unknown")
+    names = list(close_names or [])
+    if RESTING_TP_UNSUPPORTED_CLOSE in names:
+        raise ValueError(
+            "resting_tp_trade_through does not support "
+            f"{RESTING_TP_UNSUPPORTED_CLOSE} (a Hyperliquid live-only close)")
+    if not any(name in RESTING_TP_TIER_CLOSES for name in names):
+        raise ValueError(
+            "resting_tp_trade_through needs a tier close ("
+            + ", ".join(RESTING_TP_TIER_CLOSES) + f"); close refs are {names}")
+    if allow_scale_in:
+        raise ValueError(
+            "resting_tp_trade_through does not model scale-in adds; the tier "
+            "geometry must stay frozen")
+    return True
+
+
+class _RestingReachTracker:
+
+    def __init__(self, sz_decimals: int, walk_mode: bool):
+        _ensure_close_strategies_path()
+        from _helpers import build_resting_rule, resting_rule_bar
+        self._build_rule = build_resting_rule
+        self._bar = resting_rule_bar
+        self.sz_decimals = int(sz_decimals)
+        self.walk_mode = walk_mode
+        self.trade = None
+        self.prior = None
+
+    def rule_for(self, trade, side: str, row, idx, bar_index: int) -> dict:
+        entry_bar = trade is not self.trade
+        if entry_bar:
+            self.trade = trade
+            self.prior = None
+        close = float(row["close"])
+        try:
+            open_ms = int(pd.Timestamp(idx).value // 1_000_000)
+        except (TypeError, ValueError):
+            open_ms = int(bar_index)
+        bar = self._bar(
+            max(open_ms, 0), float(row.get("high", close) or close),
+            float(row.get("low", close) or close), close, side,
+            entry_bar=entry_bar, walk_mode=self.walk_mode,
+        )
+        rule = self._build_rule(
+            sz_decimals=self.sz_decimals, bars=[bar], stop_trigger_px=0.0,
+            prior_reach_px=self.prior,
+        )
+        favorable = bar["favorable_px"]
+        if self.prior is None or (favorable > self.prior if side == "long" else favorable < self.prior):
+            self.prior = favorable
+        return rule
 
 
 def _rewrite_deprecated_close_ref(name: str, params: dict) -> tuple[str, dict]:
@@ -527,30 +636,12 @@ def _check_capability_declared(request: CloseCapabilityRequest) -> list:
     return out
 
 
-# Pavol fork: BloFin perps parity — these closes have a scheduler-managed
-# implementation (virtual stops, completed-candle contexts) declared in
-# shared_strategies/close/support_matrix.json, so the HL-live-only and
-# research-context refusals do not apply on platform == "blofin".
-_BLOFIN_PARITY_CLOSES = frozenset({
-    "tiered_tp_atr_live_regime_dynamic",
-    "time_stop",
-    "zscore_target",
-    "avwap_stop",
-})
-
-
-def _blofin_parity_exempts(platform, close_name: str) -> bool:
-    return str(platform or "").strip().lower() == "blofin" \
-        and close_name in _BLOFIN_PARITY_CLOSES
-
-
 def _check_live_only_close(request: CloseCapabilityRequest) -> list:
     out = []
     for idx, ref in enumerate(request.close_refs):
         cap = CLOSE_CAPABILITIES.get(ref["name"])
         if ref["name"] in request.registered_closes and cap is not None \
-                and cap.live == CLOSE_LIVE_ONLY \
-                and not _blofin_parity_exempts(request.platform, ref["name"]):
+                and cap.live == CLOSE_LIVE_ONLY:
             out.append(capability_refusal(
                 "LIVE_ONLY_CLOSE", ref["name"], close_ref_index=idx,
                 details={"message": f"{ref['name']} is HL-live-only: the common "
@@ -565,8 +656,7 @@ def _check_live_close_context(request: CloseCapabilityRequest) -> list:
     for idx, ref in enumerate(request.close_refs):
         cap = CLOSE_CAPABILITIES.get(ref["name"])
         if ref["name"] not in request.registered_closes or cap is None \
-                or cap.live != CLOSE_LIVE_RESEARCH_CONTEXT \
-                or _blofin_parity_exempts(request.platform, ref["name"]):
+                or cap.live != CLOSE_LIVE_RESEARCH_CONTEXT:
             continue
         details = {"mode": request.mode, "platform": request.platform,
                    "strategy_type": request.strategy_type}
@@ -862,11 +952,13 @@ def _check_stop_inputs(request: CloseCapabilityRequest) -> list:
         window = _stop_evidence(request, "atr_regime_window")
         if owner in STOP_OWNERS_NEEDING_LABEL and window is not None \
                 and window.get("status") != "verified":
+            from regime_label_columns import column_name
+            column = column_name(str(window.get("value") or ""))
             out.append(_stop_refusal(
                 "MISSING_STOP_INPUT", owner,
-                f"{owner} resolves from the regime_atr_window {window.get('value')!r} label, "
-                "which the backtester does not compute (it stamps only the primary regime "
-                "window); refusing instead of resolving the stop from the wrong label",
+                f"{owner} resolves from regime_atr_window {window.get('value')!r} "
+                f"but label column {column!r} was not prepared; refusing instead of "
+                "reading the primary column",
                 required_inputs=("atr_regime_label",),
                 details={"window": window.get("value")}))
         return out
@@ -1182,9 +1274,12 @@ def leverage_evidence(value, source: str, verified: bool) -> dict:
     return {"status": "verified" if verified else "unverified", "source": source, "value": lev}
 
 
+_LABELS_UNSET = object()
+
+
 def build_stop_capability_context(*, platform, strategy_type, close_refs, fields: Mapping,
                                   regime_windows_spec=None, risk_per_trade_pct=None,
-                                  capability_context=None):
+                                  capability_context=None, regime_labels=_LABELS_UNSET):
     if capability_context is not None and (
             not isinstance(capability_context, CapabilityContext) or capability_context.errors):
         return capability_context
@@ -1207,7 +1302,10 @@ def build_stop_capability_context(*, platform, strategy_type, close_refs, fields
     units = evidence.get("stop_units") if isinstance(evidence.get("stop_units"), dict) else {}
     live = units.get("status") == "verified" and units.get("source") in (
         STOP_UNITS_LIVE_CONFIG, STOP_UNITS_PREVIEW)
-    labels = _regime_primary_labels(regime_windows_spec)
+    if regime_labels is _LABELS_UNSET:
+        labels = _regime_primary_labels(regime_windows_spec)
+    else:
+        labels = regime_labels
     blocks, _ = _parse_stop_regime_blocks(plain, labels, live)
     unified = _unified_close_params(refs) is not None
     owner = resolve_static_stop_owner(
@@ -1458,7 +1556,6 @@ LIQUIDATED_METRIC_FLOOR = 100.0
 PLATFORM_FEE_PCT = {
     "binanceus":   0.001,
     "hyperliquid": 0.00045,
-    "blofin":      0.00035,
     "robinhood":   0.0,
     "luno":        0.01,
     "okx":         0.001,
@@ -1472,15 +1569,16 @@ def fee_pct_for_platform(platform: str) -> float:
     return PLATFORM_FEE_PCT.get(platform, PLATFORM_FEE_PCT["binanceus"])
 
 
-def _bar_duration_minutes(df, direction="long"):
-    idx = df.index
-    if len(idx) < 2:
-        return 60
-    diff = idx[1] - idx[0]
-    return int(diff.total_seconds() // 60) or 1
-
-
 DEFAULT_SLIPPAGE_PCT = 0.0005
+
+FILL_COST_MODEL_VERSION = 1
+
+PAPER_FILL_COST_MODELS = {
+    0: {"taker_fee_pct": 0.00045, "tier_fee_pct": 0.00045, "slippage_pct": None,
+        "stop_slippage": False, "price_reproducible": False},
+    1: {"taker_fee_pct": 0.00045, "tier_fee_pct": 0.00045, "slippage_pct": 0.0005,
+        "stop_slippage": True, "price_reproducible": True},
+}
 
 EXECUTION_SPEC_KEYS = (
     "taker_fee_pct",
@@ -1615,11 +1713,7 @@ class _ProfileSwitcher:
 def _close_refs_use_regime_tiered_tp(refs: list[dict]) -> bool:
     for ref in refs:
         n = (ref.get("name") or "").strip().lower()
-        if n in (
-            "tiered_tp_atr_regime",
-            "tiered_tp_atr_live_regime",
-            "tiered_tp_atr_live_regime_dynamic",
-        ):
+        if n in ("tiered_tp_atr_regime", "tiered_tp_atr_live_regime"):
             return True
     return False
 
@@ -1769,56 +1863,6 @@ def _ungated_leg_notional(leg_notional: float, hurst_size_mult: float) -> float:
     return leg_notional
 
 
-def _position_avwap_prefix(df: pd.DataFrame):
-    """Return cumulative TPV/volume arrays for position-open anchored AVWAP."""
-    required = ("high", "low", "close", "volume")
-    if df is None or df.empty or any(column not in df.columns for column in required):
-        return None
-    high = pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
-    low = pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
-    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
-    volume = pd.to_numeric(df["volume"], errors="coerce").to_numpy(dtype=float)
-    valid = (
-        np.isfinite(high) & np.isfinite(low) & np.isfinite(close)
-        & np.isfinite(volume) & (high > 0) & (low > 0) & (close > 0)
-        & (volume > 0)
-    )
-    safe_volume = np.where(valid, volume, 0.0)
-    typical = (high + low + close) / 3.0
-    weighted = np.where(valid, typical * safe_volume, 0.0)
-    cumulative_tpv = np.concatenate(([0.0], np.cumsum(weighted)))
-    cumulative_volume = np.concatenate(([0.0], np.cumsum(safe_volume)))
-    if cumulative_volume[-1] <= 0:
-        return None
-    return pd.DatetimeIndex(df.index), cumulative_tpv, cumulative_volume
-
-
-def _position_anchored_avwap_from_prefix(prefix, opened_at, through_index: int) -> Optional[float]:
-    """Price-volume weighted typical price from the first candle open at/after entry."""
-    if prefix is None or opened_at is None:
-        return None
-    index, cumulative_tpv, cumulative_volume = prefix
-    try:
-        anchor = pd.Timestamp(opened_at)
-        if index.tz is None and anchor.tzinfo is not None:
-            anchor = anchor.tz_convert("UTC").tz_localize(None)
-        elif index.tz is not None and anchor.tzinfo is None:
-            anchor = anchor.tz_localize(index.tz)
-        elif index.tz is not None:
-            anchor = anchor.tz_convert(index.tz)
-        start = int(index.searchsorted(anchor, side="left"))
-        end = min(int(through_index), len(index) - 1)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if start < 0 or start > end or start >= len(index):
-        return None
-    volume = float(cumulative_volume[end + 1] - cumulative_volume[start])
-    if not math.isfinite(volume) or volume <= 0:
-        return None
-    value = float(cumulative_tpv[end + 1] - cumulative_tpv[start]) / volume
-    return value if math.isfinite(value) and value > 0 else None
-
-
 class Trade:
     def __init__(self, entry_date, entry_price, side="long"):
         self.entry_date = entry_date
@@ -1839,6 +1883,7 @@ class Trade:
         self.exit_fee = 0.0
         self.exit_reason = ""
         self.scale_in_adds = 0
+        self.funding_pnl = 0.0
 
     def close(self, exit_date, exit_price):
         self.exit_date = exit_date
@@ -1850,7 +1895,7 @@ class Trade:
         self.pnl = self.shares * self.entry_price * self.pnl_pct
 
     def to_dict(self):
-        return {
+        out = {
             "entry_date": str(self.entry_date),
             "exit_date": str(self.exit_date),
             "entry_price": self.entry_price,
@@ -1870,6 +1915,9 @@ class Trade:
             "exit_reason": self.exit_reason,
             "scale_in_adds": self.scale_in_adds,
         }
+        if self.funding_pnl:
+            out["funding_pnl"] = round(self.funding_pnl, 6)
+        return out
 
 
 class _HoldTracker:
@@ -1910,7 +1958,9 @@ class _HoldTracker:
 
 
 LEDGER_EVENTS_SCHEMA = "go-trader.backtester-ledger-events"
-LEDGER_EVENTS_SCHEMA_VERSION = 1
+LEDGER_EVENTS_SCHEMA_VERSION = 3
+HL_LIQUIDATION_STOP_BUFFER_PCT = 0.5
+PARTIAL_LIQUIDATION_NOTIONAL_USD = 100_000.0
 LEDGER_EVENT_TIMING = {
     "bar_open_fill": "fill at the open of bar_timestamp after a decision on the close of decision_timestamp",
     "intrabar_trigger_fill": "fill inside the bar that opens at bar_timestamp, when a resting trigger or limit price is crossed; no separate decision bar",
@@ -1948,7 +1998,9 @@ class _LedgerEventRecorder:
                entry_fee_allocated: Optional[float] = None,
                funding_cash: Optional[float] = None,
                funding_rate: Optional[float] = None,
-               synthetic: bool = False) -> None:
+               margin_loss: Optional[float] = None,
+               synthetic: bool = False,
+               resting_fill: Optional[dict] = None) -> None:
         if kind in ("open", "seed_inventory"):
             self.position_seq += 1
             self.position_id = f"sim-pos-{self.position_seq:04d}"
@@ -1977,6 +2029,7 @@ class _LedgerEventRecorder:
             "gross_realized": gross_realized,
             "funding_cash": funding_cash,
             "funding_rate": funding_rate,
+            "margin_loss": margin_loss,
             "reason": reason,
             "qty_before": qty_before,
             "qty_after": qty_after,
@@ -1984,6 +2037,7 @@ class _LedgerEventRecorder:
             "avg_cost_after": avg_cost_after,
             "cash_before": cash_before,
             "cash_after": cash_after,
+            "resting_fill": copy.deepcopy(resting_fill),
         })
         if kind in ("close", "terminal_liquidation") and qty_after == 0:
             self.position_id = None
@@ -2034,11 +2088,258 @@ def _stamp_hold(trade, hold: "_HoldTracker", *, entry_atr: float,
     trade.pnl -= trade.entry_fee + trade.exit_fee
 
 
+class FundingIncompleteError(Exception):
+    """Charge-mode funding is incomplete. Raised before any result row is saved."""
+
+    def __init__(self, metrics: dict):
+        self.metrics = metrics
+        block = metrics.get("funding") or {}
+        super().__init__(
+            "funding coverage is incomplete: "
+            + json.dumps(block, sort_keys=True, default=str)
+        )
+
+
+def charge_funding_rejected(result: dict) -> bool:
+    block = result.get("funding") or {}
+    if str(block.get("mode") or "") != "charge":
+        return False
+    try:
+        unpriced = int(result.get("funding_unpriced_held_hours") or 0)
+    except (TypeError, ValueError):
+        unpriced = 0
+    return unpriced > 0
+
+
+def _move_trade_funding(src: "Trade", dst: "Trade", qty: float) -> None:
+    base = src.shares if src.shares else qty
+    frac = (qty / base) if base else 1.0
+    if frac >= 1.0 - 1e-12:
+        dst.funding_pnl = src.funding_pnl
+        src.funding_pnl = 0.0
+        return
+    taken = src.funding_pnl * frac
+    dst.funding_pnl = taken
+    src.funding_pnl -= taken
+
+
+def _funding_block_from_frame(df: pd.DataFrame, platform: str, strategy_type: str,
+                              unpriced: int) -> Optional[dict]:
+    hl_perps = (str(platform or "").strip().lower() == "hyperliquid"
+                and str(strategy_type or "").strip().lower() == "perps")
+    block = None
+    if "funding_block_json" in df.columns and len(df):
+        raw = df["funding_block_json"].iloc[0]
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                block = parsed
+    if block is None and hl_perps and "funding_accrual" not in df.columns and "funding_mode" not in df.columns:
+        block = {
+            "mode": "not_attached",
+            "available": False,
+            "complete": False,
+            "coverage": None,
+            "source": None,
+            "sha256": None,
+            "row_count": 0,
+            "first": None,
+            "last": None,
+        }
+    if not isinstance(block, dict):
+        return None
+    block = dict(block)
+    block["unpriced_held_hours"] = int(unpriced)
+    mode = str(block.get("mode") or "")
+    if mode in ("charge", "partial"):
+        if block.get("available") is False and int(unpriced) > 0:
+            block["complete"] = False
+        else:
+            block["complete"] = int(unpriced) == 0
+    elif mode == "off":
+        block["complete"] = True
+    return block
+
+def perps_open_notional(cash: float, sizing_leverage: float,
+                        exchange_leverage: float, margin_per_trade_usd: float) -> float:
+    """Mirror scheduler PerpsOpenNotional. cash is sizing cash, never settlement cash."""
+    if cash <= 0:
+        return 0.0
+    if margin_per_trade_usd > 0:
+        margin = margin_per_trade_usd
+        if margin > cash:
+            margin = cash
+        if exchange_leverage <= 0:
+            exchange_leverage = 1.0
+        return margin * exchange_leverage
+    if sizing_leverage <= 0:
+        sizing_leverage = 1.0
+    return cash * sizing_leverage
+
+
+def perps_risk_based_notional(cash: float, price: float, risk_pct: float,
+                              stop_distance: float, exchange_leverage: float) -> float:
+    """Mirror scheduler PerpsRiskBasedNotional."""
+    if cash <= 0 or price <= 0 or risk_pct <= 0 or stop_distance <= 0:
+        return 0.0
+    notional = (cash * risk_pct / 100.0) / stop_distance * price
+    if exchange_leverage <= 0:
+        exchange_leverage = 1.0
+    max_notional = cash * exchange_leverage
+    if notional > max_notional:
+        notional = max_notional
+    return notional
+
+
+def clamp_stop_inside_liquidation(side: str, trigger_px: float, liq_px: float):
+    """Mirror clampStopInsideLiquidation. Tighter triggers are preserved."""
+    if trigger_px <= 0 or liq_px <= 0:
+        return trigger_px, False
+    past = (side == "long" and trigger_px <= liq_px) or (side == "short" and trigger_px >= liq_px)
+    if not past:
+        return trigger_px, False
+    if side == "long":
+        clamped = liq_px * (1.0 + HL_LIQUIDATION_STOP_BUFFER_PCT / 100.0)
+    elif side == "short":
+        clamped = liq_px * (1.0 - HL_LIQUIDATION_STOP_BUFFER_PCT / 100.0)
+    else:
+        return trigger_px, False
+    if not (clamped > 0) or clamped != clamped or clamped == float("inf"):
+        return trigger_px, False
+    return clamped, True
+
+
+def maintenance_rate_for_tier(tier_max_leverage: float) -> float:
+    """Hyperliquid maintenance margin is half of initial margin at max leverage."""
+    if tier_max_leverage <= 0:
+        return 0.0
+    return 1.0 / (2.0 * tier_max_leverage)
+
+
+def isolated_liquidation_price(side: str, price: float, position_size: float,
+                               isolated_margin: float, tier_max_leverage: float) -> float:
+    """Isolated liquidation price from the published Hyperliquid formula.
+
+    liq_price = price - side * margin_available / position_size / (1 - l * side)
+    l = 1 / (2 * tier maxLeverage).
+    margin_available = isolated_margin - position_size * price * l.
+
+    ``price`` is the average entry and ``isolated_margin`` excludes unrealized
+    PnL. That equals the mark form once unrealized PnL is included in margin,
+    so a fixed size and margin do not move the level with the mark. Still
+    unverified against a recorded liquidationPx.
+    """
+    size = abs(position_size)
+    if price <= 0 or size <= 0 or tier_max_leverage <= 0 or isolated_margin <= 0:
+        return 0.0
+    side_sign = 1.0 if side == "long" else -1.0 if side == "short" else 0.0
+    if side_sign == 0.0:
+        return 0.0
+    ell = maintenance_rate_for_tier(tier_max_leverage)
+    maintenance = size * price * ell
+    margin_available = isolated_margin - maintenance
+    denom = 1.0 - ell * side_sign
+    if denom == 0.0:
+        return 0.0
+    liq = price - side_sign * margin_available / size / denom
+    if not (liq > 0) or liq != liq or liq == float("inf"):
+        return 0.0
+    return liq
+
+
+def margin_tier_for_notional(tiers: list, notional: float):
+    """Return (tier, unmodeled). Only the first tier is modeled."""
+    ordered = sorted(tiers, key=lambda t: float(t["lower_bound"]))
+    if not ordered:
+        return None, True
+    if len(ordered) > 1 and notional >= float(ordered[1]["lower_bound"]):
+        return None, True
+    return ordered[0], False
+
+
+def normalize_perps_sizing(raw, leverage_stop: Optional[float]) -> Optional[dict]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"perps_sizing must be an object, got {type(raw).__name__}")
+    required = ("exchange_leverage", "sizing_leverage", "margin_mode", "budget_source")
+    missing = [k for k in required if k not in raw]
+    if missing:
+        raise ValueError(f"perps_sizing missing {missing}")
+    ex = float(raw["exchange_leverage"])
+    sz = float(raw["sizing_leverage"])
+    if not (ex >= 1.0) or not (0.01 <= sz <= 100.0):
+        raise ValueError(
+            f"perps_sizing leverage out of range (exchange {ex}, sizing {sz})")
+    if leverage_stop is not None and abs(float(leverage_stop) - ex) > 1e-9:
+        raise ValueError(
+            f"perps_sizing.exchange_leverage {ex} disagrees with leverage {leverage_stop}")
+    mode = str(raw["margin_mode"])
+    if mode not in ("isolated", "cross"):
+        raise ValueError(f"perps_sizing.margin_mode must be isolated or cross, got {mode!r}")
+    source = str(raw["budget_source"])
+    if source not in ("strategy_cash", "shared_wallet_pool"):
+        raise ValueError(f"perps_sizing.budget_source {source!r} is not strategy_cash or shared_wallet_pool")
+    margin = raw.get("margin_per_trade_usd")
+    margin_f = None if margin is None else float(margin)
+    if margin_f is not None and margin_f <= 0:
+        raise ValueError("perps_sizing.margin_per_trade_usd must be positive when set")
+    pool = raw.get("pool_available_margin")
+    pool_f = None if pool is None else float(pool)
+    if source == "shared_wallet_pool" and margin_f is None:
+        raise ValueError("shared_wallet_pool sizing requires margin_per_trade_usd")
+    return {
+        "exchange_leverage": ex,
+        "sizing_leverage": sz,
+        "margin_per_trade_usd": margin_f,
+        "margin_mode": mode,
+        "budget_source": source,
+        "pool_available_margin": pool_f,
+        "pool_evidence": str(raw.get("pool_evidence") or (
+            "verified" if pool_f is not None or source == "strategy_cash" else "unverified")),
+        "provenance": (
+            {"source": raw["provenance"]} if isinstance(raw.get("provenance"), str)
+            else dict(raw.get("provenance") or {})),
+    }
+
+
+def normalize_venue_margin(raw) -> Optional[dict]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"venue_margin must be an object, got {type(raw).__name__}")
+    max_lev = raw.get("max_leverage")
+    tiers = raw.get("tiers")
+    if isinstance(max_lev, bool) or not isinstance(max_lev, (int, float)) or max_lev <= 0:
+        raise ValueError("venue_margin.max_leverage must be a positive number")
+    if not isinstance(tiers, list) or not tiers:
+        raise ValueError("venue_margin.tiers must be a non-empty list")
+    out_tiers = []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            raise ValueError("venue_margin tier must be an object")
+        lower = float(tier["lower_bound"])
+        tlev = float(tier["max_leverage"])
+        if lower < 0 or tlev <= 0:
+            raise ValueError("venue_margin tier bounds must be non-negative and max_leverage > 0")
+        out_tiers.append({"lower_bound": lower, "max_leverage": tlev})
+    out_tiers.sort(key=lambda t: t["lower_bound"])
+    return {
+        "max_leverage": float(max_lev),
+        "margin_table_id": raw.get("margin_table_id"),
+        "tiers": out_tiers,
+        "formula_verified": bool(raw.get("formula_verified")),
+    }
+
+
 class Backtester:
 
     def __init__(self, initial_capital: float = 1000.0,
                  commission_pct: Optional[float] = None,
-                 slippage_pct: float = 0.0005,
+                 slippage_pct: float = DEFAULT_SLIPPAGE_PCT,
                  platform: str = "binanceus",
                  open_strategy: Optional[dict] = None,
                  close_strategies: Optional[list[dict]] = None,
@@ -2064,8 +2365,6 @@ class Backtester:
                  regime_directional_certified_states: Optional[dict] = None,
                  regime_timeframe: Optional[str] = None,
                  profile_allocation: Optional[dict] = None,
-                 circuit_breaker_max_drawdown_pct: Optional[float] = None,
-                 margin_per_trade_usd: Optional[float] = None,
                  intrabar_resolution: str = "ohlc_walk",
                  risk_per_trade_pct: Optional[float] = None,
                  allow_scale_in: bool = False,
@@ -2077,88 +2376,41 @@ class Backtester:
                  max_drawdown_pct: Optional[float] = None,
                  trailing_stop_min_move_pct: Optional[float] = None,
                  capability_context: Optional[CapabilityContext] = None,
-                 stop_platform: Optional[str] = None):
-        """
-        Args:
-            initial_capital: Starting portfolio value.
-            commission_pct: Commission per trade as fraction. If ``None``,
-                derived from ``platform`` using ``PLATFORM_FEE_PCT`` (which
-                mirrors ``scheduler/fees.go``). Pass an explicit value to
-                override (e.g. in tests).
-            slippage_pct: Slippage per trade as fraction (0.0005 = 5 bps).
-            platform: Exchange fee model — one of ``PLATFORM_FEE_PCT`` keys.
-                Unknown platforms fall back to BinanceUS (0.1%) with no
-                warning, matching the Go dispatch default.
-            open_strategy: Optional ``{"name": str, "params": dict}`` ref
-                describing the open evaluator that produced the signal column
-                on the DataFrame passed to ``run()``. The caller is responsible
-                for actually applying the open strategy; this ref is recorded
-                on the result for reporting parity with the live config (#641).
-            close_strategies: Ordered list of close-evaluator refs, each
-                ``{"name": str, "params": dict}``. The named evaluator must be
-                registered in ``shared_strategies/close/registry.py``; per-ref
-                ``params`` are merged over the registry's ``default_params`` at
-                evaluation time. Each ref runs per-bar against the simulated
-                position; the max ``close_fraction`` across refs wins (max-wins
-                vs any column-based ``close_fraction`` mirrors the live
-                composition contract). Replaces the pre-#641 parallel
-                ``close_strategies: list[str]`` + ``close_params: dict`` pair.
-            regime_timeframe: Accepted for ``load_strategy_config`` spread
-                compatibility. The runner applies this before constructing the
-                engine by aligning regime columns onto the trading DataFrame.
-            intrabar_resolution: How the engine-tracked SL trigger resolves
-                against the fill bar (#1271). ``"ohlc_walk"`` (default) walks
-                O -> H/L -> C: a range touch stops out ON that bar at the
-                trigger price (or at the open on a gap-through), winning
-                adverse-move-first over any same-bar close-evaluator exit.
-                ``"bar_close"`` restores the legacy pre-#1271 convention
-                (hit detected on the close only, filled at the next bar's
-                open) for reproducing documented baselines. See the module
-                docstring, "SL/TP intra-bar races".
-            risk_per_trade_pct: Opt-in risk-per-trade sizing (#1268),
-                mirroring the live ``risk_per_trade_pct`` config field: each
-                open commits ``shares = (cash × pct/100) / stop_distance``
-                (invest = ``cash × (pct/100) × price/stop_distance``, capped
-                at 1.0 × cash — the backtester models no leverage, so the
-                live ``cash × exchange_leverage`` cap tightens to 1× here; a
-                one-time warning prints when the cap binds). Stop distance
-                comes from the configured stop owner: ``*_atr_mult × entry
-                ATR`` (the signal bar's closed ATR, same value the SL
-                geometry uses), or ``price × *_pct`` (this engine's pct
-                fields are FRACTIONS, matching the SL trigger math). An
-                unresolvable distance (no usable ATR at the signal bar)
-                SKIPS the entry — fail-closed, matching live. Requires one
-                of the four scalar stop owners; regime-resolved owners, a
-                margin-pct-only stop, and a strategy-emitted
-                ``entry_fraction`` column are rejected loudly. None keeps
-                the legacy full-notional sizing byte-identical.
-            allow_scale_in: Opt-in scale-in / pyramiding (#1276), mirroring
-                the live ``allow_scale_in`` field (#873): a same-direction
-                signal on an open position ADDS size instead of being
-                skipped. Default False keeps every existing run
-                byte-identical. See the module docstring, "Scale-in /
-                pyramiding".
-            scale_in: Optional caps/spacing dict (live ``scale_in`` block):
-                ``max_adds`` (int, 0 = unlimited), ``max_added_notional_usd``
-                (0 = unlimited), ``add_spacing_atr`` (signed EntryATR
-                multiples; >0 add-to-winners, <0 average-down, 0 = no gate),
-                ``add_notional_usd`` (0 = the position's first-leg notional).
-                Rejected when set without ``allow_scale_in`` (mirrors the
-                live validator).
-        """
+                 stop_platform: Optional[str] = None,
+                 perps_sizing: Optional[dict] = None,
+                 liquidation_model: str = "none",
+                 venue_margin: Optional[dict] = None,
+                 regime_label_columns: Optional[dict] = None,
+                 regime_feature_labels: Optional[dict] = None,
+                 regime_label_windows=None,
+                 resting_tp_trade_through: bool = False,
+                 maker_fee_pct: Optional[float] = None):
+        # regime_label_windows is the loader's plan. Callers splat
+        # load_strategy_config into this constructor; the columns themselves
+        # arrive only through regime_label_columns.
         self.initial_capital = initial_capital
         self._execution = normalize_execution_spec(execution_spec)
         if self._execution is not None and (
-            commission_pct is not None or slippage_pct != DEFAULT_SLIPPAGE_PCT
+            commission_pct is not None
+            or maker_fee_pct is not None
+            or slippage_pct != DEFAULT_SLIPPAGE_PCT
         ):
             raise ValueError(
                 "execution_spec owns fees, spread and slippage; do not also pass "
-                "commission_pct or a non-default slippage_pct (each cost would be "
-                "charged twice)"
+                "commission_pct, maker_fee_pct or a non-default slippage_pct (each "
+                "cost would be charged twice)"
             )
+        if maker_fee_pct is not None:
+            if isinstance(maker_fee_pct, bool) or not isinstance(maker_fee_pct, (int, float)):
+                raise ValueError(f"maker_fee_pct must be a number, got {maker_fee_pct!r}")
+            maker_fee_pct = float(maker_fee_pct)
+            if not math.isfinite(maker_fee_pct) or maker_fee_pct < 0:
+                raise ValueError(f"maker_fee_pct must be finite and >= 0, got {maker_fee_pct!r}")
+            if maker_fee_pct >= 0.1:
+                raise ValueError(
+                    f"maker_fee_pct is a fraction (0.00015 = 0.015%); {maker_fee_pct!r} is not plausible"
+                )
         self.platform = platform
-        # #1271: intra-bar SL race resolution mode. Validated eagerly so a
-        # typo'd mode fails at construction, not as a silent legacy fallback.
         self.intrabar_resolution = str(intrabar_resolution or "").strip().lower()
         if self.intrabar_resolution not in ("ohlc_walk", "bar_close"):
             raise ValueError(
@@ -2170,7 +2422,9 @@ class Backtester:
             else fee_pct_for_platform(platform)
         )
         self.slippage_pct = slippage_pct
-        self._maker_fee_pct: Optional[float] = None
+        self._maker_fee_pct: float = (
+            maker_fee_pct if maker_fee_pct is not None else self.commission_pct
+        )
         if self._execution is not None:
             self.commission_pct = self._execution["taker_fee_pct"]
             self.slippage_pct = (
@@ -2213,6 +2467,42 @@ class Backtester:
         self._hl_stop_geometry = self._stop_owner != "legacy"
         self._stop_admission_live = self._stop_parameters["admission"] == "live"
         self.leverage = _finite_number(leverage)
+        self._perps_sizing = normalize_perps_sizing(perps_sizing, self.leverage)
+        model = str(liquidation_model or "none").strip().lower()
+        if model not in ("none", "venue_isolated"):
+            raise ValueError(
+                f"liquidation_model must be 'none' or 'venue_isolated', got {liquidation_model!r}")
+        self._liquidation_model = model
+        self._venue_margin = normalize_venue_margin(venue_margin)
+        if model == "venue_isolated":
+            if self._venue_margin is None:
+                raise ValueError("venue_isolated requires venue_margin")
+            if self._perps_sizing is None:
+                raise ValueError("venue_isolated requires perps_sizing")
+            if self._perps_sizing["margin_mode"] != "isolated":
+                raise ValueError("venue_isolated refuses cross margin")
+            if self._perps_sizing["exchange_leverage"] > self._venue_margin["max_leverage"]:
+                raise ValueError(
+                    "exchange leverage "
+                    f"{self._perps_sizing['exchange_leverage']} is above maxLeverage "
+                    f"{self._venue_margin['max_leverage']}")
+            if self.intrabar_resolution != "ohlc_walk":
+                raise ValueError(
+                    "venue_isolated requires intrabar_resolution ohlc_walk; "
+                    "bar_close checks a stop only at the close, so an armed stop "
+                    "cannot be treated as filling before an intrabar liquidation"
+                )
+        self._sizing_cash = 0.0
+        self._used_margin = 0.0
+        self._sized_qty = 0.0
+        self._run_liq_px = 0.0
+        self._tier_refused = False
+        self._margin_stats = {
+            "entries_capped": 0, "entries_skipped_below_min": 0,
+            "adds_beyond_strategy_margin": 0, "max_used_margin": 0.0,
+            "clamp_count": 0, "liquidation_count": 0, "tier_refusals": 0,
+            "pool_cap_unverified": False,
+        }
         self.max_drawdown_pct = _finite_number(max_drawdown_pct)
         _min_move = _finite_number(trailing_stop_min_move_pct)
         self.trailing_stop_min_move_pct = (
@@ -2225,18 +2515,34 @@ class Backtester:
         self.close_params = {r["name"]: r["params"] for r in self._close_refs}
         self._resting_tp_model = str(platform or "").strip().lower() == "hyperliquid"
         self.regime_enabled = regime_enabled
+        self._regime_label_columns = _validated_regime_label_columns(regime_label_columns)
+        self._run_position_regime = ""
+        self._stamp_gate = ""
+        self._stamp_directional = ""
+        self._stamp_atr = ""
+        self._regime_stamp_trace = []
+        self._regime_trace = False
         self.regime_timeframe = str(regime_timeframe or "").strip() or None
         self.regime_period = regime_period
         self.regime_adx_threshold = regime_adx_threshold
         self.regime_windows_spec = dict(regime_windows_spec) if regime_windows_spec else None
         self._regime_primary_labels = _regime_primary_labels(self.regime_windows_spec)
+        feature_labels = regime_feature_labels or {}
+        unknown_features = sorted(set(feature_labels) - {"atr", "directional"})
+        if unknown_features:
+            raise ValueError(
+                "unknown regime_feature_labels keys: " + ", ".join(unknown_features))
+        self._regime_atr_labels = (
+            feature_labels["atr"] if "atr" in feature_labels else self._regime_primary_labels)
+        self._regime_directional_labels = (
+            feature_labels["directional"] if "directional" in feature_labels else None)
         if self._resting_tp_model:
             _ensure_close_strategies_path()
             from tiered_tp_atr_regime import resting_ladder_errors
             _ladder_errs = []
             for _ref in self._close_refs:
                 _ladder_errs.extend(resting_ladder_errors(
-                    _ref["name"], _ref["params"], self._regime_primary_labels,
+                    _ref["name"], _ref["params"], self._regime_atr_labels,
                 ))
             if _ladder_errs:
                 raise ValueError(
@@ -2270,6 +2576,15 @@ class Backtester:
         self.regime_directional_policy = _normalize_regime_directional_policy(
             regime_directional_policy,
         )
+        if self.regime_directional_policy and self._regime_directional_labels is not None:
+            valid = set(self._regime_directional_labels)
+            bad = sorted(label for label in self.regime_directional_policy if label not in valid)
+            if bad:
+                raise ValueError(
+                    "regime_directional_policy labels "
+                    + ", ".join(bad)
+                    + " are not in the directional window vocabulary: "
+                    + ", ".join(sorted(valid)))
         if self.regime_directional_policy is not None:
             if regime_directional_certified_states is not None:
                 cert_states = regime_directional_certified_states
@@ -2292,18 +2607,6 @@ class Backtester:
                 "regime_directional_policy requires regime_enabled=True"
             )
         self._profile_alloc = _parse_profile_allocation(profile_allocation)
-        self.circuit_breaker_max_drawdown_pct = (
-            float(circuit_breaker_max_drawdown_pct)
-            if circuit_breaker_max_drawdown_pct is not None
-            else None
-        )
-        self._margin_per_trade_usd = (
-            float(margin_per_trade_usd) if margin_per_trade_usd is not None else None
-        )
-        self._leverage = float(leverage) if leverage else 1.0
-        self._margin_locked = 0.0
-        self._notional = 0.0
-        self._close_reason_counts = {}
         self.stop_loss_atr_mult_regime = (
             dict(stop_loss_atr_mult_regime) if stop_loss_atr_mult_regime else None
         )
@@ -2315,28 +2618,6 @@ class Backtester:
         self._uses_regime_tiered_close = _close_refs_use_regime_tiered_tp(
             self._close_refs,
         )
-        self._dynamic_regime_close = next(
-            (
-                ref for ref in self._close_refs
-                if (ref.get("name") or "").strip().lower()
-                == "tiered_tp_atr_live_regime_dynamic"
-            ),
-            None,
-        )
-        self._dynamic_close_confirm_cycles = 2
-        if self._dynamic_regime_close is not None:
-            raw_confirm = (
-                (self._dynamic_regime_close.get("params") or {})
-                .get("regime_confirm_cycles", 2)
-            )
-            if (
-                isinstance(raw_confirm, bool)
-                or not isinstance(raw_confirm, (int, float))
-                or int(raw_confirm) != raw_confirm
-                or raw_confirm < 1
-            ):
-                raise ValueError("regime_confirm_cycles must be a whole number >= 1")
-            self._dynamic_close_confirm_cycles = int(raw_confirm)
         self._unified_close_params: Optional[dict] = None
         self._unified_scalar_params = None
         self._uses_trailing_ratchet_close = any(
@@ -2390,22 +2671,16 @@ class Backtester:
             self._unified_scalar_params = unified_regime_scalar_params
             for _ref in self._close_refs:
                 _n = (_ref.get("name") or "").strip().lower()
-                if _n not in (
-                    "tiered_tp_atr_regime",
-                    "tiered_tp_atr_live_regime",
-                    "tiered_tp_atr_live_regime_dynamic",
-                ):
+                if _n not in ("tiered_tp_atr_regime", "tiered_tp_atr_live_regime"):
                     continue
                 _params = _ref.get("params") or {}
                 if close_params_are_unified_regime(_params):
                     self._unified_close_params = dict(_params)
                 break
             if self._unified_close_params is not None:
-                _validation_params = dict(self._unified_close_params)
-                _validation_params.pop("regime_confirm_cycles", None)
                 _unified_errs = validate_unified_regime_close(
-                    _validation_params,
-                    labels=self._regime_primary_labels,
+                    self._unified_close_params,
+                    labels=self._regime_atr_labels,
                 )
                 if _unified_errs:
                     raise ValueError(
@@ -2417,7 +2692,7 @@ class Backtester:
                     "stop_loss_atr_mult_regime": self.stop_loss_atr_mult_regime,
                     "trailing_stop_atr_mult_regime": self.trailing_stop_atr_mult_regime,
                 },
-                self._regime_primary_labels,
+                self._regime_atr_labels,
                 self._stop_admission_live,
             )
             self._stop_loss_regime_block = _blocks["stop_loss_atr_mult_regime"]
@@ -2428,7 +2703,7 @@ class Backtester:
 
         self._sl_mod = _load_post_tp_sl()
         _tier_vocab_errs = self._sl_mod.validate_regime_tiered_tp_labels(
-            self._close_refs, labels=self._regime_primary_labels,
+            self._close_refs, labels=self._regime_atr_labels,
         )
         if _tier_vocab_errs:
             raise ValueError(
@@ -2436,7 +2711,7 @@ class Backtester:
             )
         self._sl_after_rules_static, _sl_parse_errs = (
             self._sl_mod.parse_strategy_tp_sl_after_rules(
-                self._close_refs, labels=self._regime_primary_labels)
+                self._close_refs, labels=self._regime_atr_labels)
         )
         self._tp_tier_thresholds_static = self._sl_mod.parse_tp_tier_close_fractions(
             self._close_refs,
@@ -2445,7 +2720,7 @@ class Backtester:
         self._run_tp_tier_thresholds = list(self._tp_tier_thresholds_static)
         self._run_stop_loss_atr_mult: Optional[float] = None
         self._run_trailing_stop_atr_mult: Optional[float] = None
-        self._run_position_regime = ""
+        self._clear_position_stamps()
         any_sl_after_key = False
         for ref in self._close_refs:
             params = ref.get("params") or {}
@@ -2489,7 +2764,7 @@ class Backtester:
                 trailing_stop_pct=self.trailing_stop_pct,
                 stop_loss_atr_mult_regime=self.stop_loss_atr_mult_regime,
                 strategy_type=self.strategy_type,
-                labels=self._regime_primary_labels,
+                labels=self._regime_atr_labels,
             )
             if errs:
                 raise ValueError(
@@ -2547,10 +2822,28 @@ class Backtester:
                 "the constant-dollar-risk invariant; the live daemon rejects "
                 "this config at startup)"
             )
+        self._resting_tp_trade_through = _validate_resting_tp_trade_through(
+            resting_tp_trade_through, platform=platform, strategy_type=strategy_type,
+            execution=self._execution, close_names=self.close_strategies,
+            allow_scale_in=self.allow_scale_in,
+        )
+        self._last_resting_fill: Optional[dict] = None
+        self._winning_resting_fill: Optional[dict] = None
 
     @property
     def stop_owner(self) -> str:
         return self._stop_owner
+
+    @property
+    def reads_regime_labels(self) -> bool:
+        return bool(
+            self.allowed_regimes
+            or self.regime_directional_policy is not None
+            or self._stop_owner in STOP_OWNERS_NEEDING_LABEL
+            or self.stop_loss_atr_mult_regime is not None
+            or self.trailing_stop_atr_mult_regime is not None
+            or self._uses_regime_tiered_close
+        )
 
     def _apply_direction_invert(self, sig_int: pd.Series,
                                 uses_open_close: bool) -> pd.Series:
@@ -2559,6 +2852,28 @@ class Backtester:
                 int(s), uses_open_close, self.direction, self.invert_signal,
             )
         ).astype(int)
+
+    def _clear_position_stamps(self) -> None:
+        had = bool(self._run_position_regime or self._stamp_gate
+                   or self._stamp_directional or self._stamp_atr)
+        self._run_position_regime = ""
+        self._stamp_gate = ""
+        self._stamp_directional = ""
+        self._stamp_atr = ""
+        if had and self._regime_trace:
+            self._regime_stamp_trace.append({
+                "event": "clear", "gate": "", "directional": "", "atr": "",
+            })
+
+    def _note_regime_stamp(self, event: str) -> None:
+        if not self._regime_trace:
+            return
+        self._regime_stamp_trace.append({
+            "event": event,
+            "gate": self._stamp_gate,
+            "directional": self._stamp_directional,
+            "atr": self._stamp_atr,
+        })
 
     def _effective_directional_entry(
         self, current_regime: str, position_regime: str, position_qty: float,
@@ -2736,7 +3051,48 @@ class Backtester:
                 _validated_entry_fraction_series(df).shift(1).fillna(1.0)
             )
 
-        if self.regime_enabled and "regime" not in df.columns:
+        label_columns = self._regime_label_columns or {}
+        if label_columns:
+            required = []
+            for key in ("gate", "directional", "atr"):
+                name = label_columns.get(key)
+                if isinstance(name, str) and name.strip():
+                    required.append(name.strip())
+            missing = [
+                name for name in required
+                if name not in df.columns and name not in getattr(history, "columns", [])
+            ]
+            if missing:
+                raise ValueError(
+                    "refusing missing regime label column "
+                    + ", ".join(missing)
+                    + "; an absent named column is not recomputed from the primary column"
+                )
+
+            if (self.regime_directional_policy is not None
+                    and not str(label_columns.get("directional") or "").strip()):
+                raise ValueError(
+                    "refusing a directional policy without a directional regime label column; "
+                    "the flat decision is not read from the gate column"
+                )
+
+            def _label_series(name: str) -> tuple:
+                source = history[name] if name in history.columns else df[name]
+                clean = source.fillna("").map(lambda v: str(v or "").strip())
+                return (clean.reindex(df.index).fillna(""),
+                        clean.shift(1).reindex(df.index).fillna(""))
+
+            for key in ("gate", "directional", "atr"):
+                if key == "atr" and not label_columns.get("atr_named"):
+                    continue
+                name = str(label_columns.get(key) or "").strip()
+                if name:
+                    close_labels, decision_labels = _label_series(name)
+                    df[f"_regime_{key}_close"] = close_labels
+                    df[f"_regime_{key}_decision"] = decision_labels
+            self._regime_trace = True
+            self._regime_stamp_trace = []
+        elif self.regime_enabled and "regime" not in df.columns:
             ensure_regime = _load_regime()
             ensure_regime(
                 df,
@@ -2764,7 +3120,23 @@ class Backtester:
 
         has_open = "open" in df.columns
 
+        payload_row = (self._regime_label_columns or {}).get("payload_row", "decision_bar")
+        gate_row = (self._regime_label_columns or {}).get("gate_row", "decision_bar")
+
+        def _label_at(row, key: str, row_kind: str) -> str:
+            suffix = "_close" if row_kind == "closed_candle" else "_decision"
+            return str(row.get(f"_regime_{key}{suffix}", "") or "").strip()
+
+        def _payload_stamps(row) -> tuple:
+            cols = self._regime_label_columns
+            gate = _label_at(row, "gate", payload_row)
+            directional = _label_at(row, "directional", payload_row) if cols.get("directional_named") else gate
+            atr = _label_at(row, "atr", payload_row) if cols.get("atr_named") else gate
+            return gate, directional, atr
+
         def _entry_stamp(row) -> str:
+            if self._regime_label_columns:
+                return _payload_stamps(row)[2]
             if self.regime_enabled:
                 return str(row.get("regime", "") or "").strip()
             return str(row.get("_regime_bar_close", "") or "").strip()
@@ -2773,11 +3145,11 @@ class Backtester:
             return str(row.get("_regime_bar_close", "") or "").strip()
 
         cash = self.initial_capital
+        self._reset_sizing_state(cash)
         position = 0.0
         trades = []
         current_trade = None
         equity_curve = []
-        terminal_insolvency = False
         rec = _LedgerEventRecorder(self.initial_capital) if record_events else None
 
         avg_cost = 0.0
@@ -2796,32 +3168,17 @@ class Backtester:
         sl_high_water_px = 0.0
 
         pending_signal_sl_close = False
-        # Circuit breaker state (matches Go engine's per-strategy max_drawdown_pct)
-        self._cb_active = False
-        self._cb_peak_equity = self.initial_capital
-        self._cb_cooldown_bars = 0  # bars remaining in cooldown
-        # #1271: intra-bar OHLC-walk SL resolution (default mode). The pierce
-        # check reads the fill bar's full range, so it must only ever run
-        # against a trigger that was actually ARMED during the bar:
-        #   - a trigger carried from a prior bar (or bumped at this bar's
-        #     open by sl_after — suppressed that bar via #715, live next bar),
-        #   - a fixed (entry-geometry) trigger seeded at this bar's open.
-        # A trailing seed is anchored at the bar's CLOSE (the engine's
-        # bar-after-open arming convention — see the module docstring), so it
-        # is NOT an armed level during its entry bar; pierce-checking it there
-        # would stop out at a level derived from data the bar hadn't produced
-        # yet. ``sl_pierce_armed`` tracks that: set per-seed at the open
-        # blocks, promoted to True at the end of every bar a position
-        # survives (by then any trigger is a real carried level).
         walk_mode = self.intrabar_resolution == "ohlc_walk"
+        resting_reach = (
+            _RestingReachTracker(self._execution["size_decimals"], walk_mode)
+            if self._resting_tp_trade_through else None
+        )
         sl_pierce_armed = False
-        dynamic_pending_label = ""
-        dynamic_pending_count = 0
         self._active_sl_after_rules = self._sl_after_rules_static
         self._run_tp_tier_thresholds = list(self._tp_tier_thresholds_static)
         self._run_stop_loss_atr_mult: Optional[float] = None
         self._run_trailing_stop_atr_mult: Optional[float] = None
-        self._run_position_regime = ""
+        self._clear_position_stamps()
         sl_after_active = self._sl_after_pipeline_enabled
         trailing_ratchet_active = self._uses_trailing_ratchet_close
 
@@ -2836,15 +3193,10 @@ class Backtester:
             ).reindex(df.index)
 
         avwap_series = df["avwap"] if "avwap" in df.columns else None
-        avwap_prefix = (
-            _position_avwap_prefix(df)
-            if self._close_names_include_avwap_stop()
-            else None
-        )
         if self._close_names_include_avwap_stop():
             avwap_usable = avwap_series is not None and bool(
                 (pd.to_numeric(avwap_series, errors="coerce") > 0).any()
-            ) or avwap_prefix is not None
+            )
             if not avwap_usable:
                 from strategy_composition import warn_avwap_stop_missing_context
                 warn_avwap_stop_missing_context()
@@ -2867,16 +3219,24 @@ class Backtester:
                 return mark + trail_mult * entry_atr
             return 0.0
 
-        def stamp_open_from_label(stamp: str) -> None:
-            nonlocal dynamic_pending_label, dynamic_pending_count
+        def stamp_open_from_label(stamp: str, row=None, *, keep_recorded: bool = False) -> None:
+            if self._regime_label_columns and row is not None:
+                recorded = (stamp or "").strip() if keep_recorded else ""
+                if recorded:
+                    gate = directional = atr = recorded
+                else:
+                    gate, directional, atr = _payload_stamps(row)
+                stamp = atr
+                self._stamp_gate = gate
+                self._stamp_directional = directional
+                self._stamp_atr = atr
+                self._note_regime_stamp("stamp")
             lab = (stamp or "").strip()
             self._run_position_regime = lab
-            dynamic_pending_label = ""
-            dynamic_pending_count = 0
             if self._uses_regime_tiered_close:
                 rules_rt, _ = self._sl_mod.parse_strategy_tp_sl_after_rules(
                     self._close_refs, regime=lab,
-                    labels=self._regime_primary_labels,
+                    labels=self._regime_atr_labels,
                 )
                 self._active_sl_after_rules = rules_rt
                 self._run_tp_tier_thresholds = self._sl_mod.parse_tp_tier_close_fractions(
@@ -2949,8 +3309,8 @@ class Backtester:
             except (TypeError, ValueError):
                 _seed_atr = 0.0
             _seed_entry = float(starting_long["entry_price"])
-            _seed_label = (str(starting_long.get("entry_regime", "") or "").strip()
-                           or _entry_stamp(df.iloc[0]))
+            _recorded_seed = str(starting_long.get("entry_regime", "") or "").strip()
+            _seed_label = _recorded_seed or _entry_stamp(df.iloc[0])
             if (stop_needs_atr and not (0 < _seed_atr <= 0.5 * _seed_entry)) or (
                     stop_needs_label and not _seed_label):
                 stop_seed_dropped = True
@@ -2958,47 +3318,6 @@ class Backtester:
                 print(f"[#1684] seeded position dropped: its {self._stop_owner} stop has no "
                       "entry ATR or regime label yet, so the run starts flat instead of "
                       "carrying an unprotected position.", file=sys.stderr)
-
-        def advance_dynamic_close_regime(label: str, side: str) -> bool:
-            nonlocal dynamic_pending_label, dynamic_pending_count
-            nonlocal sl_trigger_px, sl_pierce_armed
-            if (
-                self._dynamic_regime_close is None
-                or position == 0
-                or not label
-            ):
-                return False
-            applied = str(self._run_position_regime or "").strip()
-            if not applied:
-                stamp_open_from_label(label)
-                return False
-            if label == applied:
-                dynamic_pending_label = ""
-                dynamic_pending_count = 0
-                return False
-            if label == dynamic_pending_label:
-                dynamic_pending_count += 1
-            else:
-                dynamic_pending_label = label
-                dynamic_pending_count = 1
-            if dynamic_pending_count < self._dynamic_close_confirm_cycles:
-                return False
-
-            stamp_open_from_label(label)
-            candidate = self._initial_sl_trigger(
-                side, scale.geom_cost(avg_cost), entry_atr_value,
-            )
-            if candidate > 0:
-                current = sl_trigger_px
-                tighter = (
-                    current <= 0
-                    or (side == "long" and candidate > current)
-                    or (side == "short" and candidate < current)
-                )
-                if tighter:
-                    sl_trigger_px = candidate
-                    sl_pierce_armed = True
-            return self._sl_hit(side, mark_price, sl_trigger_px)
 
         if starting_long:
             effective_entry = starting_long["entry_price"]
@@ -3034,10 +3353,9 @@ class Backtester:
                 seed_atr = 0.0
             if seed_atr > 0 and seed_atr <= 0.5 * effective_entry:
                 entry_atr_value = seed_atr
-            stamp = str(starting_long.get("entry_regime", "") or "").strip()
-            if not stamp:
-                stamp = _entry_stamp(df.iloc[0])
-            stamp_open_from_label(stamp)
+            recorded_seed = str(starting_long.get("entry_regime", "") or "").strip()
+            stamp_open_from_label(recorded_seed or _entry_stamp(df.iloc[0]), df.iloc[0],
+                                  keep_recorded=bool(recorded_seed))
             seed_hwm = starting_long.get("high_water", 0.0)
             try:
                 seed_hwm = float(seed_hwm or 0.0)
@@ -3081,7 +3399,15 @@ class Backtester:
         active_profile = ""
 
         book_funding = "funding_accrual" in df.columns
+        funding_mode = ""
+        if book_funding and "funding_mode" in df.columns and len(df):
+            raw_mode = df["funding_mode"].iloc[0]
+            if raw_mode == raw_mode and raw_mode is not None:
+                funding_mode = str(raw_mode).strip()
+        attribute_trade_funding = book_funding and funding_mode != "off"
         total_funding_pnl = 0.0
+        funding_unpriced_held_hours = 0
+        has_funding_missing = "funding_missing_hours" in df.columns
         execution_log: dict = {
             "rejected_entries": [],
             "skipped_partial_closes": [],
@@ -3098,6 +3424,11 @@ class Backtester:
                 "strategy-emitted entry_fraction column (#1268) — the live "
                 "sizer has no entry_fraction input, so composing them would "
                 "diverge from the live sizing formula"
+            )
+        if self._perps_sizing is not None and has_entry_fraction:
+            raise ValueError(
+                "perps_sizing is mutually exclusive with a strategy-emitted "
+                "entry_fraction column — the live sizer has no entry_fraction input"
             )
         risk_skipped_entries = 0
 
@@ -3140,12 +3471,15 @@ class Backtester:
                 eff = fill_price * (1 - self.slippage_pct)
             notional = add_qty * eff
             commission = notional * self.commission_pct
+            if self._tier_blocks(abs(position) * eff + notional):
+                return False
             if side == "long":
                 cash -= notional + commission
                 position += add_qty
             else:
                 cash += notional - commission
                 position -= add_qty
+            self._note_add_sizing(notional, commission, add_qty)
             if scale.risk_anchor_price <= 0:
                 scale.risk_anchor_price = avg_cost
             old_qty = abs(position) - add_qty
@@ -3176,7 +3510,8 @@ class Backtester:
                 )
             return True
 
-        def _spec_entry_fill(side: str, raw_fill: float, budget: float, idx):
+        def _spec_entry_fill(side: str, raw_fill: float, budget: float, idx,
+                             fee_on_top: bool = False):
             spec = self._execution
             if side == "long":
                 effective_price = raw_fill * (1 + self.slippage_pct)
@@ -3188,7 +3523,10 @@ class Backtester:
                     "requested_qty": 0.0, "floored_qty": 0.0, "notional_usd": 0.0,
                 })
                 return None
-            requested_qty = budget / (1.0 + spec["taker_fee_pct"]) / effective_price
+            if fee_on_top:
+                requested_qty = budget / effective_price
+            else:
+                requested_qty = budget / (1.0 + spec["taker_fee_pct"]) / effective_price
             qty = _hl_floor_lot_size(requested_qty, spec["size_decimals"])
             notional = qty * effective_price
             threshold = spec["min_notional_usd"] * (1.0 + spec["min_notional_margin"])
@@ -3208,10 +3546,11 @@ class Backtester:
             return effective_price, qty, notional * spec["taker_fee_pct"]
 
         def _book_close(idx, close_fraction: float, raw_fill: float, slippage: float,
-                    reason: str, bar_mark: float, seed_price: float,
-                    fee_pct: Optional[float] = None, decision_bar=None,
-                    timing: str = "bar_open_fill",
-                    record_kind: str = "close") -> bool:
+                        reason: str, bar_mark: float, seed_price: float,
+                        fee_pct: Optional[float] = None, decision_bar=None,
+                        timing: str = "bar_open_fill",
+                        margin_loss: Optional[float] = None,
+                        resting_fill: Optional[dict] = None) -> bool:
             nonlocal position, cash, avg_cost, initial_quantity, entry_atr_value
             nonlocal current_trade, sl_trigger_px, sl_tiers_processed
             nonlocal post_tp_trail_mult, sl_high_water_px
@@ -3241,49 +3580,30 @@ class Backtester:
                         "residual_qty": qty_to_close - floored,
                     })
                 qty_to_close = floored
-            position_before_close = abs(position)
-            close_ratio = (
-                min(max(qty_to_close / position_before_close, 0.0), 1.0)
-                if position_before_close > 0 else 0.0
-            )
             if position > 0:
                 effective_price = raw_fill * (1 - slippage)
                 proceeds = qty_to_close * effective_price
                 commission = proceeds * fee_rate
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    # Pavol fork: margin-space sizing — return the closed
-                    # fraction of locked margin plus realized PnL.
-                    realized_pnl = qty_to_close * (effective_price - avg_cost)
-                    margin_return = self._margin_locked * close_ratio
-                    cash += margin_return + realized_pnl - commission
-                else:
-                    cash += proceeds - commission
+                cash += proceeds - commission
                 position -= qty_to_close
             else:
                 effective_price = raw_fill * (1 + slippage)
                 cost = qty_to_close * effective_price
                 commission = cost * fee_rate
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    realized_pnl = qty_to_close * (avg_cost - effective_price)
-                    margin_return = self._margin_locked * close_ratio
-                    cash += margin_return - cost - commission
-                else:
-                    cash -= cost + commission
+                cash -= cost + commission
                 position += qty_to_close
-
-            if self._margin_per_trade_usd and self._margin_locked > 0:
-                # Release collateral and short-sale proceeds with the closed
-                # quantity so returned margin is not also left locked.
-                self._margin_locked = max(
-                    self._margin_locked - margin_return, 0.0,
-                )
-                self._notional = max(
-                    self._notional * (1.0 - close_ratio), 0.0,
-                )
+            side_closed = "long" if qty_before > 0 else "short"
+            closed_margin = self._used_margin if reason == "venue_liquidation" else None
+            self._note_close_sizing(side_closed, qty_to_close, avg_before, effective_price, commission, abs(qty_before))
+            if reason == "venue_liquidation":
+                self._margin_stats["liquidation_count"] += 1
+                if margin_loss is None:
+                    margin_loss = closed_margin
 
             if current_trade:
                 closed = Trade(current_trade.entry_date, current_trade.entry_price, current_trade.side)
                 closed.shares = qty_to_close
+                _move_trade_funding(current_trade, closed, qty_to_close)
                 closed.close(idx, effective_price)
                 gross_realized = closed.pnl
                 qty_frac = (qty_to_close / initial_quantity) if initial_quantity > 0 else 1.0
@@ -3297,7 +3617,6 @@ class Backtester:
                             ))
                 entry_fee_allocated = closed.entry_fee
                 closed.scale_in_adds = scale.scale_in_count
-                self._close_reason_counts[reason or "close_strategy"] = self._close_reason_counts.get(reason or "close_strategy", 0) + 1
                 trades.append(closed)
                 current_trade.shares -= qty_to_close
                 if current_trade.shares <= 1e-12:
@@ -3309,9 +3628,6 @@ class Backtester:
                 initial_quantity = 0.0
                 entry_atr_value = 0.0
                 scale.reset()
-                # Pavol fork: release locked margin on full close.
-                self._margin_locked = 0.0
-                self._notional = 0.0
                 sl_trigger_px = 0.0
                 sl_tiers_processed = 0
                 post_tp_trail_mult = None
@@ -3323,7 +3639,7 @@ class Backtester:
                 )
                 self._run_stop_loss_atr_mult = None
                 self._run_trailing_stop_atr_mult = None
-                self._run_position_regime = ""
+                self._clear_position_stamps()
             elif sl_after_active and self._run_tp_tier_thresholds:
                 side_now = "long" if position > 0 else "short"
                 prev_trigger = sl_trigger_px
@@ -3351,7 +3667,7 @@ class Backtester:
 
             if rec is not None:
                 rec.record(
-                    record_kind, bar=idx, decision_bar=decision_bar, timing=timing,
+                    "close", bar=idx, decision_bar=decision_bar, timing=timing,
                     side="long" if qty_before > 0 else "short",
                     action="sell" if qty_before > 0 else "buy",
                     quantity=qty_to_close, raw_price=raw_fill,
@@ -3362,7 +3678,8 @@ class Backtester:
                     cash_before=cash_before, cash_after=cash, hold=hold,
                     gross_realized=gross_realized,
                     entry_fee_allocated=entry_fee_allocated,
-                    synthetic=(record_kind == "terminal_liquidation"),
+                    margin_loss=margin_loss,
+                    resting_fill=resting_fill,
                 )
             return sl_after_moved
 
@@ -3394,7 +3711,7 @@ class Backtester:
                     stop_warmup_skipped_entries += 1
             if risk_mode:
                 risk_fraction = self._risk_entry_fraction(
-                    atr_series, idx, fill_price,
+                    atr_series, idx, fill_price, cap=self._perps_sizing is None,
                 )
                 if risk_fraction is None:
                     risk_entry_blocked = True
@@ -3415,7 +3732,8 @@ class Backtester:
                                 file=sys.stderr,
                             )
                 else:
-                    entry_fraction = risk_fraction
+                    if self._perps_sizing is None:
+                        entry_fraction = risk_fraction
             if profile_switcher is not None:
                 active_profile = profile_switcher.step(
                     str(row.get("_profile_label", "") or ""), position == 0
@@ -3423,13 +3741,21 @@ class Backtester:
                 signal = row["signal__" + active_profile]
 
             bar_regime = str(row.get("regime", "")) if self.regime_enabled else ""
+            if self._regime_label_columns:
+                gate_label = _label_at(row, "gate", payload_row if gate_row == "payload" else "decision_bar")
+                current_directional = _label_at(row, "directional", payload_row)
+                position_directional = self._stamp_directional
+            else:
+                gate_label = bar_regime
+                current_directional = bar_regime
+                position_directional = self._run_position_regime
             effective_direction = self.direction or ""
             effective_invert = self.invert_signal
             plain_short_for_bar = plain_short
             if self.regime_directional_policy is not None:
                 effective_direction, effective_invert = self._effective_directional_entry(
-                    bar_regime,
-                    self._run_position_regime,
+                    current_directional,
+                    position_directional,
                     abs(position),
                 )
                 if not uses_open_close:
@@ -3442,7 +3768,6 @@ class Backtester:
                     plain_short_for_bar = effective_direction == "short"
 
             sl_after_just_applied = False
-            dynamic_regime_stop_hit = False
             ratchet_tightened = False
 
             if book_funding and position != 0:
@@ -3453,6 +3778,9 @@ class Backtester:
                     cash_before = cash
                     cash += funding_cash
                     total_funding_pnl += funding_cash
+                    if current_trade is not None and attribute_trade_funding:
+                        current_trade.funding_pnl += funding_cash
+                    self._note_funding(funding_cash)
                     if rec is not None:
                         rec.record(
                             "funding", bar=idx, decision_bar=None,
@@ -3467,42 +3795,23 @@ class Backtester:
                             funding_cash=funding_cash, funding_rate=accrual,
                         )
 
-            if self._margin_per_trade_usd and self._margin_locked > 0:
-                unrealized_pnl = position * (mark_price - avg_cost)
-                equity = cash + self._margin_locked + unrealized_pnl - (self._notional if position < 0 else 0)
-            else:
-                equity = cash + position * mark_price
+            if position != 0 and has_funding_missing:
+                raw_miss = row.get("funding_missing_hours", 0)
+                try:
+                    miss = int(raw_miss) if raw_miss == raw_miss else 0
+                except (TypeError, ValueError):
+                    miss = 0
+                if miss > 0:
+                    funding_unpriced_held_hours += miss
+
+            equity = cash + position * mark_price
             equity_curve.append({"date": idx, "equity": equity})
 
-            # Circuit breaker: track peak equity and manage cooldown
-            if self.circuit_breaker_max_drawdown_pct is not None:
-                if equity > self._cb_peak_equity:
-                    self._cb_peak_equity = equity
-                if self._cb_cooldown_bars > 0:
-                    self._cb_cooldown_bars -= 1
-                    if self._cb_cooldown_bars <= 0:
-                        self._cb_active = False
-                if not self._cb_active and self._cb_peak_equity > 0:
-                    dd_pct = (self._cb_peak_equity - equity) / self._cb_peak_equity * 100
-                    if dd_pct >= self.circuit_breaker_max_drawdown_pct:
-                        self._cb_active = True
-                        bar_minutes = _bar_duration_minutes(df, self.direction)
-                        cooldown_minutes = max(bar_minutes, 1)
-                        self._cb_cooldown_bars = max(1, int(24 * 60 / cooldown_minutes))
-
-            # Regime gate: block new entries when the prior bar's regime
-            # isn't in the allowed set. Existing positions are always managed
-            # by close paths. ``compute_regime`` initializes every row to
-            # ``"ranging"`` (warmup bars included). After the post-injection
-            # shift (#730) row 0 is empty — an empty label resolves per
-            # ``regime_gate_on_failure`` (#1278): the default ``"open"``
-            # ADMITS the bar-0 entry (matching the live #879 fail-open gate);
-            # ``"closed"`` blocks it (matching live fail-closed).
             regime_blocked = (
                 self.regime_enabled
                 and bool(self.allowed_regimes)
                 and not _regime_allows_entry(
-                    self.allowed_regimes, bar_regime, self.regime_gate_on_failure
+                    self.allowed_regimes, gate_label, self.regime_gate_on_failure
                 )
             )
 
@@ -3545,8 +3854,8 @@ class Backtester:
                         sl_after_just_applied = True
                 if self.regime_directional_policy is not None:
                     entry_direction, entry_invert = self._effective_directional_entry(
-                        bar_regime,
-                        self._run_position_regime,
+                        current_directional,
+                        position_directional,
                         abs(position),
                     )
                     open_action = _open_action_from_signal(
@@ -3559,20 +3868,35 @@ class Backtester:
                     )
 
                 long_entry_ok = (
-                    open_action == "long" and position == 0 and cash > 0
+                    open_action == "long" and position == 0
+                    and (self._sizing_cash > 0 if self._perps_sizing is not None else cash > 0)
                     and not regime_blocked and not risk_entry_blocked
                 )
                 short_entry_ok = (
-                    open_action == "short" and position == 0 and cash > 0
+                    open_action == "short" and position == 0
+                    and (self._sizing_cash > 0 if self._perps_sizing is not None else cash > 0)
                     and not regime_blocked and not risk_entry_blocked
                 )
                 spec_fill = None
                 if self._execution is not None and (long_entry_ok or short_entry_ok):
+                    spec_budget = cash * entry_fraction
+                    fee_on_top = False
+                    if self._perps_sizing is not None:
+                        dist = self._risk_stop_distance(atr_series, idx, fill_price) if risk_mode else None
+                        spec_budget = self._live_notional(fill_price, dist, hurst_size_mult) or 0.0
+                        fee_on_top = True
                     spec_fill = _spec_entry_fill(
                         "long" if long_entry_ok else "short",
-                        fill_price, cash * entry_fraction, idx,
+                        fill_price, spec_budget, idx, fee_on_top=fee_on_top,
                     )
                     if spec_fill is None:
+                        long_entry_ok = False
+                        short_entry_ok = False
+                live_open_notional = None
+                if self._perps_sizing is not None and self._execution is None and (long_entry_ok or short_entry_ok):
+                    dist = self._risk_stop_distance(atr_series, idx, fill_price) if risk_mode else None
+                    live_open_notional = self._live_notional(fill_price, dist, hurst_size_mult)
+                    if live_open_notional is None:
                         long_entry_ok = False
                         short_entry_ok = False
                 cash_before, qty_before, avg_before = cash, position, avg_cost
@@ -3581,17 +3905,14 @@ class Backtester:
                         effective_price, shares, commission = spec_fill
                         position = shares
                         cash -= shares * effective_price + commission
-                    elif self._margin_per_trade_usd:
-                        # Pavol fork: margin-space sizing.
+                        self._note_open_sizing(shares * effective_price, commission, shares)
+                    elif live_open_notional is not None:
                         effective_price = fill_price * (1 + self.slippage_pct)
-                        margin = min(self._margin_per_trade_usd, cash)
-                        notional = margin * self._leverage
-                        commission = notional * self.commission_pct
-                        cash -= margin + commission
-                        self._margin_locked = margin
-                        self._notional = notional
-                        shares = notional / effective_price
+                        shares = live_open_notional / effective_price
+                        commission = live_open_notional * self.commission_pct
                         position = shares
+                        cash -= shares * effective_price + commission
+                        self._note_open_sizing(live_open_notional, commission, shares)
                     else:
                         effective_price = fill_price * (1 + self.slippage_pct)
                         invest = cash * entry_fraction
@@ -3600,6 +3921,7 @@ class Backtester:
                         shares = available / effective_price
                         position = shares
                         cash -= invest
+
                     current_trade = Trade(idx, effective_price, "long")
                     current_trade.shares = shares
                     avg_cost = effective_price
@@ -3621,7 +3943,7 @@ class Backtester:
                     scale.base_open_notional = _ungated_leg_notional(
                         shares * effective_price, hurst_size_mult,
                     )
-                    stamp_open_from_label(_entry_stamp(row))
+                    stamp_open_from_label(_entry_stamp(row), row)
                     if self._hl_stop_geometry:
                         sl_trigger_px, sl_high_water_px, sl_pierce_armed = self._hl_arm_stop(
                             "long", avg_cost, entry_atr_value, self._run_position_regime,
@@ -3665,19 +3987,14 @@ class Backtester:
                         effective_price, shares, commission = spec_fill
                         cash += shares * effective_price - commission
                         position = -shares
-                    elif self._margin_per_trade_usd:
-                        # Pavol fork: margin-space sizing.
+                        self._note_open_sizing(shares * effective_price, commission, shares)
+                    elif live_open_notional is not None:
                         effective_price = fill_price * (1 - self.slippage_pct)
-                        margin = min(self._margin_per_trade_usd, cash)
-                        notional = margin * self._leverage
-                        commission = notional * self.commission_pct
-                        cash -= margin + commission
-                        # Short-sale proceeds: receive notional in cash
-                        cash += notional
-                        self._margin_locked = margin
-                        self._notional = notional
-                        shares = notional / effective_price
+                        shares = live_open_notional / effective_price
+                        commission = live_open_notional * self.commission_pct
+                        cash += shares * effective_price - commission
                         position = -shares
+                        self._note_open_sizing(live_open_notional, commission, shares)
                     else:
                         effective_price = fill_price * (1 - self.slippage_pct)
                         margin = cash * entry_fraction
@@ -3686,10 +4003,11 @@ class Backtester:
                         shares = notional / effective_price
                         cash += 2 * notional - margin
                         position = -shares
+
                     current_trade = Trade(idx, effective_price, "short")
-                    current_trade.shares = abs(shares) if isinstance(shares, (int,float)) else abs(position)
+                    current_trade.shares = shares
                     avg_cost = effective_price
-                    initial_quantity = abs(shares) if isinstance(shares, (int,float)) else abs(position)
+                    initial_quantity = shares
                     entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
                     hold.open(effective_price, "short", commission)
                     if rec is not None:
@@ -3707,7 +4025,7 @@ class Backtester:
                     scale.base_open_notional = _ungated_leg_notional(
                         shares * effective_price, hurst_size_mult,
                     )
-                    stamp_open_from_label(_entry_stamp(row))
+                    stamp_open_from_label(_entry_stamp(row), row)
                     if self._hl_stop_geometry:
                         sl_trigger_px, sl_high_water_px, sl_pierce_armed = self._hl_arm_stop(
                             "short", avg_cost, entry_atr_value, self._run_position_regime,
@@ -3766,6 +4084,44 @@ class Backtester:
                     )
 
                 if (
+                    self._liquidation_model == "venue_isolated"
+                    and position != 0
+                    and avg_cost > 0
+                ):
+                    side_now = "long" if position > 0 else "short"
+                    bar_open = float(row["open"]) if has_open else mark_price
+                    self._refresh_liq(side_now, avg_cost, abs(position))
+                    sl_trigger_px = self._clamp_trigger(
+                        side_now, sl_trigger_px, event_date=idx,
+                    )
+                    hi = float(row.get("high", mark_price) or mark_price)
+                    lo = float(row.get("low", mark_price) or mark_price)
+                    gap = self._open_past_liquidation(side_now, bar_open)
+                    # The walk fill below is the only stop check on this bar.
+                    # A post-TP bump sets sl_after_just_applied and skips it, so
+                    # that stop must not also suppress the range liquidation.
+                    stop_armed = (
+                        walk_mode
+                        and sl_pierce_armed
+                        and sl_trigger_px > 0
+                        and not sl_after_just_applied
+                    )
+                    range_reaches = (
+                        self._run_liq_px > 0
+                        and (
+                            (lo <= self._run_liq_px)
+                            if side_now == "long"
+                            else (hi >= self._run_liq_px)
+                        )
+                    )
+                    if gap or (range_reaches and not stop_armed):
+                        _book_close(
+                            idx, 1.0, self._run_liq_px, 0.0, "venue_liquidation",
+                            mark_price, avg_cost, fee_pct=0.0, decision_bar=None,
+                            timing="intrabar_trigger_fill",
+                        )
+
+                if (
                     walk_mode
                     and position != 0
                     and sl_pierce_armed
@@ -3782,23 +4138,84 @@ class Backtester:
                         sl_trigger_px,
                     )
                     if raw_fill is not None:
-                        _book_close(
-                            idx, 1.0, raw_fill, self.slippage_pct,
-                            "sl", mark_price, raw_fill,
+                        cash_before, qty_before, avg_before = cash, position, avg_cost
+                        gross_realized = None
+                        entry_fee_allocated = None
+                        qty_to_close = abs(position)
+                        if position > 0:
+                            effective_price = raw_fill * (1 - self.slippage_pct)
+                            proceeds = qty_to_close * effective_price
+                            commission = proceeds * self.commission_pct
+                            cash += proceeds - commission
+                        else:
+                            effective_price = raw_fill * (1 + self.slippage_pct)
+                            cost = qty_to_close * effective_price
+                            commission = cost * self.commission_pct
+                            cash -= cost + commission
+                        position = 0.0
+                        self._note_close_sizing(
+                            side_now, qty_to_close, avg_before, effective_price,
+                            commission, qty_to_close,
                         )
+                        if current_trade:
+                            closed = Trade(
+                                current_trade.entry_date,
+                                current_trade.entry_price,
+                                current_trade.side,
+                            )
+                            closed.shares = qty_to_close
+                            _move_trade_funding(current_trade, closed, qty_to_close)
+                            closed.close(idx, effective_price)
+                            gross_realized = closed.pnl
+                            qty_frac = (
+                                qty_to_close / initial_quantity
+                                if initial_quantity > 0 else 1.0
+                            )
+                            _stamp_hold(closed, hold,
+                                        entry_atr=entry_atr_value,
+                                        exit_fee=commission, reason="sl",
+                                        qty_frac=qty_frac,
+                                        true_up_entry_fee=(
+                                            scale.scale_in_count > 0
+                                        ))
+                            entry_fee_allocated = closed.entry_fee
+                            closed.scale_in_adds = scale.scale_in_count
+                            trades.append(closed)
+                            current_trade = None
+                        avg_cost = 0.0
+                        initial_quantity = 0.0
+                        entry_atr_value = 0.0
+                        scale.reset()
+                        sl_trigger_px = 0.0
+                        sl_tiers_processed = 0
+                        post_tp_trail_mult = None
+                        sl_high_water_px = 0.0
                         sl_pierce_armed = False
+                        self._active_sl_after_rules = self._sl_after_rules_static
+                        self._run_tp_tier_thresholds = list(
+                            self._tp_tier_thresholds_static,
+                        )
+                        self._run_stop_loss_atr_mult = None
+                        self._run_trailing_stop_atr_mult = None
+                        self._clear_position_stamps()
+                        if rec is not None:
+                            rec.record(
+                                'close', bar=idx, decision_bar=None,
+                                timing='intrabar_trigger_fill', side="long" if qty_before > 0 else "short", action="sell" if qty_before > 0 else "buy",
+                                quantity=qty_to_close, raw_price=raw_fill, effective_price=effective_price,
+                                fee_rate=self.commission_pct, fee_charged=commission, reason="sl",
+                                qty_before=qty_before, qty_after=position,
+                                avg_cost_before=avg_before, avg_cost_after=avg_cost,
+                                cash_before=cash_before, cash_after=cash, hold=hold,
+                                gross_realized=gross_realized, entry_fee_allocated=entry_fee_allocated,
+                            )
 
                 if self.close_strategies and position != 0 and avg_cost > 0:
-                    # Evaluator geometry (tiered-TP thresholds etc.) reads the
-                    # frozen anchor, never the blend — mirroring the live
-                    # on-chain protection path; PnL stays on the blend.
-                    position_avwap_value = (
-                        _position_anchored_avwap_from_prefix(
-                            avwap_prefix, current_trade.entry_date, i,
+                    resting_rule = None
+                    if resting_reach is not None:
+                        resting_rule = resting_reach.rule_for(
+                            current_trade, "long" if position > 0 else "short", row, idx, i,
                         )
-                        if avwap_prefix is not None and current_trade is not None
-                        else None
-                    )
                     pending_close_fraction, pending_close_reason, tier_fill_price = self._evaluate_close_strategies(
                         position, scale.geom_cost(avg_cost), initial_quantity,
                         entry_atr_value,
@@ -3808,34 +4225,31 @@ class Backtester:
                         bars_held=hold.bars,
                         zscore_series=zscore_series,
                         avwap_series=avwap_series,
-                        position_anchored_avwap=position_avwap_value,
-                        regime_pending_label=dynamic_pending_label,
-                        regime_pending_count=dynamic_pending_count,
+                        resting_rule=resting_rule,
                     )
                     if (
                         self._resting_tp_model
                         and pending_close_fraction > 0
                         and tier_fill_price > 0
                     ):
+                        if resting_rule is not None:
+                            booked_resting_fill = self._winning_resting_fill
+                        else:
+                            booked_resting_fill = {
+                                "rule": "legacy_mark_cross",
+                                "k_ticks": None,
+                                "verdict": "resting_fill_unverified",
+                                "reach_px": mark_price,
+                                "fill_px": tier_fill_price,
+                            }
                         if _book_close(idx, pending_close_fraction, tier_fill_price, 0.0,
                                        pending_close_reason, mark_price, mark_price,
                                        fee_pct=self._maker_fee_pct,
-                                       timing="intrabar_trigger_fill"):
+                                       timing="intrabar_trigger_fill",
+                                       resting_fill=booked_resting_fill):
                             sl_after_just_applied = True
                         pending_close_fraction = 0.0
                         pending_close_reason = ""
-                    if (
-                        self._dynamic_regime_close is not None
-                        and position != 0
-                        and open_action == "none"
-                    ):
-                        dynamic_regime_stop_hit = advance_dynamic_close_regime(
-                            _bar_close_regime(row),
-                            "long" if position > 0 else "short",
-                        )
-                        if dynamic_regime_stop_hit:
-                            pending_close_fraction = 1.0
-                            pending_close_reason = "dynamic_regime_stop"
                     if (
                         trailing_ratchet_active
                         and self._ratchet_mod
@@ -3876,7 +4290,7 @@ class Backtester:
                         side_now, scale.geom_cost(avg_cost), entry_atr_value,
                         self._run_position_regime, mark_price, post_tp_trail_mult,
                         sl_trigger_px, sl_high_water_px, ratchet_tightened,
-                        event_date=idx,
+                        event_date=idx, liq_anchor=avg_cost,
                     )
                     if not walk_mode and sl_trigger_px > 0 and self._sl_hit(
                         side_now, mark_price, sl_trigger_px,
@@ -3910,28 +4324,8 @@ class Backtester:
                     if not walk_mode and sl_trigger_px > 0 and self._sl_hit(
                         side_now, mark_price, sl_trigger_px,
                     ):
-                        if pending_close_fraction <= 0:
-                            pending_close_fraction = 1.0
-                            pending_close_reason = "dynamic_regime_stop" if dynamic_regime_stop_hit else "sl"
-                # Margin-based circuit breaker (per-trade drawdown, matches Go engine)
-                if (self._margin_per_trade_usd is not None
-                    and self._margin_locked > 0
-                    and position != 0
-                    and avg_cost > 0
-                    and self.circuit_breaker_max_drawdown_pct is not None):
-                    unrealized_pnl = position * (mark_price - avg_cost)
-                    if unrealized_pnl < 0:
-                        margin_dd_pct = (abs(unrealized_pnl) / self._margin_locked) * 100
-                        if margin_dd_pct >= self.circuit_breaker_max_drawdown_pct:
-                            pending_close_fraction = 1.0
-                            pending_close_reason = "circuit_breaker"
-                # Equity-level circuit breaker override (existing logic)
-                if self._cb_active and position != 0 and pending_close_fraction <= 0:
-                    pending_close_fraction = 1.0
-                    pending_close_reason = "circuit_breaker"
-                # #1271: any trigger surviving to a bar's end (seeded,
-                # walked, or sl_after-bumped) is a real carried level for
-                # the next bar — pierce-eligible from here on.
+                        pending_close_fraction = 1.0
+                        pending_close_reason = "sl"
                 if position != 0:
                     sl_pierce_armed = True
                 continue
@@ -3943,12 +4337,12 @@ class Backtester:
                 effective_price = fill_price * (1 - self.slippage_pct)
                 proceeds = position * effective_price
                 commission = proceeds * self.commission_pct
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    realized_pnl = position * (effective_price - avg_cost)
-                    cash += self._margin_locked + realized_pnl - commission
-                else:
-                    cash += proceeds - commission
+                cash += proceeds - commission
                 position = 0.0
+                self._note_close_sizing(
+                    "long", abs(qty_before), avg_before, effective_price,
+                    commission, abs(qty_before),
+                )
                 if current_trade:
                     current_trade.close(idx, effective_price)
                     gross_realized = current_trade.pnl
@@ -3960,13 +4354,11 @@ class Backtester:
                     current_trade = None
                 pending_signal_sl_close = False
                 sl_trigger_px = 0.0
-                self._margin_locked = 0.0
-                self._notional = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
                 scale.reset()
-                self._run_position_regime = ""
+                self._clear_position_stamps()
                 if rec is not None:
                     rec.record(
                         'close', bar=idx, decision_bar=decision_idx,
@@ -3987,12 +4379,12 @@ class Backtester:
                 effective_price = fill_price * (1 + self.slippage_pct)
                 cost = abs(position) * effective_price
                 commission = cost * self.commission_pct
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    realized_pnl = abs(position) * (avg_cost - effective_price)
-                    cash += self._margin_locked - cost - commission
-                else:
-                    cash -= cost + commission
+                cash -= cost + commission
                 position = 0.0
+                self._note_close_sizing(
+                    "short", abs(qty_before), avg_before, effective_price,
+                    commission, abs(qty_before),
+                )
                 if current_trade:
                     current_trade.close(idx, effective_price)
                     gross_realized = current_trade.pnl
@@ -4004,13 +4396,11 @@ class Backtester:
                     current_trade = None
                 pending_signal_sl_close = False
                 sl_trigger_px = 0.0
-                self._margin_locked = 0.0
-                self._notional = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
                 scale.reset()
-                self._run_position_regime = ""
+                self._clear_position_stamps()
                 if rec is not None:
                     rec.record(
                         'close', bar=idx, decision_bar=decision_idx,
@@ -4027,94 +4417,100 @@ class Backtester:
             cash_before, qty_before, avg_before = cash, position, avg_cost
             gross_realized = None
             entry_fee_allocated = None
-            if plain_short_for_bar and signal == -1 and position == 0 and cash > 0 and not regime_blocked and not risk_entry_blocked:
+            if plain_short_for_bar and signal == -1 and position == 0 and (self._sizing_cash > 0 if self._perps_sizing is not None else cash > 0) and not regime_blocked and not risk_entry_blocked:
                 effective_price = fill_price * (1 - self.slippage_pct)
-                # #980: entry_fraction of flat-state cash is the committed
-                # margin; pay commission from it, receive the short-sale
-                # proceeds on top of the untouched reserve (fraction 1.0
-                # reduces to cash = 2 * notional, today's math exactly).
-                margin = cash * entry_fraction
-                commission = margin * self.commission_pct
-                notional = margin - commission
-                shares = notional / effective_price
-                cash += 2 * notional - margin
-                position = -shares
-
-                current_trade = Trade(idx, effective_price, "short")
-                current_trade.shares = shares
-                scale.reset()
-                scale.base_open_notional = _ungated_leg_notional(
-                    shares * effective_price, hurst_size_mult,
-                )
-
-                avg_cost = effective_price
-                entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
-                hold.open(effective_price, "short", commission)
-                if rec is not None:
-                    rec.record(
-                        'open', bar=idx, decision_bar=decision_idx,
-                        timing='bar_open_fill', side="short", action="sell",
-                        quantity=shares, raw_price=fill_price, effective_price=effective_price,
-                        fee_rate=self.commission_pct, fee_charged=commission, reason="open_short",
-                        qty_before=qty_before, qty_after=position,
-                        avg_cost_before=avg_before, avg_cost_after=avg_cost,
-                        cash_before=cash_before, cash_after=cash, hold=hold,
-                        gross_realized=None, entry_fee_allocated=None,
+                if self._perps_sizing is not None:
+                    dist = self._risk_stop_distance(atr_series, idx, fill_price) if risk_mode else None
+                    live_notional = self._live_notional(fill_price, dist, hurst_size_mult)
+                    if live_notional is None:
+                        effective_price = None
+                    else:
+                        shares = live_notional / effective_price
+                        commission = live_notional * self.commission_pct
+                        cash += shares * effective_price - commission
+                        position = -shares
+                        self._note_open_sizing(live_notional, commission, shares)
+                else:
+                    margin = cash * entry_fraction
+                    commission = margin * self.commission_pct
+                    notional = margin - commission
+                    shares = notional / effective_price
+                    cash += 2 * notional - margin
+                    position = -shares
+                if effective_price is not None:
+                    current_trade = Trade(idx, effective_price, "short")
+                    current_trade.shares = shares
+                    scale.reset()
+                    scale.base_open_notional = _ungated_leg_notional(
+                        shares * effective_price, hurst_size_mult,
                     )
-                stamp_open_from_label(_entry_stamp(row))
-                sl_trigger_px = 0.0
-                sl_high_water_px = mark_price
-                sl_pierce_armed = False
-                if self._hl_stop_geometry:
-                    sl_trigger_px, sl_high_water_px, sl_pierce_armed = self._hl_arm_stop(
-                        "short", avg_cost, entry_atr_value, self._run_position_regime,
-                        mark_price, event_date=idx,
-                    )
-                elif (
-                    self.stop_loss_atr_mult is not None
-                    and self.stop_loss_atr_mult > 0
-                    and entry_atr_value > 0
-                ):
-                    sl_trigger_px = avg_cost + self.stop_loss_atr_mult * entry_atr_value
-                    sl_pierce_armed = True
-                elif (
-                    self.trailing_stop_atr_mult is not None
-                    and self.trailing_stop_atr_mult > 0
-                    and entry_atr_value > 0
-                ):
-                    sl_trigger_px = mark_price + self.trailing_stop_atr_mult * entry_atr_value
-                elif self.stop_loss_pct is not None and self.stop_loss_pct > 0:
-                    sl_trigger_px = avg_cost * (1 + self.stop_loss_pct)
-                    sl_pierce_armed = True
+
+                    avg_cost = effective_price
+                    entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
+                    hold.open(effective_price, "short", commission)
+                    if rec is not None:
+                        rec.record(
+                            'open', bar=idx, decision_bar=decision_idx,
+                            timing='bar_open_fill', side="short", action="sell",
+                            quantity=shares, raw_price=fill_price, effective_price=effective_price,
+                            fee_rate=self.commission_pct, fee_charged=commission, reason="open_short",
+                            qty_before=qty_before, qty_after=position,
+                            avg_cost_before=avg_before, avg_cost_after=avg_cost,
+                            cash_before=cash_before, cash_after=cash, hold=hold,
+                            gross_realized=None, entry_fee_allocated=None,
+                        )
+                    stamp_open_from_label(_entry_stamp(row), row)
+                    sl_trigger_px = 0.0
+                    sl_high_water_px = mark_price
+                    sl_pierce_armed = False
+                    if self._hl_stop_geometry:
+                        sl_trigger_px, sl_high_water_px, sl_pierce_armed = self._hl_arm_stop(
+                            "short", avg_cost, entry_atr_value, self._run_position_regime,
+                            mark_price, event_date=idx,
+                        )
+                    elif (
+                        self.stop_loss_atr_mult is not None
+                        and self.stop_loss_atr_mult > 0
+                        and entry_atr_value > 0
+                    ):
+                        sl_trigger_px = avg_cost + self.stop_loss_atr_mult * entry_atr_value
+                        sl_pierce_armed = True
+                    elif (
+                        self.trailing_stop_atr_mult is not None
+                        and self.trailing_stop_atr_mult > 0
+                        and entry_atr_value > 0
+                    ):
+                        sl_trigger_px = mark_price + self.trailing_stop_atr_mult * entry_atr_value
+                    elif self.stop_loss_pct is not None and self.stop_loss_pct > 0:
+                        sl_trigger_px = avg_cost * (1 + self.stop_loss_pct)
+                        sl_pierce_armed = True
 
             elif plain_short_for_bar and signal == 1 and position < 0:
                 effective_price = fill_price * (1 + self.slippage_pct)
                 cost = abs(position) * effective_price
                 commission = cost * self.commission_pct
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    realized_pnl = abs(position) * (avg_cost - effective_price)
-                    cash += self._margin_locked - cost - commission
-                else:
-                    cash -= cost + commission
+                cash -= cost + commission
                 position = 0.0
+                self._note_close_sizing(
+                    "short", abs(qty_before), avg_before, effective_price,
+                    commission, abs(qty_before),
+                )
+
                 if current_trade:
                     current_trade.close(idx, effective_price)
                     gross_realized = current_trade.pnl
                     _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
                                 exit_fee=commission, reason="signal")
-                    self._close_reason_counts["signal"] = self._close_reason_counts.get("signal", 0) + 1
                     entry_fee_allocated = current_trade.entry_fee
                     current_trade.scale_in_adds = scale.scale_in_count
                     trades.append(current_trade)
                     current_trade = None
                 sl_trigger_px = 0.0
-                self._margin_locked = 0.0
-                self._notional = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
                 scale.reset()
-                self._run_position_regime = ""
+                self._clear_position_stamps()
                 if rec is not None:
                     rec.record(
                         'close', bar=idx, decision_bar=decision_idx,
@@ -4127,95 +4523,100 @@ class Backtester:
                         gross_realized=gross_realized, entry_fee_allocated=entry_fee_allocated,
                     )
 
-            elif not plain_short_for_bar and signal == 1 and position == 0 and cash > 0 and not regime_blocked and not risk_entry_blocked:
-                # BUY — go long (#980: entry_fraction of flat-state cash;
-                # 1.0 = all available cash, today's math exactly)
+            elif not plain_short_for_bar and signal == 1 and position == 0 and (self._sizing_cash > 0 if self._perps_sizing is not None else cash > 0) and not regime_blocked and not risk_entry_blocked:
                 effective_price = fill_price * (1 + self.slippage_pct)
-                # #980: commit entry_fraction of flat-state cash; the
-                # remainder stays as a reserve (fraction 1.0 = full
-                # notional, today's math exactly).
-                invest = cash * entry_fraction
-                commission = invest * self.commission_pct
-                available = invest - commission
-                shares = available / effective_price
-                position = shares
-                cash -= invest
-
-                current_trade = Trade(idx, effective_price, "long")
-                current_trade.shares = shares
-                scale.reset()
-                scale.base_open_notional = _ungated_leg_notional(
-                    shares * effective_price, hurst_size_mult,
-                )
-
-                avg_cost = effective_price
-                entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
-                hold.open(effective_price, "long", commission)
-                if rec is not None:
-                    rec.record(
-                        'open', bar=idx, decision_bar=decision_idx,
-                        timing='bar_open_fill', side="long", action="buy",
-                        quantity=shares, raw_price=fill_price, effective_price=effective_price,
-                        fee_rate=self.commission_pct, fee_charged=commission, reason="open_long",
-                        qty_before=qty_before, qty_after=position,
-                        avg_cost_before=avg_before, avg_cost_after=avg_cost,
-                        cash_before=cash_before, cash_after=cash, hold=hold,
-                        gross_realized=None, entry_fee_allocated=None,
+                if self._perps_sizing is not None:
+                    dist = self._risk_stop_distance(atr_series, idx, fill_price) if risk_mode else None
+                    live_notional = self._live_notional(fill_price, dist, hurst_size_mult)
+                    if live_notional is None:
+                        effective_price = None
+                    else:
+                        shares = live_notional / effective_price
+                        commission = live_notional * self.commission_pct
+                        position = shares
+                        cash -= shares * effective_price + commission
+                        self._note_open_sizing(live_notional, commission, shares)
+                else:
+                    invest = cash * entry_fraction
+                    commission = invest * self.commission_pct
+                    available = invest - commission
+                    shares = available / effective_price
+                    position = shares
+                    cash -= invest
+                if effective_price is not None:
+                    current_trade = Trade(idx, effective_price, "long")
+                    current_trade.shares = shares
+                    scale.reset()
+                    scale.base_open_notional = _ungated_leg_notional(
+                        shares * effective_price, hurst_size_mult,
                     )
-                stamp_open_from_label(_entry_stamp(row))
-                sl_trigger_px = 0.0
-                sl_high_water_px = mark_price
-                sl_pierce_armed = False
-                if self._hl_stop_geometry:
-                    sl_trigger_px, sl_high_water_px, sl_pierce_armed = self._hl_arm_stop(
-                        "long", avg_cost, entry_atr_value, self._run_position_regime,
-                        mark_price, event_date=idx,
-                    )
-                elif (
-                    self.stop_loss_atr_mult is not None
-                    and self.stop_loss_atr_mult > 0
-                    and entry_atr_value > 0
-                ):
-                    sl_trigger_px = avg_cost - self.stop_loss_atr_mult * entry_atr_value
-                    sl_pierce_armed = True
-                elif (
-                    self.trailing_stop_atr_mult is not None
-                    and self.trailing_stop_atr_mult > 0
-                    and entry_atr_value > 0
-                ):
-                    sl_trigger_px = mark_price - self.trailing_stop_atr_mult * entry_atr_value
-                elif self.stop_loss_pct is not None and self.stop_loss_pct > 0:
-                    sl_trigger_px = avg_cost * (1 - self.stop_loss_pct)
-                    sl_pierce_armed = True
+
+                    avg_cost = effective_price
+                    entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
+                    hold.open(effective_price, "long", commission)
+                    if rec is not None:
+                        rec.record(
+                            'open', bar=idx, decision_bar=decision_idx,
+                            timing='bar_open_fill', side="long", action="buy",
+                            quantity=shares, raw_price=fill_price, effective_price=effective_price,
+                            fee_rate=self.commission_pct, fee_charged=commission, reason="open_long",
+                            qty_before=qty_before, qty_after=position,
+                            avg_cost_before=avg_before, avg_cost_after=avg_cost,
+                            cash_before=cash_before, cash_after=cash, hold=hold,
+                            gross_realized=None, entry_fee_allocated=None,
+                        )
+                    stamp_open_from_label(_entry_stamp(row), row)
+                    sl_trigger_px = 0.0
+                    sl_high_water_px = mark_price
+                    sl_pierce_armed = False
+                    if self._hl_stop_geometry:
+                        sl_trigger_px, sl_high_water_px, sl_pierce_armed = self._hl_arm_stop(
+                            "long", avg_cost, entry_atr_value, self._run_position_regime,
+                            mark_price, event_date=idx,
+                        )
+                    elif (
+                        self.stop_loss_atr_mult is not None
+                        and self.stop_loss_atr_mult > 0
+                        and entry_atr_value > 0
+                    ):
+                        sl_trigger_px = avg_cost - self.stop_loss_atr_mult * entry_atr_value
+                        sl_pierce_armed = True
+                    elif (
+                        self.trailing_stop_atr_mult is not None
+                        and self.trailing_stop_atr_mult > 0
+                        and entry_atr_value > 0
+                    ):
+                        sl_trigger_px = mark_price - self.trailing_stop_atr_mult * entry_atr_value
+                    elif self.stop_loss_pct is not None and self.stop_loss_pct > 0:
+                        sl_trigger_px = avg_cost * (1 - self.stop_loss_pct)
+                        sl_pierce_armed = True
 
             elif signal == -1 and position > 0:
                 effective_price = fill_price * (1 - self.slippage_pct)
                 proceeds = position * effective_price
                 commission = proceeds * self.commission_pct
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    realized_pnl = position * (effective_price - avg_cost)
-                    cash += self._margin_locked + realized_pnl - commission
-                else:
-                    cash += proceeds - commission
+                cash += proceeds - commission
                 position = 0.0
+                self._note_close_sizing(
+                    "long", abs(qty_before), avg_before, effective_price,
+                    commission, abs(qty_before),
+                )
+
                 if current_trade:
                     current_trade.close(idx, effective_price)
                     gross_realized = current_trade.pnl
                     _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
                                 exit_fee=commission, reason="signal")
-                    self._close_reason_counts["signal"] = self._close_reason_counts.get("signal", 0) + 1
                     entry_fee_allocated = current_trade.entry_fee
                     current_trade.scale_in_adds = scale.scale_in_count
                     trades.append(current_trade)
                     current_trade = None
                 sl_trigger_px = 0.0
-                self._margin_locked = 0.0
-                self._notional = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
                 scale.reset()
-                self._run_position_regime = ""
+                self._clear_position_stamps()
                 if rec is not None:
                     rec.record(
                         'close', bar=idx, decision_bar=decision_idx,
@@ -4250,6 +4651,36 @@ class Backtester:
                 )
 
             if (
+                self._liquidation_model == "venue_isolated"
+                and position != 0
+                and avg_cost > 0
+            ):
+                side_now = "long" if position > 0 else "short"
+                bar_open = float(row["open"]) if has_open else mark_price
+                self._refresh_liq(side_now, avg_cost, abs(position))
+                sl_trigger_px = self._clamp_trigger(
+                    side_now, sl_trigger_px, event_date=idx,
+                )
+                hi = float(row.get("high", mark_price) or mark_price)
+                lo = float(row.get("low", mark_price) or mark_price)
+                gap = self._open_past_liquidation(side_now, bar_open)
+                stop_armed = sl_pierce_armed and sl_trigger_px > 0
+                range_reaches = (
+                    self._run_liq_px > 0
+                    and (
+                        (lo <= self._run_liq_px)
+                        if side_now == "long"
+                        else (hi >= self._run_liq_px)
+                    )
+                )
+                if gap or (range_reaches and not stop_armed):
+                    _book_close(
+                        idx, 1.0, self._run_liq_px, 0.0, "venue_liquidation",
+                        mark_price, avg_cost, fee_pct=0.0, decision_bar=None,
+                        timing="intrabar_trigger_fill",
+                    )
+
+            if (
                 walk_mode
                 and position != 0
                 and sl_pierce_armed
@@ -4278,6 +4709,11 @@ class Backtester:
                         commission = cost * self.commission_pct
                         cash -= cost + commission
                     position = 0.0
+                    self._note_close_sizing(
+                        "long" if qty_before > 0 else "short",
+                        abs(qty_before), avg_before, effective_price,
+                        commission, abs(qty_before),
+                    )
                     if current_trade:
                         current_trade.close(idx, effective_price)
                         gross_realized = current_trade.pnl
@@ -4294,7 +4730,7 @@ class Backtester:
                     sl_high_water_px = 0.0
                     sl_pierce_armed = False
                     scale.reset()
-                    self._run_position_regime = ""
+                    self._clear_position_stamps()
                     if rec is not None:
                         rec.record(
                             'close', bar=idx, decision_bar=None,
@@ -4313,6 +4749,7 @@ class Backtester:
                     side_now, scale.geom_cost(avg_cost), entry_atr_value,
                     self._run_position_regime, mark_price, None,
                     sl_trigger_px, sl_high_water_px, False, event_date=idx,
+                    liq_anchor=avg_cost,
                 )
                 if not walk_mode and self._sl_hit(side_now, mark_price, sl_trigger_px):
                     pending_signal_sl_close = True
@@ -4342,55 +4779,11 @@ class Backtester:
                         sl_trigger_px = candidate
                 if not walk_mode and self._sl_hit("short", mark_price, sl_trigger_px):
                     pending_signal_sl_close = True
-            # Circuit breaker override (highest priority)
-            if self._cb_active and position != 0 and not pending_signal_sl_close:
-                pending_signal_sl_close = True
-
-            # Check insolvency after this bar's signal/close/stop paths have
-            # had a chance to book an exit. A pending next-open stop is also
-            # allowed to execute before terminal liquidation.
-            terminal_liquidation_allowed = (
-                self._margin_per_trade_usd is not None or position < 0
-            )
-            if position != 0 and terminal_liquidation_allowed and not pending_signal_sl_close:
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    unrealized_pnl = position * (mark_price - avg_cost)
-                    terminal_equity = (
-                        cash + self._margin_locked + unrealized_pnl
-                        - (self._notional if position < 0 else 0)
-                    )
-                else:
-                    terminal_equity = cash + position * mark_price
-                if terminal_equity <= 0:
-                    if rec is not None:
-                        rec.mark_interval_end(
-                            bar=idx, cash=cash, position=position,
-                            avg_cost=avg_cost, hold=hold,
-                        )
-                    _book_close(
-                        idx, 1.0, mark_price, self.slippage_pct,
-                        "liquidation", mark_price, mark_price,
-                        record_kind="terminal_liquidation",
-                    )
-                    cash = 0.0
-                    if rec is not None and rec.events:
-                        rec.events[-1]["cash_after"] = cash
-                    terminal_insolvency = True
-                    equity_curve[-1]["equity"] = 0.0
-                    for future_idx in df.index[i + 1:]:
-                        equity_curve.append({"date": future_idx, "equity": 0.0})
-                    break
-
-            # #1271: promote any surviving trigger to a carried, pierce-
-            # eligible level for the next bar (plain-path mirror of the
-            # open/close path's pre-continue arming).
-            if position != 0:
-                sl_pierce_armed = True
 
             if position != 0:
                 sl_pierce_armed = True
 
-        if rec is not None and not terminal_insolvency:
+        if rec is not None:
             rec.mark_interval_end(bar=df.index[-1], cash=cash, position=position,
                                   avg_cost=avg_cost, hold=hold)
         if position != 0:
@@ -4401,21 +4794,18 @@ class Backtester:
                 final_price = df["close"].iloc[-1] * (1 - self.slippage_pct)
                 proceeds = position * final_price
                 commission = proceeds * self.commission_pct
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    realized_pnl = position * (final_price - avg_cost)
-                    cash += self._margin_locked + realized_pnl - commission
-                else:
-                    cash += proceeds - commission
+                cash += proceeds - commission
             else:
                 final_price = df["close"].iloc[-1] * (1 + self.slippage_pct)
                 cost = abs(position) * final_price
                 commission = cost * self.commission_pct
-                if self._margin_per_trade_usd and self._margin_locked > 0:
-                    realized_pnl = abs(position) * (avg_cost - final_price)
-                    cash += self._margin_locked - cost - commission
-                else:
-                    cash -= cost + commission
+                cash -= cost + commission
             position = 0.0
+            self._note_close_sizing(
+                "long" if qty_before > 0 else "short",
+                abs(qty_before), avg_before, final_price, commission, abs(qty_before),
+            )
+
             if current_trade:
                 current_trade.close(df.index[-1], final_price)
                 gross_realized = current_trade.pnl
@@ -4426,11 +4816,9 @@ class Backtester:
                 _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
                             exit_fee=commission, reason="end_of_data",
                             qty_frac=eod_qty_frac,
-                            # #1276: end-of-data is the final leg.
                             true_up_entry_fee=scale.scale_in_count > 0)
                 entry_fee_allocated = current_trade.entry_fee
                 current_trade.scale_in_adds = scale.scale_in_count
-                self._close_reason_counts["end_of_data"] = self._close_reason_counts.get("end_of_data", 0) + 1
                 trades.append(current_trade)
             if rec is not None:
                 rec.record(
@@ -4445,10 +4833,6 @@ class Backtester:
                     synthetic=True,
                 )
 
-        # The last in-loop snapshot is pre-close; replace it with terminal
-        # cash so EOD fills, fees, and slippage are reflected in return and DD.
-        if equity_curve:
-            equity_curve[-1]["equity"] = cash
         final_equity = cash
         equity_df = pd.DataFrame(equity_curve).set_index("date")
 
@@ -4473,6 +4857,9 @@ class Backtester:
             "close_validation": self._close_validation.to_dict(),
             "trades": [t.to_dict() for t in trades],
         })
+        margin_block = self._margin_metrics()
+        if margin_block is not None:
+            metrics["margin"] = margin_block
         if self._execution is not None:
             metrics["execution"] = {
                 "spec": dict(self._execution),
@@ -4492,18 +4879,21 @@ class Backtester:
         if stop_seed_dropped:
             metrics["stop_seed_dropped"] = True
         if risk_mode:
-            # #1268: surface the fail-closed skips so a run that took fewer
-            # entries than the signal produced is auditable.
             metrics["risk_per_trade_pct"] = self.risk_per_trade_pct
             metrics["risk_sizing_skipped_entries"] = risk_skipped_entries
         if self.allow_scale_in:
-            # #1276: add-leg telemetry — adds create no Trade rows (live #T
-            # parity), so surface them here for auditability.
             metrics["scale_in_adds"] = scale_in_adds_total
             metrics["scale_in_added_notional_usd"] = round(
                 scale_in_added_notional_total, 6,
             )
 
+        funding_block = _funding_block_from_frame(
+            df, self.platform, self.strategy_type, funding_unpriced_held_hours)
+        if funding_block is not None:
+            metrics["funding"] = funding_block
+            metrics["funding_unpriced_held_hours"] = int(funding_unpriced_held_hours)
+        if save and charge_funding_rejected(metrics):
+            raise FundingIncompleteError(metrics)
         if save:
             store_backtest_result(metrics)
         if rec is not None:
@@ -4511,24 +4901,28 @@ class Backtester:
 
         return metrics
 
-    def _risk_entry_fraction(self, atr_series: Optional[pd.Series], idx,
-                             price: float) -> Optional[float]:
-        pct = float(self.risk_per_trade_pct or 0)
-        if pct <= 0 or price <= 0:
-            return None
-        dist = None
+    def _risk_stop_distance(self, atr_series: Optional[pd.Series], idx,
+                            price: float) -> Optional[float]:
         kind, field_name = self._risk_owner
         if kind == "atr":
             atr = self._stamp_entry_atr(atr_series, idx, price)
             if atr <= 0:
                 return None
-            dist = float(getattr(self, field_name)) * atr
-        elif kind == "pct":
-            dist = price * float(getattr(self, field_name))
+            return float(getattr(self, field_name)) * atr
+        if kind == "pct":
+            return price * float(getattr(self, field_name))
+        return None
+
+    def _risk_entry_fraction(self, atr_series: Optional[pd.Series], idx,
+                             price: float, cap: bool = True) -> Optional[float]:
+        pct = float(self.risk_per_trade_pct or 0)
+        if pct <= 0 or price <= 0:
+            return None
+        dist = self._risk_stop_distance(atr_series, idx, price)
         if dist is None or dist <= 0:
             return None
         fraction = (pct / 100.0) * price / dist
-        if fraction > 1.0:
+        if cap and fraction > 1.0:
             if not self._risk_cap_warned:
                 self._risk_cap_warned = True
                 print(
@@ -4542,6 +4936,196 @@ class Backtester:
             fraction = 1.0
         return fraction
 
+    def _reset_sizing_state(self, initial_cash: float) -> None:
+        self._sizing_cash = float(initial_cash)
+        self._used_margin = 0.0
+        self._sized_qty = 0.0
+        self._run_liq_px = 0.0
+        self._tier_refused = False
+        self._margin_stats = {
+            "entries_capped": 0, "entries_skipped_below_min": 0,
+            "adds_beyond_strategy_margin": 0, "max_used_margin": 0.0,
+            "clamp_count": 0, "liquidation_count": 0, "tier_refusals": 0,
+            "pool_cap_unverified": False,
+        }
+
+    def _sizing_cash_argument(self) -> float:
+        sizing = self._perps_sizing
+        if sizing["budget_source"] != "shared_wallet_pool":
+            return self._sizing_cash
+        pool = sizing.get("pool_available_margin")
+        if pool is None:
+            self._margin_stats["pool_cap_unverified"] = True
+            margin = float(sizing["margin_per_trade_usd"] or 0.0)
+            return margin if margin > 0 else self._sizing_cash
+        return float(pool)
+
+    def _tier_blocks(self, notional: float) -> bool:
+        if self._liquidation_model != "venue_isolated" or self._venue_margin is None:
+            return False
+        _tier, unmodeled = margin_tier_for_notional(self._venue_margin["tiers"], notional)
+        if unmodeled:
+            self._margin_stats["tier_refusals"] += 1
+            return True
+        return False
+
+    def _live_notional(self, price: float, stop_distance: Optional[float],
+                       entry_mult: float) -> Optional[float]:
+        sizing = self._perps_sizing
+        if sizing is None or price <= 0:
+            return None
+        cash_arg = self._sizing_cash_argument()
+        risk = float(self.risk_per_trade_pct or 0)
+        capped = False
+        if risk > 0:
+            if stop_distance is None or stop_distance <= 0:
+                return None
+            raw = (cash_arg * risk / 100.0) / stop_distance * price
+            max_notional = cash_arg * sizing["exchange_leverage"]
+            notional = raw if raw <= max_notional else max_notional
+            capped = raw > max_notional
+        else:
+            notional = perps_open_notional(
+                cash_arg, sizing["sizing_leverage"], sizing["exchange_leverage"],
+                float(sizing["margin_per_trade_usd"] or 0.0),
+            )
+        notional *= entry_mult if entry_mult > 0 else 1.0
+        if notional < 1.0:
+            self._margin_stats["entries_skipped_below_min"] += 1
+            return None
+        if self._tier_blocks(notional):
+            return None
+        if capped:
+            self._margin_stats["entries_capped"] += 1
+        return notional
+
+    def _note_open_sizing(self, notional: float, fee: float, qty: float = 0.0) -> None:
+        if self._perps_sizing is None:
+            return
+        self._sizing_cash -= fee
+        lev = self._perps_sizing["exchange_leverage"]
+        self._used_margin += notional / lev if lev > 0 else notional
+        if qty > 0:
+            self._sized_qty = qty
+        if self._used_margin > self._margin_stats["max_used_margin"]:
+            self._margin_stats["max_used_margin"] = self._used_margin
+
+    def _note_add_sizing(self, notional: float, fee: float, qty: float = 0.0) -> None:
+        if self._perps_sizing is None:
+            return
+        lev = self._perps_sizing["exchange_leverage"]
+        add_margin = notional / lev if lev > 0 else notional
+        free_margin = self._sizing_cash - self._used_margin
+        if add_margin > free_margin + 1e-9:
+            self._margin_stats["adds_beyond_strategy_margin"] += 1
+        self._sizing_cash -= fee
+        self._used_margin += add_margin
+        if qty > 0:
+            self._sized_qty += qty
+        if self._used_margin > self._margin_stats["max_used_margin"]:
+            self._margin_stats["max_used_margin"] = self._used_margin
+
+    def _note_close_sizing(self, side: str, qty: float, entry_px: float,
+                           exit_px: float, fee: float, qty_before: float) -> None:
+        if self._perps_sizing is None or qty <= 0 or qty_before <= 0:
+            return
+        if side == "long":
+            gross = qty * (exit_px - entry_px)
+        else:
+            gross = qty * (entry_px - exit_px)
+        self._sizing_cash += gross - fee
+        if abs(qty_before - qty) <= 1e-9:
+            self._used_margin = 0.0
+            self._sized_qty = 0.0
+        else:
+            self._used_margin = max(0.0, self._used_margin * (1.0 - qty / qty_before))
+            self._sized_qty = max(0.0, qty_before - qty)
+
+    def _note_funding(self, funding_cash: float) -> None:
+        if self._perps_sizing is None:
+            return
+        self._sizing_cash += funding_cash
+
+    def _refresh_liq(self, side: str, anchor: float, qty: float) -> float:
+        """Liquidation price from the entry anchor and this quantity's margin.
+
+        The level does not read the bar close. Only the first margin tier is
+        modeled; position value at the computed price selects that tier.
+        """
+        self._run_liq_px = 0.0
+        if self._liquidation_model != "venue_isolated" or qty <= 0 or anchor <= 0:
+            return 0.0
+        if self._venue_margin is None or self._used_margin <= 0:
+            return 0.0
+        tiers = self._venue_margin["tiers"]
+        ordered = sorted(tiers, key=lambda t: float(t["lower_bound"]))
+        if not ordered:
+            return 0.0
+        liq = isolated_liquidation_price(
+            side, anchor, abs(qty), self._used_margin, ordered[0]["max_leverage"])
+        if liq <= 0:
+            return 0.0
+        _tier, unmodeled = margin_tier_for_notional(tiers, abs(qty) * liq)
+        if unmodeled:
+            if not self._tier_refused:
+                self._margin_stats["tier_refusals"] += 1
+                self._tier_refused = True
+            return 0.0
+        self._run_liq_px = liq
+        return liq
+
+    def _clamp_trigger(self, side: str, trigger: float, event_date=None) -> float:
+        if self._liquidation_model != "venue_isolated" or trigger <= 0:
+            return trigger
+        clamped, did = clamp_stop_inside_liquidation(side, trigger, self._run_liq_px)
+        if did:
+            self._margin_stats["clamp_count"] += 1
+            self._emit_stop_event(
+                "liquidation_clamp", date=str(event_date), side=side,
+                trigger=clamped, previous=trigger, liquidation_px=self._run_liq_px,
+            )
+        return clamped
+
+    def _open_past_liquidation(self, side: str, open_px: float) -> bool:
+        liq = self._run_liq_px
+        if liq <= 0 or open_px <= 0:
+            return False
+        if side == "long":
+            return open_px <= liq
+        if side == "short":
+            return open_px >= liq
+        return False
+
+    def _margin_metrics(self) -> Optional[dict]:
+        if self._perps_sizing is None and self._liquidation_model == "none":
+            return None
+        sizing = self._perps_sizing or {}
+        formula = "unverified"
+        if self._venue_margin and self._venue_margin.get("formula_verified"):
+            formula = "verified"
+        return {
+            "sizing_model": "legacy_cash_fraction" if self._perps_sizing is None else "live_perps",
+            "exchange_leverage": sizing.get("exchange_leverage"),
+            "sizing_leverage": sizing.get("sizing_leverage"),
+            "margin_per_trade_usd": sizing.get("margin_per_trade_usd"),
+            "margin_mode": sizing.get("margin_mode"),
+            "budget_source": sizing.get("budget_source"),
+            "pool_evidence": sizing.get("pool_evidence"),
+            "pool_cap_unverified": bool(self._margin_stats["pool_cap_unverified"]),
+            "entries_capped_by_exchange_leverage": self._margin_stats["entries_capped"],
+            "entries_skipped_below_1_usd": self._margin_stats["entries_skipped_below_min"],
+            "adds_beyond_strategy_margin": self._margin_stats["adds_beyond_strategy_margin"],
+            "max_used_margin": round(self._margin_stats["max_used_margin"], 6),
+            "liquidation_model": self._liquidation_model,
+            "liquidation_formula": formula,
+            "trigger_source": "candle_proxy" if self._liquidation_model == "venue_isolated" else "none",
+            "liquidation_settlement": (
+                "research_assumption" if self._liquidation_model == "venue_isolated" else "none"),
+            "clamp_count": self._margin_stats["clamp_count"],
+            "liquidation_count": self._margin_stats["liquidation_count"],
+            "tier_refusals": self._margin_stats["tier_refusals"],
+        }
+
     def _stamp_entry_atr(self, atr_series: Optional[pd.Series], idx,
                          entry_price: float) -> float:
         if atr_series is None or entry_price <= 0:
@@ -4549,14 +5133,6 @@ class Backtester:
         try:
             pos = int(atr_series.index.get_loc(idx))
         except (KeyError, TypeError, ValueError):
-            # Missing label, or a non-unique index where get_loc returns a
-            # slice/mask — no unambiguous prior bar; treat as no usable ATR.
-            return 0.0
-        if pos < 1:
-            return 0.0
-        try:
-            value = float(atr_series.iloc[pos - 1])
-        except (TypeError, ValueError):
             return 0.0
         if pos < 1:
             return 0.0
@@ -4586,9 +5162,7 @@ class Backtester:
                                    bars_held: int = 0,
                                    zscore_series: Optional[pd.Series] = None,
                                    avwap_series: Optional[pd.Series] = None,
-                                   position_anchored_avwap: Optional[float] = None,
-                                   regime_pending_label: str = "",
-                                   regime_pending_count: int = 0
+                                   resting_rule: Optional[dict] = None
                                    ) -> Tuple[float, str, float]:
         evaluate, _list_strategies = _load_close_registry()
         side = "long" if position > 0 else "short"
@@ -4600,9 +5174,6 @@ class Backtester:
             "initial_quantity": float(initial_quantity or abs(position)),
             "entry_atr": float(entry_atr_value),
             "regime": str(position_regime or ""),
-            "regime_applied_label": str(position_regime or ""),
-            "regime_pending_label": str(regime_pending_label or ""),
-            "regime_pending_count": int(regime_pending_count or 0),
             "bars_held": int(bars_held),
         }
         if self._resting_tp_model:
@@ -4611,6 +5182,10 @@ class Backtester:
             "mark_price": float(mark_price),
             "regime": str(market_regime or ""),
         }
+        if resting_rule is not None:
+            market_dict["resting_tp_rule"] = resting_rule
+        self._last_resting_fill = None
+        self._winning_resting_fill = None
         if atr_series is not None:
             try:
                 live_atr = float(atr_series.loc[idx])
@@ -4629,32 +5204,37 @@ class Backtester:
 
         if avwap_series is not None:
             try:
-                series_avwap = float(avwap_series.loc[idx])
+                avwap_value = float(avwap_series.loc[idx])
             except (KeyError, TypeError, ValueError):
-                series_avwap = float("nan")
-            if series_avwap == series_avwap and series_avwap > 0:
-                market_dict["avwap"] = series_avwap
-        if "avwap" not in market_dict and position_anchored_avwap is not None:
-            try:
-                anchored_avwap = float(position_anchored_avwap)
-            except (TypeError, ValueError):
-                anchored_avwap = 0.0
-            if math.isfinite(anchored_avwap) and anchored_avwap > 0:
-                market_dict["avwap"] = anchored_avwap
+                avwap_value = float("nan")
+            if avwap_value == avwap_value and avwap_value > 0:
+                market_dict["avwap"] = avwap_value
 
         best = 0.0
         best_reason = ""
         best_fill = 0.0
+        best_resting_fill: Optional[dict] = None
         for name in self.close_strategies:
             params = self.close_params.get(name)
             result = evaluate(name, position_dict, market_dict, params)
             fraction = float(result.get("close_fraction", 0.0) or 0.0)
+            if resting_rule is not None and isinstance(result.get("resting_fill"), dict) and (
+                    fraction > best or self._last_resting_fill is None):
+                self._last_resting_fill = result["resting_fill"]
             if fraction > best:
                 best = fraction
                 best_reason = str(result.get("reason") or name)
                 best_fill = float(result.get("tier_fill_price", 0.0) or 0.0)
+                evidence = result.get("resting_fill")
+                best_resting_fill = (
+                    copy.deepcopy(evidence)
+                    if resting_rule is not None and isinstance(evidence, dict)
+                    else None
+                )
                 if best >= 1.0:
+                    self._winning_resting_fill = best_resting_fill
                     return 1.0, best_reason, best_fill
+        self._winning_resting_fill = best_resting_fill
         return min(max(best, 0.0), 1.0), best_reason, best_fill
 
     def _initial_sl_trigger(self, side: str, avg_cost: float,
@@ -4853,6 +5433,9 @@ class Backtester:
                     trigger = 0.0
                 fraction = ff
                 pierce = trigger > 0
+        if self._liquidation_model == "venue_isolated" and self._sized_qty > 0:
+            self._refresh_liq(side, anchor, self._sized_qty)
+            trigger = self._clamp_trigger(side, trigger, event_date)
         self._emit_stop_event(
             "arm", date=str(event_date), side=side, geometry=kind, anchor=anchor,
             entry_atr=entry_atr, regime=label, fraction=fraction, mark=mark,
@@ -4862,7 +5445,7 @@ class Backtester:
     def _hl_trail_step(self, side: str, anchor: float, entry_atr: float, label: str,
                        mark: float, post_tp_trail_mult: Optional[float],
                        trigger: float, high_water: float, bypass_min_move: bool,
-                       event_date=None) -> Tuple[float, float]:
+                       event_date=None, liq_anchor: float = 0.0) -> Tuple[float, float]:
         tf = self._hl_trailing_fraction(anchor, entry_atr, label, post_tp_trail_mult)
         if tf <= 0:
             return trigger, high_water
@@ -4870,6 +5453,10 @@ class Backtester:
             side, mark, high_water if high_water > 0 else anchor, tf,
             self.trailing_stop_min_move_pct, trigger, bypass_min_move=bypass_min_move)
         new_trigger = candidate if replaced else trigger
+        if self._liquidation_model == "venue_isolated" and self._sized_qty > 0:
+            basis = liq_anchor if liq_anchor > 0 else anchor
+            self._refresh_liq(side, basis, self._sized_qty)
+            new_trigger = self._clamp_trigger(side, new_trigger, event_date)
         self._emit_stop_event(
             "trail", date=str(event_date), side=side, anchor=anchor, entry_atr=entry_atr,
             regime=label, fraction=tf, mark=mark, post_tp_trail_mult=post_tp_trail_mult,
@@ -5015,25 +5602,20 @@ class Backtester:
 
         total_trades = len(trades)
         if total_trades > 0:
-            winning = [t for t in trades if t.pnl > 0]
-            losing = [t for t in trades if t.pnl <= 0]
+            def _trade_net_pnl(t):
+                return t.pnl + (getattr(t, "funding_pnl", 0.0) or 0.0)
+
+            winning = [t for t in trades if _trade_net_pnl(t) > 0]
+            losing = [t for t in trades if _trade_net_pnl(t) <= 0]
             win_rate = len(winning) / total_trades
 
-            gross_profit = sum(t.pnl for t in winning) if winning else 0
-            gross_loss = abs(sum(t.pnl for t in losing)) if losing else 0
-            # All-win legs (no losing trades → gross_loss == 0) have an
-            # undefined profit factor. Report None, never float("inf"): a NaN/inf
-            # would serialize as the nonstandard JSON `Infinity` token that strict
-            # parsers (incl. Go json.Unmarshal) reject.
+            gross_profit = sum(_trade_net_pnl(t) for t in winning) if winning else 0
+            gross_loss = abs(sum(_trade_net_pnl(t) for t in losing)) if losing else 0
             profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
 
-            # Net return fraction per leg (net t.pnl over entry notional), so
-            # avg_win/avg_loss share the net convention with the win/loss
-            # buckets above — t.pnl_pct is GROSS and would misreport a
-            # gross-winner/net-loser bucketed as a loss (#1241).
             def _net_pnl_pct(t):
                 notional = t.shares * t.entry_price
-                return (t.pnl / notional) if notional > 0 else 0.0
+                return (_trade_net_pnl(t) / notional) if notional > 0 else 0.0
             avg_win = np.mean([_net_pnl_pct(t) for t in winning]) if winning else 0
             avg_loss = np.mean([_net_pnl_pct(t) for t in losing]) if losing else 0
         else:
@@ -5063,7 +5645,6 @@ class Backtester:
             "total_trades": total_trades,
             "avg_win_pct": round(avg_win * 100, 2),
             "avg_loss_pct": round(avg_loss * 100, 2),
-            "close_reason_counts": dict(self._close_reason_counts),
             "liquidated": liquidated,
         }
 

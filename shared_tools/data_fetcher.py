@@ -8,6 +8,7 @@ import requests
 import ccxt
 import pandas as pd
 
+from closed_bar import TIMESTAMP_KIND_OPEN, declare_frame_cadence
 from storage import store_ohlcv, load_ohlcv
 
 
@@ -53,6 +54,8 @@ def _blofin_adapter():
 
 OHLCV_TIMESTAMP_KIND = "open"
 
+OHLCV_TIMESTAMP_KIND = TIMESTAMP_KIND_OPEN
+
 
 def get_exchange(exchange_id: str = "binanceus") -> ccxt.Exchange:
     exchange_class = getattr(ccxt, exchange_id)
@@ -94,7 +97,7 @@ def fetch_ohlcv(
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("datetime", inplace=True)
 
-    return df
+    return declare_frame_cadence(df, timeframe, OHLCV_TIMESTAMP_KIND)
 
 
 def fetch_ohlcv_blofin(
@@ -243,7 +246,7 @@ def fetch_full_history(
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("datetime", inplace=True)
 
-    return df
+    return declare_frame_cadence(df, timeframe, OHLCV_TIMESTAMP_KIND)
 
 
 
@@ -435,7 +438,7 @@ def load_cached_data(
             f"{first_label}..{last_label} does not cover requested period "
             f"{start_date or 'start'}..{end_date or 'now'}"
         )
-    return df
+    return declare_frame_cadence(df, timeframe, OHLCV_TIMESTAMP_KIND)
 
 
 def _timeframe_duration_ms(timeframe: str) -> int:
