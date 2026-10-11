@@ -12,11 +12,14 @@ Environment variables:
     OKX_SANDBOX=1      — use OKX demo trading environment
 """
 
+import json
 import os
 import sys
 import math
 import time
 from typing import Tuple
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'shared_tools'))
 
@@ -76,6 +79,49 @@ class OKXExchangeAdapter:
             self._exchange.load_markets()
             self._markets_loaded = True
 
+    def _normalize_symbol(self, symbol: str) -> str:
+        base = symbol.split("/")[0].split(":")[0].strip().upper()
+        return base
+
+    def _okx_public_json(self, endpoint: str, params: dict) -> dict:
+        url = f"https://www.okx.com{endpoint}?{urlencode(params)}"
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        })
+        with urlopen(req, timeout=15) as resp:
+            return json.load(resp)
+
+    def _okx_public_bar(self, interval: str) -> str:
+        if interval and interval[-1] in {"h", "d", "w"} and interval[:-1].isdigit():
+            return interval[:-1] + interval[-1].upper()
+        return interval
+
+    def _fetch_public_ohlcv(self, inst_id: str, interval: str, limit: int) -> list:
+        params = {"instId": inst_id, "bar": self._okx_public_bar(interval), "limit": limit}
+        for endpoint in ("/api/v5/market/candles", "/api/v5/market/history-candles"):
+            try:
+                payload = self._okx_public_json(endpoint, params)
+            except Exception:
+                continue
+            rows = payload.get("data") or []
+            candles = []
+            for row in reversed(rows):
+                try:
+                    candles.append([
+                        int(row[0]),
+                        float(row[1]),
+                        float(row[2]),
+                        float(row[3]),
+                        float(row[4]),
+                        float(row[5]),
+                    ])
+                except (TypeError, ValueError, IndexError):
+                    continue
+            if candles:
+                return candles
+        return []
+
     def get_spot_price(self, symbol: str) -> float:
         """Get current spot price for a coin (e.g. 'BTC')."""
         for suffix in ("/USDT", "/USD", "/USDC"):
@@ -109,9 +155,13 @@ class OKXExchangeAdapter:
         pair = f"{symbol}/USDT"
         try:
             candles = self._exchange.fetch_ohlcv(pair, interval, limit=limit)
-            return candles  # ccxt already returns [ts, o, h, l, c, v]
+            if candles:
+                return candles  # ccxt already returns [ts, o, h, l, c, v]
+        except TypeError:
+            pass
         except Exception:
             return []
+        return self._fetch_public_ohlcv(f"{self._normalize_symbol(symbol)}-USDT", interval, limit)
 
     def get_ohlcv_closes(self, symbol: str, interval: str = "1h", limit: int = 200) -> list:
         """Fetch OHLCV and return just close prices (for HTF filter compatibility)."""
@@ -123,9 +173,13 @@ class OKXExchangeAdapter:
         pair = f"{symbol}/USDT:USDT"
         try:
             candles = self._exchange.fetch_ohlcv(pair, interval, limit=limit)
-            return candles
+            if candles:
+                return candles
+        except TypeError:
+            pass
         except Exception:
             return []
+        return self._fetch_public_ohlcv(f"{self._normalize_symbol(symbol)}-USDT-SWAP", interval, limit)
 
     def get_funding_rate(self, symbol: str) -> float:
         """Get current predicted funding rate for a perpetual swap.

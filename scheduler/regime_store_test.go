@@ -338,12 +338,12 @@ func TestRegimeStorePhaseBudgetSealsStragglers(t *testing.T) {
 
 func TestRegimeBundleCheckArgs(t *testing.T) {
 	req := regimeBundleRequest{
-		Key:        regimeBundleKey{Platform: "hyperliquid", Symbol: "BTC", Timeframe: "1h", SpecJSON: `{"default":{"period":14}}`},
+		Key:        regimeBundleKey{Platform: "hyperliquid", InstType: "swap", Symbol: "BTC", Timeframe: "1h", SpecJSON: `{"default":{"period":14}}`},
 		OhlcvLimit: 200,
 		MinBars:    30,
 	}
 	args := strings.Join(regimeBundleCheckArgs(req), " ")
-	for _, want := range []string{"--platform hyperliquid", "--symbol BTC", "--timeframe 1h", "--ohlcv-limit 200", "--min-bars 30"} {
+	for _, want := range []string{"--platform hyperliquid", "--symbol BTC", "--timeframe 1h", "--inst-type swap", "--ohlcv-limit 200", "--min-bars 30"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("args missing %q: %s", want, args)
 		}

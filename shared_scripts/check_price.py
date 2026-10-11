@@ -4,11 +4,104 @@ Quick price fetcher for the Go scheduler.
 Fetches current prices for given symbols.
 
 Usage: python3 check_price.py BTC/USDT SOL/USDT
+
+Routing:
+- pair symbols (e.g. BTC/USDT) are fetched via BinanceUS
+- bare spot coins (e.g. BTC) are fetched via OKX
 """
 
-import sys
 import json
+import sys
 import traceback
+
+
+_EXCHANGES = {}
+_TICKERS = {}
+
+
+def _exchange(name):
+    if name not in _EXCHANGES:
+        import ccxt
+        _EXCHANGES[name] = getattr(ccxt, name)({"enableRateLimit": True})
+    return _EXCHANGES[name]
+
+
+def _tickers(name):
+    if name not in _TICKERS:
+        exchange = _exchange(name)
+        try:
+            _TICKERS[name] = exchange.fetch_tickers()
+        except Exception:
+            _TICKERS[name] = None
+    return _TICKERS[name]
+
+
+def _last_price(ticker):
+    if not isinstance(ticker, dict):
+        return 0.0
+    last = ticker.get("last") or 0
+    try:
+        return float(last)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fetch_binanceus(symbol):
+    tickers = _tickers("binanceus") or {}
+    ticker = tickers.get(symbol)
+    if ticker:
+        price = _last_price(ticker)
+        if price > 0:
+            return price
+    ticker = _exchange("binanceus").fetch_ticker(symbol)
+    return _last_price(ticker)
+
+
+def _fetch_okx_spot(symbol):
+    tickers = _tickers("okx") or {}
+    for suffix in ("/USDT", "/USD", "/USDC"):
+        ticker = tickers.get(symbol + suffix)
+        if ticker:
+            price = _last_price(ticker)
+            if price > 0:
+                return price
+    exchange = _exchange("okx")
+    for suffix in ("/USDT", "/USD", "/USDC"):
+        try:
+            ticker = exchange.fetch_ticker(symbol + suffix)
+            price = _last_price(ticker)
+            if price > 0:
+                return price
+        except Exception:
+            continue
+    return 0.0
+
+
+def fetch_price(symbol):
+    # Preserve the original symbol as the JSON key.
+    if "/" in symbol:
+        try:
+            price = _fetch_binanceus(symbol)
+            if price > 0:
+                return price
+        except Exception:
+            pass
+        try:
+            return _fetch_okx_spot(symbol.split("/", 1)[0])
+        except Exception:
+            return 0.0
+
+    try:
+        price = _fetch_okx_spot(symbol)
+        if price > 0:
+            return price
+    except Exception:
+        pass
+
+    try:
+        return _fetch_binanceus(symbol)
+    except Exception:
+        return 0.0
 
 
 def main():
@@ -17,26 +110,24 @@ def main():
         print(json.dumps({}))
         return
 
+    prices = {}
+    for symbol in symbols:
+        try:
+            price = fetch_price(symbol)
+            if price > 0:
+                prices[symbol] = round(price, 2)
+            else:
+                print(f"Failed to fetch {symbol}: no positive price", file=sys.stderr)
+        except Exception as e:
+            print(f"Failed to fetch {symbol}: {e}", file=sys.stderr)
+
+    print(json.dumps(prices))
+
+
+if __name__ == "__main__":
     try:
-        import ccxt
-        exchange = ccxt.binanceus({"enableRateLimit": True})
-
-        prices = {}
-        for symbol in symbols:
-            try:
-                ticker = exchange.fetch_ticker(symbol)
-                prices[symbol] = round(ticker["last"], 2)
-            except Exception as e:
-                print(f"Failed to fetch {symbol}: {e}", file=sys.stderr)
-                # Omit failed symbols so Go can detect missing prices
-
-        print(json.dumps(prices))
-
+        main()
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         print(json.dumps({}))
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

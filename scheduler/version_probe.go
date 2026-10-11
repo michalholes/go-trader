@@ -123,7 +123,7 @@ var strategyTunerSchemaProbeArgv = []string{
 
 var simulateStrategyProbeArgv = []string{"--probe-only"}
 
-const probeTimeout = 15 * time.Second
+const probeTimeout = 60 * time.Second
 
 // probeCheckScripts invokes each unique check script configured in cfg
 // with --probe-only. Returns nil if every script accepts the probe argv;

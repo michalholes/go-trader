@@ -191,6 +191,38 @@ func runPythonReadOnly(script string, args []string) ([]byte, []byte, error) {
 	return runPython(shutdownReadOnlyCtx, script, args, nil)
 }
 
+// runPythonReadOnlyBestEffort mirrors runPythonReadOnly but returns quickly
+// when the shared Python semaphore is saturated. Callers should treat a busy
+// semaphore like a cache miss and fall back to stale data.
+func runPythonReadOnlyBestEffort(script string, args []string, timeout time.Duration) ([]byte, []byte, error) {
+	select {
+	case pythonSemaphore <- struct{}{}:
+		defer func() { <-pythonSemaphore }()
+	default:
+		return nil, nil, fmt.Errorf("python semaphore busy")
+	}
+
+	ctx, cancel := context.WithTimeout(shutdownReadOnlyCtx, timeout)
+	defer cancel()
+
+	cmdArgs := append([]string{script}, args...)
+	cmd := exec.CommandContext(ctx, ".venv/bin/python3", cmdArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		if cmd.Process != nil {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return stdout.Bytes(), stderr.Bytes(), &pythonScriptTimeoutError{d: timeout}
+	}
+	return stdout.Bytes(), stderr.Bytes(), err
+}
+
 // runPythonReadOnlyWithStdin mirrors runPythonReadOnly for scripts that
 // receive their input over stdin (currently RunOptionsCheckWithStdin).
 func runPythonReadOnlyWithStdin(script string, args []string, stdinData []byte) ([]byte, []byte, error) {
@@ -1317,8 +1349,43 @@ func parseRobinhoodPositionsOutput(stdout []byte, stderrStr string, runErr error
 }
 
 // FetchPrices runs check_price.py and returns a map of symbol→price.
+// It bypasses the shared Python semaphore so price fetches do not wait
+// behind long-running strategy checks.
 func FetchPrices(symbols []string) (map[string]float64, error) {
-	stdout, stderr, err := RunPythonScript("shared_scripts/check_price.py", symbols)
+	ctx, cancel := context.WithTimeout(context.Background(), scriptTimeout)
+	defer cancel()
+
+	cmdArgs := append([]string{"shared_scripts/check_price.py"}, symbols...)
+	cmd := exec.CommandContext(ctx, ".venv/bin/python3", cmdArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		if cmd.Process != nil {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil, fmt.Errorf("price fetch error: %w (stderr: %s)", &pythonScriptTimeoutError{d: scriptTimeout}, string(stderr.Bytes()))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("price fetch error: %w (stderr: %s)", err, string(stderr.Bytes()))
+	}
+
+	var prices map[string]float64
+	if err := json.Unmarshal(stdout.Bytes(), &prices); err != nil {
+		return nil, fmt.Errorf("parse prices: %w (stdout: %s)", err, string(stdout.Bytes()))
+	}
+	return prices, nil
+}
+
+// FetchPricesBestEffort runs check_price.py with a shorter timeout and
+// returns quickly if the shared Python semaphore is saturated. Callers
+// should tolerate a best-effort miss and fall back to stale marks.
+func FetchPricesBestEffort(symbols []string, timeout time.Duration) (map[string]float64, error) {
+	stdout, stderr, err := runPythonReadOnlyBestEffort("shared_scripts/check_price.py", symbols, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("price fetch error: %w (stderr: %s)", err, string(stderr))
 	}
@@ -1330,6 +1397,7 @@ func FetchPrices(symbols []string) (map[string]float64, error) {
 	return prices, nil
 }
 
+// FuturesMarkModePaperFallback is the mode string returned by
 // FuturesMarkModePaperFallback is the mode string returned by
 // fetch_futures_marks.py when live mode init failed (e.g. missing deps,
 // network error) and the script silently degraded to yfinance paper quotes.
@@ -1420,10 +1488,10 @@ type BloFinFill struct {
 
 // BloFinExecution is the execution block from check_blofin.py --execute output.
 type BloFinExecution struct {
-	Action string       `json:"action"`
-	Symbol string       `json:"symbol"`
-	Size   float64      `json:"size"`
-	Fill   *BloFinFill  `json:"fill,omitempty"`
+	Action string      `json:"action"`
+	Symbol string      `json:"symbol"`
+	Size   float64     `json:"size"`
+	Fill   *BloFinFill `json:"fill,omitempty"`
 }
 
 // BloFinExecuteResult is the top-level JSON from check_blofin.py --execute.
@@ -1444,9 +1512,9 @@ type BloFinCloseFill struct {
 
 // BloFinClose is the close block from close_blofin_position.py.
 type BloFinClose struct {
-	Symbol      string         `json:"symbol"`
+	Symbol      string           `json:"symbol"`
 	Fill        *BloFinCloseFill `json:"fill,omitempty"`
-	AlreadyFlat bool           `json:"already_flat,omitempty"`
+	AlreadyFlat bool             `json:"already_flat,omitempty"`
 }
 
 // BloFinCloseResult is the top-level JSON from close_blofin_position.py.

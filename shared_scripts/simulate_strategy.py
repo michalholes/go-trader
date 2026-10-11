@@ -10,6 +10,10 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
+if "--probe-only" in sys.argv:
+    print(json.dumps({"ok": True}))
+    sys.exit(0)
+
 import pandas as pd
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

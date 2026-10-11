@@ -270,8 +270,7 @@ func ParseSummaryFrequency(s string) (time.Duration, error) {
 }
 
 // ShouldPostSummary reports whether a channel summary should be posted at now.
-// hasTrades unconditionally forces a post (users want immediate trade
-// visibility). Otherwise the cadence is derived from freq:
+// Cadence is derived from freq:
 //   - freq empty or invalid → legacy default: continuous channels post every
 //     channel run; non-continuous channels post hourly.
 //   - freq "every"/"per_check"/"always" → every channel run.
@@ -281,9 +280,7 @@ func ParseSummaryFrequency(s string) (time.Duration, error) {
 // continuous is true for channel types (options/perps/futures) that legacy
 // posted every channel run.
 func ShouldPostSummary(freq string, continuous, hasTrades bool, lastPost, now time.Time) bool {
-	if hasTrades {
-		return true
-	}
+	_ = hasTrades
 	dur, err := ParseSummaryFrequency(freq)
 	if err != nil {
 		dur = -1

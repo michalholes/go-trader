@@ -122,18 +122,21 @@ def _fetch_dataframe(args):
     adapter_err = None
     try:
         adapter = _load_adapter(platform)
-        ohlcv_fn = getattr(adapter, "get_ohlcv", None)
+        if getattr(args, "inst_type", "spot") == "swap":
+            ohlcv_fn = getattr(adapter, "get_perp_ohlcv", None)
+        else:
+            ohlcv_fn = getattr(adapter, "get_ohlcv", None)
         if ohlcv_fn is not None:
             rows = ohlcv_fn(args.symbol, interval=args.timeframe, limit=args.ohlcv_limit)
         elif not args.allow_spot_fallback:
-            raise AttributeError(f"adapter for '{platform}' has no get_ohlcv")
+            raise AttributeError(f"adapter for '{platform}' has no OHLCV loader for {getattr(args, 'inst_type', 'spot')}")
     except Exception as e:  # noqa: BLE001 - converted to bundle error or fallback
         if not args.allow_spot_fallback:
             raise
         adapter_err = e
         rows = None
 
-    if not rows and args.allow_spot_fallback:
+    if not rows and args.allow_spot_fallback and getattr(args, "inst_type", "spot") != "swap":
         if adapter_err is not None:
             print(f"adapter.get_ohlcv failed: {adapter_err}", file=sys.stderr)
         import ccxt
@@ -144,7 +147,6 @@ def _fetch_dataframe(args):
     if not rows:
         return None
     return _make_dataframe(rows)
-
 
 def _window_adx_threshold(spec: dict) -> float:
     """ADX threshold for the 3-state view of one window spec."""
@@ -196,6 +198,7 @@ def main() -> None:
     parser.add_argument("--regime-windows-spec-json", required=True,
                         help="resolved window specs from Go regimeWindowsSpecJSON")
     parser.add_argument("--ohlcv-limit", type=int, default=200)
+    parser.add_argument("--inst-type", default="spot", choices=["spot", "swap"])
     parser.add_argument("--min-bars", type=int, default=30,
                         help="insufficient-data floor; mirrors the check scripts' candle guard")
     parser.add_argument("--allow-spot-fallback", action="store_true", default=False,

@@ -32,6 +32,11 @@ import (
 
 const regimeCheckScript = "shared_scripts/check_regime.py"
 
+// regimeBundleTimeout gives regime bundles a little more room than the
+// default 30s Python subprocess deadline. Regime fetch/calc is the noisiest
+// read-only path and can legitimately run longer on larger OKX spot rosters.
+const regimeBundleTimeout = 45 * time.Second
+
 // regimeBundleMinBars mirrors the five check scripts' insufficient-data guard
 // (len(candles) < 30 → error), so a signature the check would refuse to trade
 // on also produces no bundle.
@@ -58,13 +63,14 @@ const (
 // is a different raw computation.
 type regimeBundleKey struct {
 	Platform  string
+	InstType  string
 	Symbol    string
 	Timeframe string
 	SpecJSON  string
 }
 
 func (k regimeBundleKey) String() string {
-	return k.Platform + "/" + k.Symbol + "/" + k.Timeframe
+	return k.Platform + "/" + k.InstType + "/" + k.Symbol + "/" + k.Timeframe
 }
 
 // regimeBundleRequest is the work order for one check_regime.py invocation.
@@ -114,7 +120,7 @@ type regimeBundleOutput struct {
 // One full subprocess timeout wave plus headroom: without a cap, a storm of
 // N distinct hanging signatures would serialize to ceil(N/4)×scriptTimeout
 // ahead of the check fan-out. Var (not const) so tests can shrink it.
-var regimeStorePhaseBudget = scriptTimeout + 15*time.Second
+var regimeStorePhaseBudget = regimeBundleTimeout + 15*time.Second
 
 // RegimeStore is the two-layer global store, rebuilt empty every cycle.
 // Guarded by its own mutex: writes happen on the population goroutines before
@@ -207,6 +213,24 @@ func (s *RegimeStore) Snapshot() ([]*RegimeBundle, time.Time) {
 		if a.Symbol != b.Symbol {
 			return a.Symbol < b.Symbol
 		}
+		if a.InstType != b.InstType {
+			return a.InstType < b.InstType
+		}
+		if a.InstType != b.InstType {
+			return a.InstType < b.InstType
+		}
+		if a.InstType != b.InstType {
+			return a.InstType < b.InstType
+		}
+		if a.InstType != b.InstType {
+			return a.InstType < b.InstType
+		}
+		if a.InstType != b.InstType {
+			return a.InstType < b.InstType
+		}
+		if a.InstType != b.InstType {
+			return a.InstType < b.InstType
+		}
 		if a.Timeframe != b.Timeframe {
 			return a.Timeframe < b.Timeframe
 		}
@@ -249,6 +273,13 @@ func strategyRegimeDataPlatform(sc StrategyConfig) string {
 	return ""
 }
 
+func strategyRegimeDataInstType(sc StrategyConfig) string {
+	if sc.Type == "perps" {
+		return "swap"
+	}
+	return "spot"
+}
+
 // strategyArgSymbolTimeframe extracts the positional <symbol> <timeframe>
 // pair shared by every check-script argv shape (manual auto-fills the same
 // layout: ["hold", symbol, timeframe, ...]).
@@ -281,6 +312,7 @@ func strategyRegimeBundleRequest(sc StrategyConfig, rc *RegimeConfig) (regimeBun
 		return regimeBundleRequest{
 			Key: regimeBundleKey{
 				Platform:  platform,
+				InstType:  strategyRegimeDataInstType(sc),
 				Symbol:    strings.ToUpper(underlying), // check_options upper-cases the underlying
 				Timeframe: optionsRegimeTimeframe,
 				SpecJSON:  optionsRegimeWindowsSpecJSON,
@@ -308,6 +340,7 @@ func strategyRegimeBundleRequest(sc StrategyConfig, rc *RegimeConfig) (regimeBun
 	return regimeBundleRequest{
 		Key: regimeBundleKey{
 			Platform:  platform,
+			InstType:  strategyRegimeDataInstType(sc),
 			Symbol:    symbol,
 			Timeframe: timeframe,
 			SpecJSON:  specJSON,
@@ -339,6 +372,9 @@ func collectRegimeBundleRequests(due []StrategyConfig, rc *RegimeConfig) []regim
 		if a.Symbol != b.Symbol {
 			return a.Symbol < b.Symbol
 		}
+		if a.InstType != b.InstType {
+			return a.InstType < b.InstType
+		}
 		if a.Timeframe != b.Timeframe {
 			return a.Timeframe < b.Timeframe
 		}
@@ -353,6 +389,7 @@ func regimeBundleCheckArgs(req regimeBundleRequest) []string {
 		"--platform", req.Key.Platform,
 		"--symbol", req.Key.Symbol,
 		"--timeframe", req.Key.Timeframe,
+		"--inst-type", req.Key.InstType,
 		"--regime-windows-spec-json", req.Key.SpecJSON,
 		"--ohlcv-limit", strconv.Itoa(req.OhlcvLimit),
 		"--min-bars", strconv.Itoa(req.MinBars),
@@ -402,7 +439,7 @@ func parseRegimeBundleOutput(key regimeBundleKey, data []byte, now time.Time) (*
 var runRegimeBundleCheckFn = runRegimeBundleCheck
 
 func runRegimeBundleCheck(ctx context.Context, req regimeBundleRequest) (*RegimeBundle, error) {
-	stdout, stderr, err := runPython(ctx, regimeCheckScript, regimeBundleCheckArgs(req), nil)
+	stdout, stderr, err := runPythonWithTimeout(ctx, regimeCheckScript, regimeBundleCheckArgs(req), nil, regimeBundleTimeout)
 	now := time.Now().UTC()
 	// Subprocess contract: JSON on stdout even on error; parse regardless of
 	// exit code and prefer the script's structured error over the exit error.

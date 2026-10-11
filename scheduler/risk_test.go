@@ -644,7 +644,7 @@ func TestCollectPerpsMarkSymbols(t *testing.T) {
 		{ID: "hl-empty", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "", "1h"}},
 	}
 
-	hlCoins, okxCoins := collectPerpsMarkSymbols(strategies)
+	hlCoins, okxCoins, _ := collectPerpsMarkSymbols(strategies)
 
 	// HL: BTC (dedup'd) + ETH, sorted.
 	wantHL := []string{"BTC", "ETH"}
@@ -675,7 +675,7 @@ func TestCollectPerpsMarkSymbols_Empty(t *testing.T) {
 	strategies := []StrategyConfig{
 		{ID: "sma-btc", Type: "spot", Platform: "binanceus", Args: []string{"sma", "BTC/USDT", "1h"}},
 	}
-	hlCoins, okxCoins := collectPerpsMarkSymbols(strategies)
+	hlCoins, okxCoins, _ := collectPerpsMarkSymbols(strategies)
 	if len(hlCoins) != 0 {
 		t.Errorf("hlCoins = %v, want empty", hlCoins)
 	}
