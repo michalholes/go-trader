@@ -34,30 +34,30 @@ type StrategyDecisionFields struct {
 }
 
 type PositionCtx struct {
-	Side                           string
-	AvgCost                        float64
-	Quantity                       float64
-	InitialQuantity                float64
-	EntryATR                       float64
-	RiskAnchorPrice                float64
-	Regime                         string
-	RegimeAppliedLabel             string
-	RegimePendingLabel             string
-	RegimePendingCount             int
-	DirectionalRegime              string
-	RegimeWindows                  map[string]string
-	Profile                        string
-	DirectionCertifiedAtOpen       bool
-	DirectionCertifiedStatesAtOpen map[string]string
-	OnChainTPResting               bool
-	OnChainTPBlocked               string
-	OpenedAt                       time.Time
-	BarsHeld                       int
-	BarsHeldKnown                  bool
-	StopLossTriggerPx              float64
-	StopLossHighWaterPx            float64
-	PostTPTrailingATRMult          float64
-	SLAdjustedTiersProcessed       int
+	Side                            string
+	AvgCost                         float64
+	Quantity                        float64
+	InitialQuantity                 float64
+	EntryATR                        float64
+	RiskAnchorPrice                 float64
+	Regime                          string
+	RegimeAppliedLabel              string
+	RegimePendingLabel              string
+	RegimePendingCount              int
+	DirectionalRegime               string
+	RegimeWindows                   map[string]string
+	Profile                         string
+	DirectionCertifiedAtOpen        bool
+	DirectionCertifiedStatesAtOpen  map[string]string
+	OnChainTPResting                bool
+	OnChainTPBlocked                string
+	OpenedAt                        time.Time
+	BarsHeld                        int
+	BarsHeldKnown                   bool
+	StopLossTriggerPx               float64
+	StopLossHighWaterPx             float64
+	PostTPTrailingATRMult           float64
+	SLAdjustedTiersProcessed        int
 	RatchetFallbackNormalizePending bool
 	RestingTPScannedOpenMs          int64
 	RestingTPReachPx                float64
@@ -195,25 +195,25 @@ func positionCtxFromPosition(pos *Position) PositionCtx {
 		return PositionCtx{}
 	}
 	ctx := PositionCtx{
-		Side:                           pos.Side,
-		AvgCost:                        pos.AvgCost,
-		Quantity:                       pos.Quantity,
-		InitialQuantity:                pos.InitialQuantity,
-		EntryATR:                       pos.EntryATR,
-		RiskAnchorPrice:                pos.RiskAnchorPrice,
-		Regime:                         pos.Regime,
-		RegimeAppliedLabel:             pos.RegimeAppliedLabel,
-		RegimePendingLabel:             pos.RegimePendingLabel,
-		RegimePendingCount:             pos.RegimePendingCount,
-		DirectionalRegime:              pos.Regime,
-		RegimeWindows:                  cloneStringMap(pos.RegimeWindows),
-		Profile:                        pos.OpenProfile,
-		DirectionCertifiedAtOpen:       pos.DirectionCertifiedAtOpen,
-		DirectionCertifiedStatesAtOpen: cloneStringMap(pos.DirectionCertifiedStatesAtOpen),
-		OpenedAt:                       pos.OpenedAt,
-		StopLossTriggerPx:              pos.StopLossTriggerPx,
-		StopLossHighWaterPx:            pos.StopLossHighWaterPx,
-		SLAdjustedTiersProcessed:       pos.SLAdjustedTiersProcessed,
+		Side:                            pos.Side,
+		AvgCost:                         pos.AvgCost,
+		Quantity:                        pos.Quantity,
+		InitialQuantity:                 pos.InitialQuantity,
+		EntryATR:                        pos.EntryATR,
+		RiskAnchorPrice:                 pos.RiskAnchorPrice,
+		Regime:                          pos.Regime,
+		RegimeAppliedLabel:              pos.RegimeAppliedLabel,
+		RegimePendingLabel:              pos.RegimePendingLabel,
+		RegimePendingCount:              pos.RegimePendingCount,
+		DirectionalRegime:               pos.Regime,
+		RegimeWindows:                   cloneStringMap(pos.RegimeWindows),
+		Profile:                         pos.OpenProfile,
+		DirectionCertifiedAtOpen:        pos.DirectionCertifiedAtOpen,
+		DirectionCertifiedStatesAtOpen:  cloneStringMap(pos.DirectionCertifiedStatesAtOpen),
+		OpenedAt:                        pos.OpenedAt,
+		StopLossTriggerPx:               pos.StopLossTriggerPx,
+		StopLossHighWaterPx:             pos.StopLossHighWaterPx,
+		SLAdjustedTiersProcessed:        pos.SLAdjustedTiersProcessed,
 		RatchetFallbackNormalizePending: pos.RatchetFallbackNormalizePending,
 		RestingTPScannedOpenMs:          pos.RestingTPScannedOpenMs,
 		RestingTPReachPx:                pos.RestingTPReachPx,
