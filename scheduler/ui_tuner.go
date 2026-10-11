@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type UIEditableField struct {
@@ -37,6 +39,8 @@ type UIStrategyConfigResponse struct {
 	AllowedRegimes       []string               `json:"allowed_regimes,omitempty"`
 	StopLossPct          *float64               `json:"stop_loss_pct,omitempty"`
 	StopLossATRMult      *float64               `json:"stop_loss_atr_mult,omitempty"`
+	Paused               bool                   `json:"paused"`
+	NotifyRatchet        *bool                  `json:"notify_ratchet_triggers"`
 	DefaultParams        map[string]interface{} `json:"default_params"`
 	EditableFields       []UIEditableField      `json:"editable_fields"`
 	HasOpenPosition      bool                   `json:"has_open_position"`
@@ -54,6 +58,7 @@ type UISimulateResponse struct {
 	LiveMarkers      []UITradeMarker `json:"live_markers"`
 	SimulatedMarkers []UITradeMarker `json:"simulated_markers"`
 	PreviewNote      string          `json:"preview_note,omitempty"`
+	LiveRefusal      string          `json:"live_refusal,omitempty"`
 	Error            string          `json:"error,omitempty"`
 }
 
@@ -67,12 +72,18 @@ type UIApplyConfigResponse struct {
 	Message         string `json:"message"`
 }
 
-func (ss *StatusServer) SetConfigContext(configPath string, regime *RegimeConfig) {
-	if ss == nil {
+func (ss *StatusServer) SetConfigContext(configPath string, cfg *Config) {
+	if ss == nil || cfg == nil {
 		return
 	}
 	ss.configPath = configPath
-	ss.regime = regime
+	ss.regime = cfg.Regime
+	ss.strategiesMu.Lock()
+	ss.uiCfg = cfg
+	ss.intervalSeconds = cfg.IntervalSeconds
+	ss.userCloseDefaults = cfg.userDefaultsClose()
+	ss.globalNotifyRatchet = cfg.NotifyRatchetTriggers
+	ss.strategiesMu.Unlock()
 }
 
 func (ss *StatusServer) handleAPIStrategyConfig(w http.ResponseWriter, r *http.Request, id string) {
@@ -141,21 +152,29 @@ func (ss *StatusServer) handleAPIStrategySimulate(w http.ResponseWriter, r *http
 
 	livePayload := simulateConfigPayload(liveCfg, ss.regime)
 	simPayload := simulateConfigPayload(simCfg, ss.regime)
-	markersByLabel, simErr := runStrategySimulate(candles, map[string]map[string]interface{}{
-		"live":      livePayload,
-		"simulated": simPayload,
-	})
+	uiCfg := ss.uiTradeConfig()
+	livePayload["atr_method"] = resolveATRMethod(liveCfg, uiCfg)
+	simPayload["atr_method"] = resolveATRMethod(simCfg, uiCfg)
+	if _, ok := req.Overrides["leverage"]; ok {
+		simPayload["leverage_source"] = "tuner_override"
+	}
+	markersByLabel, liveRefusal, simErr := runTunerPreviewSimulate(candles, livePayload, simPayload)
 	if simErr != nil {
 		writeJSONError(w, http.StatusBadGateway, simErr.Error())
 		return
 	}
 
+	previewNote := "Gray markers replay the live config over fetched candles; they are not recorded trade history."
+	if liveRefusal != "" {
+		previewNote = "The live config was refused by the backtest stop policy, so only the simulated markers are shown."
+	}
 	writeJSON(w, UISimulateResponse{
 		StrategyID:       id,
 		Source:           source,
 		LiveMarkers:      markersByLabel["live"],
 		SimulatedMarkers: markersByLabel["simulated"],
-		PreviewNote:      "Gray markers replay the live config over fetched candles; they are not recorded trade history.",
+		PreviewNote:      previewNote,
+		LiveRefusal:      liveRefusal,
 	})
 }
 
@@ -263,10 +282,6 @@ func (ss *StatusServer) strategyHasOpenPosition(id string) bool {
 }
 
 func (ss *StatusServer) requireMutatingAPIAuth(w http.ResponseWriter, r *http.Request) bool {
-	if strings.TrimSpace(ss.statusToken) == "" {
-		writeJSONError(w, http.StatusForbidden, "config apply requires status_token")
-		return false
-	}
 	return ss.requireAPIAuth(w, r)
 }
 
@@ -296,11 +311,45 @@ type pythonErrorResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-func fetchStrategyDefaultParams(sc StrategyConfig) (map[string]interface{}, string, error) {
-	name := effectiveOpenStrategy(sc)
-	if name == "" {
-		return map[string]interface{}{}, "", nil
+type simulateLabelRefusal struct {
+	Label   string
+	Message string
+}
+
+func (e *simulateLabelRefusal) Error() string {
+	return e.Message
+}
+
+type strategySchemaCacheEntry struct {
+	defaults map[string]interface{}
+	desc     string
+}
+
+var (
+	strategySchemaCacheMu sync.Mutex
+	strategySchemaCache   = map[string]strategySchemaCacheEntry{}
+)
+
+func strategySchemaCacheKey(typ, openName string) string {
+	return typ + "\x00" + openName
+}
+
+func cloneStringAnyMap(in map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
+	return out
+}
+
+func clearStrategySchemaCacheForTest() {
+	strategySchemaCacheMu.Lock()
+	defer strategySchemaCacheMu.Unlock()
+	strategySchemaCache = map[string]strategySchemaCacheEntry{}
+}
+
+func loadStrategyTunerSchema(sc StrategyConfig) (map[string]interface{}, string, error) {
+	name := effectiveOpenStrategy(sc)
 	args := []string{
 		"--type", sc.Type,
 		"--strategy", name,
@@ -327,6 +376,46 @@ func fetchStrategyDefaultParams(sc StrategyConfig) (map[string]interface{}, stri
 		resp.DefaultParams = map[string]interface{}{}
 	}
 	return resp.DefaultParams, resp.Description, nil
+}
+
+func fetchStrategyDefaultParams(sc StrategyConfig) (map[string]interface{}, string, error) {
+	return fetchStrategyDefaultParamsWith(sc, loadStrategyTunerSchema)
+}
+
+func fetchStrategyDefaultParamsWith(
+	sc StrategyConfig,
+	load func(StrategyConfig) (map[string]interface{}, string, error),
+) (map[string]interface{}, string, error) {
+	name := effectiveOpenStrategy(sc)
+	if name == "" {
+		return map[string]interface{}{}, "", nil
+	}
+	key := strategySchemaCacheKey(sc.Type, name)
+
+	strategySchemaCacheMu.Lock()
+	if cached, ok := strategySchemaCache[key]; ok {
+		defaults := cloneStringAnyMap(cached.defaults)
+		desc := cached.desc
+		strategySchemaCacheMu.Unlock()
+		return defaults, desc, nil
+	}
+	strategySchemaCacheMu.Unlock()
+
+	defaults, desc, err := load(sc)
+	if err != nil {
+		return nil, "", err
+	}
+	if defaults == nil {
+		defaults = map[string]interface{}{}
+	}
+
+	strategySchemaCacheMu.Lock()
+	strategySchemaCache[key] = strategySchemaCacheEntry{
+		defaults: cloneStringAnyMap(defaults),
+		desc:     desc,
+	}
+	strategySchemaCacheMu.Unlock()
+	return cloneStringAnyMap(defaults), desc, nil
 }
 
 func buildUIStrategyConfig(sc StrategyConfig, defaults map[string]interface{}, _ string, hasOpen bool) UIStrategyConfigResponse {
@@ -362,6 +451,8 @@ func buildUIStrategyConfig(sc StrategyConfig, defaults map[string]interface{}, _
 		AllowedRegimes:       append([]string(nil), sc.AllowedRegimes...),
 		StopLossPct:          sc.StopLossPct,
 		StopLossATRMult:      sc.StopLossATRMult,
+		Paused:               sc.Paused,
+		NotifyRatchet:        sc.NotifyRatchetTriggers,
 		DefaultParams:        defaults,
 		EditableFields:       fields,
 		HasOpenPosition:      hasOpen,
@@ -397,11 +488,11 @@ func buildEditableFields(sc StrategyConfig, mergedParams, defaults map[string]in
 			if v, ok := sc.CloseStrategy.Params["sl_atr_mult"]; ok {
 				if f, ok := v.(float64); ok {
 					fields = append(fields, UIEditableField{
-						Key:     "close_strategy.params.sl_atr_mult",
-						Label:   "Close SL ATR mult",
-						Type:    "number",
-						Value:   f,
-						Group:   "risk",
+						Key:   "close_strategy.params.sl_atr_mult",
+						Label: "Close SL ATR mult",
+						Type:  "number",
+						Value: f,
+						Group: "risk",
 					})
 				}
 			}
@@ -524,6 +615,20 @@ func mergeStrategyTunerOverrides(base StrategyConfig, overrides map[string]json.
 			out.StopLossPct = nil
 		}
 	}
+	if raw, ok := overrides["paused"]; ok {
+		var v bool
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return out, fmt.Errorf("paused: %w", err)
+		}
+		out.Paused = v
+	}
+	if raw, ok := overrides["notify_ratchet_triggers"]; ok {
+		v, err := decodeOptionalBool(raw)
+		if err != nil {
+			return out, fmt.Errorf("notify_ratchet_triggers: %w", err)
+		}
+		out.NotifyRatchetTriggers = v
+	}
 	if raw, ok := overrides["open_strategy"]; ok {
 		var ref StrategyRef
 		if err := json.Unmarshal(raw, &ref); err != nil {
@@ -582,6 +687,17 @@ func mergeStrategyTunerOverrides(base StrategyConfig, overrides map[string]json.
 	return out, nil
 }
 
+func decodeOptionalBool(raw json.RawMessage) (*bool, error) {
+	if string(raw) == "null" {
+		return nil, nil
+	}
+	var v bool
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
 func decodeOptionalFloat(raw json.RawMessage) (*float64, error) {
 	if string(raw) == "null" {
 		return nil, nil
@@ -607,6 +723,17 @@ func simulateConfigPayload(sc StrategyConfig, regime *RegimeConfig) map[string]i
 		"initial_capital":    sc.InitialCapital,
 		"stop_loss_pct":      sc.StopLossPct,
 		"stop_loss_atr_mult": sc.StopLossATRMult,
+		"stop_units":         "live_percent",
+		"leverage":           sc.Leverage,
+		"leverage_source":    "strategy_config",
+		"max_drawdown_pct":   sc.MaxDrawdownPct,
+		"regime_atr_window":  sc.RegimeATRWindow,
+	}
+	if sc.leverageDefaulted {
+		payload["leverage_source"] = "loader_default"
+	}
+	if sc.TrailingStopMinMovePct != nil {
+		payload["trailing_stop_min_move_pct"] = *sc.TrailingStopMinMovePct
 	}
 	if sc.StopLossMarginPct != nil {
 		payload["stop_loss_margin_pct"] = *sc.StopLossMarginPct
@@ -617,18 +744,22 @@ func simulateConfigPayload(sc StrategyConfig, regime *RegimeConfig) map[string]i
 	if sc.TrailingStopATRMult != nil {
 		payload["trailing_stop_atr_mult"] = *sc.TrailingStopATRMult
 	}
-	if sc.StopLossATRRegime != nil {
-		payload["stop_loss_atr_regime"] = sc.StopLossATRRegime
+	if sc.StopLossATRMultRegime != nil {
+		payload["stop_loss_atr_mult_regime"] = sc.StopLossATRMultRegime
 	}
-	if sc.TrailingStopATRRegime != nil {
-		payload["trailing_stop_atr_regime"] = sc.TrailingStopATRRegime
+	if sc.TrailingStopATRMultRegime != nil {
+		payload["trailing_stop_atr_mult_regime"] = sc.TrailingStopATRMultRegime
 	}
 	if regime != nil {
-		payload["regime"] = map[string]interface{}{
+		regimePayload := map[string]interface{}{
 			"enabled":       regime.Enabled,
 			"period":        regimePeriod(regime),
 			"adx_threshold": regimeADXThreshold(regime),
 		}
+		if len(regime.Windows) > 0 {
+			regimePayload["windows"] = regime.Windows
+		}
+		payload["regime"] = regimePayload
 	}
 	if sc.OpenStrategy.Name == "" && effectiveOpenStrategy(sc) != "" {
 		open := sc.OpenStrategy
@@ -658,6 +789,21 @@ func regimeADXThreshold(regime *RegimeConfig) float64 {
 	return 20
 }
 
+func runTunerPreviewSimulate(candles []UICandle, livePayload, simPayload map[string]interface{}) (map[string][]UITradeMarker, string, error) {
+	markersByLabel, err := runStrategySimulate(candles, map[string]map[string]interface{}{
+		"live":      livePayload,
+		"simulated": simPayload,
+	})
+	var refusal *simulateLabelRefusal
+	if !errors.As(err, &refusal) || refusal.Label != "live" {
+		return markersByLabel, "", err
+	}
+	markersByLabel, err = runStrategySimulate(candles, map[string]map[string]interface{}{
+		"simulated": simPayload,
+	})
+	return markersByLabel, refusal.Error(), err
+}
+
 func runStrategySimulate(candles []UICandle, configs map[string]map[string]interface{}) (map[string][]UITradeMarker, error) {
 	type cfgItem struct {
 		Label  string                 `json:"label"`
@@ -683,7 +829,9 @@ func runStrategySimulate(candles []UICandle, configs map[string]map[string]inter
 	stdout, stderr, runErr := runPythonReadOnlyWithStdin("shared_scripts/simulate_strategy.py", nil, stdin)
 	var resp struct {
 		pythonErrorResponse
-		Markers map[string][]UITradeMarker `json:"markers"`
+		Markers         map[string][]UITradeMarker `json:"markers"`
+		Label           string                     `json:"label"`
+		CloseCapability json.RawMessage            `json:"close_capability"`
 	}
 	if err := json.Unmarshal(stdout, &resp); err != nil {
 		if runErr != nil {
@@ -692,6 +840,9 @@ func runStrategySimulate(candles []UICandle, configs map[string]map[string]inter
 		return nil, fmt.Errorf("parse simulate response: %w", err)
 	}
 	if resp.Error != "" {
+		if resp.Label != "" && len(resp.CloseCapability) > 0 {
+			return nil, &simulateLabelRefusal{Label: resp.Label, Message: resp.Error}
+		}
 		return nil, fmt.Errorf("%s", resp.Error)
 	}
 	if runErr != nil {
@@ -836,6 +987,24 @@ func patchStrategyJSON(item map[string]json.RawMessage, merged StrategyConfig, o
 		}
 		if _, keep := overrides["stop_loss_pct"]; !keep {
 			deleteKey("stop_loss_pct")
+		}
+	}
+	if _, ok := overrides["paused"]; ok {
+		if merged.Paused {
+			if err := set("paused", true); err != nil {
+				return item, err
+			}
+		} else {
+			deleteKey("paused")
+		}
+	}
+	if _, ok := overrides["notify_ratchet_triggers"]; ok {
+		if merged.NotifyRatchetTriggers != nil {
+			if err := set("notify_ratchet_triggers", *merged.NotifyRatchetTriggers); err != nil {
+				return item, err
+			}
+		} else {
+			deleteKey("notify_ratchet_triggers")
 		}
 	}
 

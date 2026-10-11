@@ -5,16 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// pythonScriptTimeoutError is returned when a Python subprocess hits its
-// deadline (runPython / runPythonWithTimeout). Callers can use errors.As.
 type pythonScriptTimeoutError struct {
 	d time.Duration
 }
@@ -23,12 +23,10 @@ func (e *pythonScriptTimeoutError) Error() string {
 	return fmt.Sprintf("script timed out after %s", e.d)
 }
 
-// pythonSemaphore limits concurrent Python subprocess executions.
 var pythonSemaphore = make(chan struct{}, 4)
 
 const scriptTimeout = 30 * time.Second
 
-// SpotResult is the JSON output from check_strategy.py.
 type SpotResult struct {
 	StrategyDecisionFields
 	Strategy   string                 `json:"strategy"`
@@ -41,36 +39,42 @@ type SpotResult struct {
 	Error      string                 `json:"error,omitempty"`
 }
 
-// HyperliquidResult is the JSON output from check_hyperliquid.py (signal check mode).
 type HyperliquidResult struct {
 	StrategyDecisionFields
-	Strategy   string                 `json:"strategy"`
-	Symbol     string                 `json:"symbol"`
-	Timeframe  string                 `json:"timeframe"`
-	Signal     int                    `json:"signal"`
-	Price      float64                `json:"price"`
-	Indicators map[string]interface{} `json:"indicators"`
-	Mode       string                 `json:"mode"`
-	Platform   string                 `json:"platform"`
-	Timestamp  string                 `json:"timestamp"`
-	Error      string                 `json:"error,omitempty"`
-	// Divergence is the regime-window divergence result computed inside
-	// runHyperliquidCheck (#907). Not from the Python script — derived Go-side
-	// from the payload after regime resolution. Zero value = none.
-	Divergence DivergenceResult `json:"-"`
+	Strategy                        string                 `json:"strategy"`
+	Symbol                          string                 `json:"symbol"`
+	Timeframe                       string                 `json:"timeframe"`
+	Signal                          int                    `json:"signal"`
+	Price                           float64                `json:"price"`
+	Indicators                      map[string]interface{} `json:"indicators"`
+	Mode                            string                 `json:"mode"`
+	Platform                        string                 `json:"platform"`
+	Timestamp                       string                 `json:"timestamp"`
+	Error                           string                 `json:"error,omitempty"`
+	Degraded                        string                 `json:"degraded,omitempty"`
+	Divergence                      DivergenceResult       `json:"-"`
+	ForceFullClose                  bool                   `json:"-"`
+	SharedCloseStrandedUSD          float64                `json:"-"`
+	SharedCloseEscalateFailedUSD    float64                `json:"-"`
+	SharedCloseEscalateFailureError string                 `json:"-"`
+	LiveOrderSubmitted              bool                   `json:"-"`
+	LiveOrderCancelRequested        bool                   `json:"-"`
+	SizedCloseBookFraction          float64                `json:"-"`
+	SizedCloseCanceledOIDs          []int64                `json:"-"`
+	SizedCloseBookedQty             float64                `json:"-"`
+	SizedClosePreSend               hlCloseView            `json:"-"`
+	PaperPartialCloseHold           string                 `json:"-"`
 }
 
-// HyperliquidFill holds fill details from a live Hyperliquid order.
 type HyperliquidFill struct {
 	AvgPx             float64 `json:"avg_px"`
 	TotalSz           float64 `json:"total_sz"`
-	OID               int64   `json:"oid,omitempty"`                  // exchange order ID
-	Fee               float64 `json:"fee,omitempty"`                  // exchange fee (if available)
-	StopLossOID       int64   `json:"stop_loss_oid,omitempty"`        // resting trigger OID for the per-trade SL placed alongside the fill (#412)
-	StopLossTriggerPx float64 `json:"stop_loss_trigger_px,omitempty"` // SL trigger price (for logs/audit) (#412)
+	OID               int64   `json:"oid,omitempty"`
+	Fee               float64 `json:"fee,omitempty"`
+	StopLossOID       int64   `json:"stop_loss_oid,omitempty"`
+	StopLossTriggerPx float64 `json:"stop_loss_trigger_px,omitempty"`
 }
 
-// HyperliquidExecution is the execution block from check_hyperliquid.py --execute output.
 type HyperliquidExecution struct {
 	Action string           `json:"action"`
 	Symbol string           `json:"symbol"`
@@ -78,21 +82,20 @@ type HyperliquidExecution struct {
 	Fill   *HyperliquidFill `json:"fill,omitempty"`
 }
 
-// HyperliquidExecuteResult is the top-level JSON from check_hyperliquid.py --execute.
 type HyperliquidExecuteResult struct {
-	Execution                 *HyperliquidExecution `json:"execution"`
-	Platform                  string                `json:"platform"`
-	Timestamp                 string                `json:"timestamp"`
-	Error                     string                `json:"error,omitempty"`
-	CancelStopLossError       string                `json:"cancel_stop_loss_error,omitempty"`       // non-fatal: SL cancel before order failed (#412)
-	CancelStopLossSucceeded   bool                  `json:"cancel_stop_loss_succeeded,omitempty"`   // SL cancel went through (set even if subsequent open failed) so caller can clear stale pos.StopLossOID (#421)
-	StopLossError             string                `json:"stop_loss_error,omitempty"`              // non-fatal: SL placement after fill failed (#412)
-	StopLossFilledImmediately bool                  `json:"stop_loss_filled_immediately,omitempty"` // SL trigger filled at submit (price already through the level) — position is flat on-chain (#421)
+	Execution                   *HyperliquidExecution `json:"execution"`
+	Platform                    string                `json:"platform"`
+	Timestamp                   string                `json:"timestamp"`
+	Error                       string                `json:"error,omitempty"`
+	CancelStopLossError         string                `json:"cancel_stop_loss_error,omitempty"`
+	CancelStopLossSucceeded     bool                  `json:"cancel_stop_loss_succeeded,omitempty"`
+	CancelStopLossSucceededOIDs []int64               `json:"cancel_stop_loss_succeeded_oids,omitempty"`
+	CancelStopLossFailedOIDs    []int64               `json:"cancel_stop_loss_failed_oids,omitempty"`
+	StopLossError               string                `json:"stop_loss_error,omitempty"`
+	StopLossFilledImmediately   bool                  `json:"stop_loss_filled_immediately,omitempty"`
+	OrderOutcome                string                `json:"order_outcome,omitempty"`
 }
 
-// HyperliquidStopLossUpdateResult is the JSON output from check_hyperliquid.py
-// --update-stop-loss. It reuses the same cancel/place fields as execute mode
-// but has no market-order execution block (#501).
 type HyperliquidStopLossUpdateResult struct {
 	Platform                  string  `json:"platform"`
 	Timestamp                 string  `json:"timestamp"`
@@ -104,66 +107,88 @@ type HyperliquidStopLossUpdateResult struct {
 	StopLossError             string  `json:"stop_loss_error,omitempty"`
 	StopLossFilledImmediately bool    `json:"stop_loss_filled_immediately,omitempty"`
 	StopLossFilledExternally  bool    `json:"stop_loss_filled_externally,omitempty"`
+	StopLossOutcomeUnknown    bool    `json:"stop_loss_outcome_unknown,omitempty"`
+	StopLossOldStillOpen      bool    `json:"stop_loss_old_still_open,omitempty"`
+	PrePlaceOpenOIDs          []int64 `json:"pre_place_open_oids,omitempty"`
 	OpenOrderCheckError       string  `json:"open_order_check_error,omitempty"`
+	SentCancelOID             int64   `json:"-"`
+	MatchedSize               float64 `json:"-"`
+	CancelOnly                bool    `json:"cancel_only,omitempty"`
+	StopLossNotOpen           bool    `json:"stop_loss_not_open,omitempty"`
+	StopLossSize              float64 `json:"stop_loss_size,omitempty"`
 }
 
-// HyperliquidProtectionSyncResult is emitted by check_hyperliquid.py
-// --sync-protection. It keeps per-strategy reduce-only SL/TP order OIDs in
-// Position so restart recovery can verify or re-place missing protection (#601).
-//
-// `*_filled_externally` flags signal that the recorded OID had already filled
-// on-chain when sync ran (reconciler will book the close); the Go side must
-// clear the OID without re-placing to avoid the over-close hazard from #604.
+func hlPlacedStopQty(sent, reported float64) float64 {
+	if reported > 0 && reported < sent {
+		return reported
+	}
+	return sent
+}
+
 type HyperliquidProtectionSyncResult struct {
-	Platform                 string    `json:"platform"`
-	Timestamp                string    `json:"timestamp"`
-	Error                    string    `json:"error,omitempty"`
-	StopLossOID              int64     `json:"stop_loss_oid,omitempty"`
-	StopLossTriggerPx        float64   `json:"stop_loss_trigger_px,omitempty"`
-	TPOIDs                   []int64   `json:"tp_oids,omitempty"`
-	TPPxs                    []float64 `json:"tp_pxs,omitempty"`
-	TPErrors                 []string  `json:"tp_errors,omitempty"`
-	TPFilledExternally       []bool    `json:"tp_filled_externally,omitempty"`
-	TP1OID                   int64     `json:"tp1_oid,omitempty"`
-	TP2OID                   int64     `json:"tp2_oid,omitempty"`
-	TP1Px                    float64   `json:"tp1_px,omitempty"`
-	TP2Px                    float64   `json:"tp2_px,omitempty"`
-	StopLossError            string    `json:"stop_loss_error,omitempty"`
-	TP1Error                 string    `json:"tp1_error,omitempty"`
-	TP2Error                 string    `json:"tp2_error,omitempty"`
-	OpenOrderCheckError      string    `json:"open_order_check_error,omitempty"`
-	StopLossFilledExternally bool      `json:"stop_loss_filled_externally,omitempty"`
-	TP1FilledExternally      bool      `json:"tp1_filled_externally,omitempty"`
-	TP2FilledExternally      bool      `json:"tp2_filled_externally,omitempty"`
-	// #843: surplus tier-count-shrink cancels — failed OIDs are re-appended to
-	// pos.TPOIDs so the next cycle retries; filled OIDs are dropped from tracking.
-	TPCancelFailedOIDs []int64 `json:"tp_cancel_failed_oids,omitempty"`
-	TPCancelFilledOIDs []int64 `json:"tp_cancel_filled_oids,omitempty"`
+	Platform                  string    `json:"platform"`
+	Timestamp                 string    `json:"timestamp"`
+	Error                     string    `json:"error,omitempty"`
+	StopLossOID               int64     `json:"stop_loss_oid,omitempty"`
+	StopLossTriggerPx         float64   `json:"stop_loss_trigger_px,omitempty"`
+	TPOIDs                    []int64   `json:"tp_oids,omitempty"`
+	TPPxs                     []float64 `json:"tp_pxs,omitempty"`
+	TPErrors                  []string  `json:"tp_errors,omitempty"`
+	TPFilledExternally        []bool    `json:"tp_filled_externally,omitempty"`
+	TPFilledImmediately       []bool    `json:"tp_filled_immediately,omitempty"`
+	TPSizeSkipped             []bool    `json:"tp_size_skipped,omitempty"`
+	TPOutcomeUnknown          []bool    `json:"tp_outcome_unknown,omitempty"`
+	TP1OID                    int64     `json:"tp1_oid,omitempty"`
+	TP2OID                    int64     `json:"tp2_oid,omitempty"`
+	TP1Px                     float64   `json:"tp1_px,omitempty"`
+	TP2Px                     float64   `json:"tp2_px,omitempty"`
+	StopLossError             string    `json:"stop_loss_error,omitempty"`
+	TP1Error                  string    `json:"tp1_error,omitempty"`
+	TP2Error                  string    `json:"tp2_error,omitempty"`
+	OpenOrderCheckError       string    `json:"open_order_check_error,omitempty"`
+	StopLossFilledExternally  bool      `json:"stop_loss_filled_externally,omitempty"`
+	StopLossFilledImmediately bool      `json:"stop_loss_filled_immediately,omitempty"`
+	TP1FilledExternally       bool      `json:"tp1_filled_externally,omitempty"`
+	TP2FilledExternally       bool      `json:"tp2_filled_externally,omitempty"`
+	TPCancelFailedOIDs        []int64   `json:"tp_cancel_failed_oids,omitempty"`
+	TPCancelFilledOIDs        []int64   `json:"tp_cancel_filled_oids,omitempty"`
+	TPCancelNotOpenOIDs       []int64   `json:"tp_cancel_not_open_oids,omitempty"`
+	CancelStopLossSucceeded   bool      `json:"cancel_stop_loss_succeeded,omitempty"`
+	CancelStopLossError       string    `json:"cancel_stop_loss_error,omitempty"`
+	StopLossOutcomeUnknown    bool      `json:"stop_loss_outcome_unknown,omitempty"`
+	StopLossSize              float64   `json:"stop_loss_size,omitempty"`
 }
 
-// runPython is the shared subprocess spawner. parentCtx is one of
-// shutdownReadOnlyCtx (read-only scripts, cancelled at SIGTERM) or
-// shutdownSideEffectCtx (live order placement / state mutation, allowed to
-// finish under the drain cap). Both default to context.Background() when the
-// daemon entry point hasn't called initShutdownContexts (one-off CLI commands
-// and tests).
 func runPython(parentCtx context.Context, script string, args []string, stdinData []byte) ([]byte, []byte, error) {
 	return runPythonWithTimeout(parentCtx, script, args, stdinData, scriptTimeout)
 }
 
-// runPythonWithTimeout mirrors runPython but uses an explicit deadline (e.g.
-// long-running fetch scripts like fetch_hl_user_fills.py). Semaphore, Setpgid,
-// stdin, and SIGKILL-on-deadline behavior match runPython.
 func runPythonWithTimeout(parentCtx context.Context, script string, args []string, stdinData []byte, timeout time.Duration) ([]byte, []byte, error) {
 	pythonSemaphore <- struct{}{}
 	defer func() { <-pythonSemaphore }()
+	return spawnPythonProcess(parentCtx, script, args, stdinData, timeout)
+}
 
-	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+func spawnPythonProcess(parentCtx context.Context, script string, args []string, stdinData []byte, timeout time.Duration) ([]byte, []byte, error) {
+	return spawnPythonProcessWithEnv(parentCtx, script, args, stdinData, timeout, nil)
+}
+
+func spawnPythonProcessWithEnv(parentCtx context.Context, script string, args []string, stdinData []byte, timeout time.Duration, envOverrides map[string]string) ([]byte, []byte, error) {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(parentCtx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(parentCtx)
+	}
 	defer cancel()
 
 	cmdArgs := append([]string{script}, args...)
 	cmd := exec.CommandContext(ctx, ".venv/bin/python3", cmdArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if len(envOverrides) > 0 {
+		cmd.Env = processEnvironment(envOverrides)
+	}
 	if stdinData != nil {
 		cmd.Stdin = bytes.NewReader(stdinData)
 	}
@@ -173,20 +198,46 @@ func runPythonWithTimeout(parentCtx context.Context, script string, args []strin
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
+	if ctx.Err() != nil {
 		if cmd.Process != nil {
 			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
+	}
+	if ctx.Err() == context.DeadlineExceeded {
 		return stdout.Bytes(), stderr.Bytes(), &pythonScriptTimeoutError{d: timeout}
 	}
 	return stdout.Bytes(), stderr.Bytes(), err
 }
 
-// runPythonReadOnly is for scripts with no on-chain or local-state side
-// effects (check_*.py signal evaluation, fetch_*_marks.py, fetch_*_positions
-// for snapshot reads, --list-json, check_balance.py, check_price.py).
-// Cancelled immediately on SIGTERM so the daemon can shut down without
-// waiting on idle work.
+func processEnvironment(overrides map[string]string) []string {
+	keys := make([]string, 0, len(overrides))
+	for key := range overrides {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	prefixes := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		prefixes[key+"="] = struct{}{}
+	}
+	env := make([]string, 0, len(os.Environ())+len(keys))
+	for _, item := range os.Environ() {
+		replaced := false
+		for prefix := range prefixes {
+			if strings.HasPrefix(item, prefix) {
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			env = append(env, item)
+		}
+	}
+	for _, key := range keys {
+		env = append(env, key+"="+overrides[key])
+	}
+	return env
+}
+
 func runPythonReadOnly(script string, args []string) ([]byte, []byte, error) {
 	return runPython(shutdownReadOnlyCtx, script, args, nil)
 }
@@ -229,31 +280,20 @@ func runPythonReadOnlyWithStdin(script string, args []string, stdinData []byte) 
 	return runPython(shutdownReadOnlyCtx, script, args, stdinData)
 }
 
-// runPythonSideEffect is for scripts that place live orders, mutate local
-// state via on-chain operations, or send external messages (--execute,
-// close_*.py, --sync-protection, trigger updates). Registers with
-// sideEffectWG so SIGTERM waits up to shutdownDrainCap before forcing a
-// kill, preserving local/on-chain consistency.
 func runPythonSideEffect(script string, args []string) ([]byte, []byte, error) {
 	sideEffectWG.Add(1)
 	defer sideEffectWG.Done()
 	return runPython(shutdownSideEffectCtx, script, args, nil)
 }
 
-// RunPythonScript is the public entry for callers outside executor.go
-// (balance.go, init.go); both call sites are read-only. New side-effecting
-// callers should use runPythonSideEffect via a typed wrapper instead of
-// reaching for this function.
 func RunPythonScript(script string, args []string) ([]byte, []byte, error) {
 	return runPythonReadOnly(script, args)
 }
 
-// RunSpotCheck runs check_strategy.py and parses the result.
 func RunSpotCheck(script string, args []string) (*SpotResult, string, error) {
 	stdout, stderr, err := RunPythonScript(script, args)
 	stderrStr := string(stderr)
 	if err != nil {
-		// Try to parse JSON even on non-zero exit (script may exit(1) with JSON error output)
 		var result SpotResult
 		if jsonErr := json.Unmarshal(stdout, &result); jsonErr == nil && result.Error != "" {
 			return &result, stderrStr, nil
@@ -268,13 +308,10 @@ func RunSpotCheck(script string, args []string) (*SpotResult, string, error) {
 	return &result, stderrStr, nil
 }
 
-// RunPythonScriptWithStdin is the public stdin-piped entry, currently used
-// only via RunOptionsCheckWithStdin (read-only).
 func RunPythonScriptWithStdin(script string, args []string, stdinData []byte) ([]byte, []byte, error) {
 	return runPythonReadOnlyWithStdin(script, args, stdinData)
 }
 
-// RunOptionsCheckWithStdin runs check_options.py, passing positionsJSON via stdin.
 func RunOptionsCheckWithStdin(script string, args []string, positionsJSON string) (*OptionsResult, string, error) {
 	stdout, stderr, err := RunPythonScriptWithStdin(script, args, []byte(positionsJSON))
 	stderrStr := string(stderr)
@@ -293,29 +330,15 @@ func RunOptionsCheckWithStdin(script string, args []string, positionsJSON string
 	return &result, stderrStr, nil
 }
 
-// RunOptionsCheck runs check_options.py and parses the result.
-func RunOptionsCheck(script string, args []string) (*OptionsResult, string, error) {
-	stdout, stderr, err := RunPythonScript(script, args)
-	stderrStr := string(stderr)
-	if err != nil {
-		// Try to parse JSON even on non-zero exit (script may exit(1) with JSON error output)
-		var result OptionsResult
-		if jsonErr := json.Unmarshal(stdout, &result); jsonErr == nil && result.Error != "" {
-			return &result, stderrStr, nil
-		}
-		return nil, stderrStr, fmt.Errorf("script error: %w (stderr: %s)", err, stderrStr)
-	}
-
-	var result OptionsResult
-	if err := json.Unmarshal(stdout, &result); err != nil {
-		return nil, stderrStr, fmt.Errorf("parse output: %w (stdout: %s)", err, string(stdout))
-	}
-	return &result, stderrStr, nil
+func RunHyperliquidCheck(script string, args []string) (*HyperliquidResult, string, error) {
+	return runHyperliquidCheckStdout(RunPythonScript(script, args))
 }
 
-// RunHyperliquidCheck runs check_hyperliquid.py in signal check mode and parses the result.
-func RunHyperliquidCheck(script string, args []string) (*HyperliquidResult, string, error) {
-	stdout, stderr, err := RunPythonScript(script, args)
+func RunHyperliquidCheckWithStdin(script string, args []string, stdinData []byte) (*HyperliquidResult, string, error) {
+	return runHyperliquidCheckStdout(runPythonReadOnlyWithStdin(script, args, stdinData))
+}
+
+func runHyperliquidCheckStdout(stdout, stderr []byte, err error) (*HyperliquidResult, string, error) {
 	stderrStr := string(stderr)
 	if err != nil {
 		var result HyperliquidResult
@@ -332,45 +355,46 @@ func RunHyperliquidCheck(script string, args []string) (*HyperliquidResult, stri
 	return &result, stderrStr, nil
 }
 
-// RunHyperliquidExecute runs check_hyperliquid.py in execute mode (live orders).
-// stopLossPct > 0 requests a reduce-only SL trigger after a successful open.
-// cancelStopLossOID > 0 cancels an existing trigger before placing the new order
-// (used on signal-based closes so the stale SL doesn't race the close fill).
-// prevPosQty > 0 indicates a flip is in progress: total_sz from the fill is
-// closeQty + newQty, and the SL must be sized against (total_sz - prevPosQty)
-// or HL will reject the oversized reduce-only trigger (#421).
-// marginMode ("isolated"|"cross") + leverage are forwarded to update_leverage
-// before the order, but only on a fresh open from flat — HL rejects margin-mode
-// changes on an open position (#486). Empty marginMode skips the call. These
-// trailing args are HL-specific: OKX/TopStep have their own execute helpers.
-// buildHyperliquidExecuteArgs builds the argv passed to check_hyperliquid.py
-// --execute. Extracted so the argv contract can be asserted in tests without
-// spawning a subprocess (#592 review #4).
-//
-// closeFullPosition=true emits --close-full-position and OMITS --size, so the
-// Python script calls adapter.market_close(sz=None) — closing the entire
-// on-chain residual without a sized order, eliminating rounding dust on final
-// TP tiers (#592).
-// hlExecuteSnapshot carries cycle-local on-chain state from Go's Phase 1
-// clearinghouseState fetch into the --execute argv (#768 fix #4). When both
-// fields are present, Python skips its duplicate get_position_leverage /info
-// call. Zero-valued fields are omitted from argv — Python falls back to the
-// original fetch path.
 type hlExecuteSnapshot struct {
-	AccountLeverage   int    // on-chain leverage value for the symbol (0 == unknown)
-	AccountMarginMode string // "isolated" | "cross" (empty == unknown)
+	AccountLeverage   int
+	AccountMarginMode string
 }
 
-func buildHyperliquidExecuteArgs(symbol, side string, size, stopLossPct float64, cancelStopLossOID int64, prevPosQty float64, marginMode string, leverage float64, closeFullPosition bool, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) []string {
+type hlCloseMode int
+
+const (
+	hlCloseModeNone hlCloseMode = iota
+	hlCloseModeWhole
+	hlCloseModeReduceOnly
+	hlCloseModeCross
+)
+
+func (m hlCloseMode) String() string {
+	switch m {
+	case hlCloseModeWhole:
+		return "whole"
+	case hlCloseModeReduceOnly:
+		return "reduce_only"
+	case hlCloseModeCross:
+		return "cross"
+	default:
+		return "none"
+	}
+}
+
+func buildHyperliquidExecuteArgs(symbol, side string, size, stopLossPct float64, cancelStopLossOID int64, prevPosQty float64, marginMode string, leverage float64, closeMode hlCloseMode, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) []string {
 	args := []string{
 		"--execute",
 		fmt.Sprintf("--symbol=%s", symbol),
 		fmt.Sprintf("--side=%s", side),
 		"--mode=live",
 	}
-	if closeFullPosition {
+	switch closeMode {
+	case hlCloseModeWhole:
 		args = append(args, "--close-full-position")
-	} else {
+	case hlCloseModeReduceOnly, hlCloseModeCross:
+		args = append(args, fmt.Sprintf("--size=%g", size), "--close-mode="+closeMode.String())
+	default:
 		args = append(args, fmt.Sprintf("--size=%g", size))
 	}
 	if stopLossPct > 0 {
@@ -392,9 +416,6 @@ func buildHyperliquidExecuteArgs(symbol, side string, size, stopLossPct float64,
 		if leverage > 0 {
 			args = append(args, fmt.Sprintf("--leverage=%g", leverage))
 		}
-		// Forward Go's clearinghouseState snapshot only when both fields are
-		// known — Python ignores partial snapshots and falls back to its own
-		// get_position_leverage call.
 		if snapshot.AccountLeverage > 0 && (snapshot.AccountMarginMode == "isolated" || snapshot.AccountMarginMode == "cross") {
 			args = append(args, fmt.Sprintf("--account-leverage=%d", snapshot.AccountLeverage))
 			args = append(args, fmt.Sprintf("--account-margin-mode=%s", snapshot.AccountMarginMode))
@@ -403,17 +424,15 @@ func buildHyperliquidExecuteArgs(symbol, side string, size, stopLossPct float64,
 	return args
 }
 
-// RunHyperliquidExecute runs check_hyperliquid.py in execute mode (live orders).
-// See buildHyperliquidExecuteArgs for argv-contract details.
-func RunHyperliquidExecute(script, symbol, side string, size, stopLossPct float64, cancelStopLossOID int64, prevPosQty float64, marginMode string, leverage float64, closeFullPosition bool, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
-	args := buildHyperliquidExecuteArgs(symbol, side, size, stopLossPct, cancelStopLossOID, prevPosQty, marginMode, leverage, closeFullPosition, snapshot, extraCancelOIDs...)
+func RunHyperliquidExecute(script, symbol, side string, size, stopLossPct float64, cancelStopLossOID int64, prevPosQty float64, marginMode string, leverage float64, closeMode hlCloseMode, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
+	args := buildHyperliquidExecuteArgs(symbol, side, size, stopLossPct, cancelStopLossOID, prevPosQty, marginMode, leverage, closeMode, snapshot, extraCancelOIDs...)
 	stdout, stderr, err := runPythonSideEffect(script, args)
+	hlNoteCoinSubmission(symbol)
 	return parseHyperliquidExecuteOutput(stdout, string(stderr), err)
 }
 
-// RunHyperliquidUpdateStopLoss cancels the existing resting SL trigger and
-// places a replacement trigger at triggerPx for an already-open HL perps
-// position (#501). side is the current position side ("long" or "short").
+var runHyperliquidExecuteFn = RunHyperliquidExecute
+
 func RunHyperliquidUpdateStopLoss(script, symbol, side string, size, triggerPx float64, cancelStopLossOID int64) (*HyperliquidStopLossUpdateResult, string, error) {
 	args := []string{
 		"--update-stop-loss",
@@ -427,21 +446,100 @@ func RunHyperliquidUpdateStopLoss(script, symbol, side string, size, triggerPx f
 		args = append(args, fmt.Sprintf("--cancel-stop-loss-oid=%d", cancelStopLossOID))
 	}
 	stdout, stderr, err := runPythonSideEffect(script, args)
-	return parseHyperliquidUpdateStopLossOutput(stdout, string(stderr), err)
+	res, stderrStr, parseErr := parseHyperliquidUpdateStopLossOutput(stdout, string(stderr), err)
+	if hlStopUpdateMovesChain(res) {
+		hlNoteCoinSubmission(symbol)
+	}
+	return res, stderrStr, parseErr
 }
 
-// buildHyperliquidSyncProtectionArgv builds argv for check_hyperliquid.py
-// --sync-protection (used by RunHyperliquidSyncProtection and tests).
-func buildHyperliquidSyncProtectionArgv(symbol, side string, size, avgCost, entryATR, stopLossATRMult float64, tiers []hlProtectionTier, stopLossOID int64, tpOIDs []int64, tpArmedTiers []bool, forceSLReplace bool, forceTPReplace []bool, cancelTPOIDs []int64, reconcileFillHintsJSON []byte) []string {
+var runHyperliquidListOpenOrderOIDsFunc = RunHyperliquidListOpenOrderOIDs
+
+type hlListedOpenOrder struct {
+	OID        int64   `json:"oid"`
+	Coin       string  `json:"coin"`
+	Side       string  `json:"side"`
+	Sz         float64 `json:"sz"`
+	ReduceOnly bool    `json:"reduce_only"`
+	IsTrigger  bool    `json:"is_trigger"`
+	OrderType  string  `json:"order_type"`
+	TriggerPx  float64 `json:"trigger_px"`
+}
+
+type hlAllOpenOrders struct {
+	Orders   []hlListedOpenOrder
+	Decimals map[string]int
+	ReadErr  string
+}
+
+func RunHyperliquidListOpenOrderOIDs(script, symbol string) (orders []hlListedOpenOrder, readErr string, err error) {
+	stdout, _, err := runPythonSideEffect(script, []string{"--list-open-order-oids", fmt.Sprintf("--symbol=%s", symbol)})
+	if err != nil && len(stdout) == 0 {
+		return nil, "", err
+	}
+	var payload struct {
+		OpenOrders          []hlListedOpenOrder `json:"open_orders"`
+		OpenOrderCheckError string              `json:"open_order_check_error"`
+		SzDecimals          *int                `json:"sz_decimals"`
+		SzDecimalsByCoin    map[string]int      `json:"sz_decimals_by_coin"`
+	}
+	if uerr := json.Unmarshal(stdout, &payload); uerr != nil {
+		return nil, "", uerr
+	}
+	if payload.OpenOrderCheckError != "" {
+		return nil, payload.OpenOrderCheckError, nil
+	}
+	return payload.OpenOrders, "", nil
+}
+
+func parseHLAllOpenOrders(stdout []byte) (hlAllOpenOrders, error) {
+	var payload struct {
+		OpenOrders          []hlListedOpenOrder `json:"open_orders"`
+		OpenOrderCheckError string              `json:"open_order_check_error"`
+		SzDecimalsByCoin    map[string]int      `json:"sz_decimals_by_coin"`
+	}
+	if err := json.Unmarshal(stdout, &payload); err != nil {
+		return hlAllOpenOrders{}, err
+	}
+	if payload.OpenOrderCheckError != "" {
+		return hlAllOpenOrders{ReadErr: payload.OpenOrderCheckError}, nil
+	}
+	decimals := make(map[string]int, len(payload.SzDecimalsByCoin))
+	for coin, d := range payload.SzDecimalsByCoin {
+		if key := hlCoinKey(coin); key != "" {
+			decimals[key] = d
+		}
+	}
+	return hlAllOpenOrders{Orders: payload.OpenOrders, Decimals: decimals}, nil
+}
+
+func RunHyperliquidListAllOpenOrders(script string) (hlAllOpenOrders, error) {
+	stdout, _, err := runPythonSideEffect(script, []string{"--list-open-order-oids"})
+	if err != nil && len(stdout) == 0 {
+		return hlAllOpenOrders{}, err
+	}
+	return parseHLAllOpenOrders(stdout)
+}
+
+var runHyperliquidListAllOpenOrdersFn = RunHyperliquidListAllOpenOrders
+
+func buildHyperliquidSyncProtectionArgv(plan hlProtectionPlan, reconcileFillHintsJSON []byte) []string {
+	tiers := plan.Tiers
 	args := []string{
 		"--sync-protection",
-		fmt.Sprintf("--symbol=%s", symbol),
-		fmt.Sprintf("--side=%s", side),
-		fmt.Sprintf("--size=%g", size),
-		fmt.Sprintf("--avg-cost=%g", avgCost),
-		fmt.Sprintf("--entry-atr=%g", entryATR),
-		fmt.Sprintf("--stop-loss-atr-mult=%g", stopLossATRMult),
+		fmt.Sprintf("--symbol=%s", plan.Symbol),
+		fmt.Sprintf("--side=%s", plan.Side),
+		fmt.Sprintf("--size=%g", plan.Size),
+		fmt.Sprintf("--avg-cost=%g", plan.AvgCost),
+		fmt.Sprintf("--entry-atr=%g", plan.EntryATR),
+		fmt.Sprintf("--stop-loss-atr-mult=%g", plan.StopLossATRMult),
 		"--mode=live",
+	}
+	if plan.StopLossATRMult > 0 && (plan.PreserveMovedStop || plan.StopLossTriggerPx != 0) {
+		args = append(args, fmt.Sprintf("--stop-loss-trigger-px=%g", plan.StopLossTriggerPx))
+	}
+	if plan.StopLossATRMult > 0 && plan.PreserveMovedStop {
+		args = append(args, "--preserve-moved-stop")
 	}
 	if len(tiers) > 0 {
 		tierArgs := make([]map[string]float64, 0, len(tiers))
@@ -455,32 +553,32 @@ func buildHyperliquidSyncProtectionArgv(symbol, side string, size, avgCost, entr
 			args = append(args, fmt.Sprintf("--tp-tiers-json=%s", string(b)))
 		}
 	}
-	if stopLossOID > 0 {
-		args = append(args, fmt.Sprintf("--stop-loss-oid=%d", stopLossOID))
+	if plan.StopLossOID > 0 {
+		args = append(args, fmt.Sprintf("--stop-loss-oid=%d", plan.StopLossOID))
 	}
-	if len(tpOIDs) > 0 {
-		if b, err := json.Marshal(tpOIDs); err == nil {
+	if len(plan.TPOIDs) > 0 {
+		if b, err := json.Marshal(plan.TPOIDs); err == nil {
 			args = append(args, fmt.Sprintf("--tp-oids-json=%s", string(b)))
 		}
 	}
 	if len(tiers) > 0 {
-		armed := tpArmedTiersForTierCount(tpArmedTiers, len(tiers))
+		armed := tpArmedTiersForTierCount(plan.TPArmedTiers, len(tiers))
 		if b, err := json.Marshal(armed); err == nil {
 			args = append(args, fmt.Sprintf("--tp-armed-tiers-json=%s", string(b)))
 		} else {
 			fmt.Fprintf(os.Stderr, "[WARN] json.Marshal(tp armed tiers) failed: %v — sync-protection omitting --tp-armed-tiers-json\n", err)
 		}
 	}
-	if forceSLReplace {
+	if plan.ForceSLReplace {
 		args = append(args, "--force-sl-replace")
 	}
-	if len(forceTPReplace) > 0 {
-		if b, err := json.Marshal(forceTPReplace); err == nil {
+	if len(plan.ForceTPReplace) > 0 {
+		if b, err := json.Marshal(plan.ForceTPReplace); err == nil {
 			args = append(args, fmt.Sprintf("--force-tp-replace-json=%s", string(b)))
 		}
 	}
-	if len(cancelTPOIDs) > 0 {
-		if b, err := json.Marshal(cancelTPOIDs); err == nil {
+	if len(plan.CancelTPOIDs) > 0 {
+		if b, err := json.Marshal(plan.CancelTPOIDs); err == nil {
 			args = append(args, fmt.Sprintf("--cancel-tp-oids-json=%s", string(b)))
 		}
 	}
@@ -490,8 +588,8 @@ func buildHyperliquidSyncProtectionArgv(symbol, side string, size, avgCost, entr
 	return args
 }
 
-func RunHyperliquidSyncProtection(script, symbol, side string, size, avgCost, entryATR, stopLossATRMult float64, tiers []hlProtectionTier, stopLossOID int64, tpOIDs []int64, tpArmedTiers []bool, forceSLReplace bool, forceTPReplace []bool, cancelTPOIDs []int64, reconcileFillHintsJSON []byte) (*HyperliquidProtectionSyncResult, string, error) {
-	args := buildHyperliquidSyncProtectionArgv(symbol, side, size, avgCost, entryATR, stopLossATRMult, tiers, stopLossOID, tpOIDs, tpArmedTiers, forceSLReplace, forceTPReplace, cancelTPOIDs, reconcileFillHintsJSON)
+func RunHyperliquidSyncProtection(script string, plan hlProtectionPlan, reconcileFillHintsJSON []byte) (*HyperliquidProtectionSyncResult, string, error) {
+	args := buildHyperliquidSyncProtectionArgv(plan, reconcileFillHintsJSON)
 	stdout, stderr, err := runPythonSideEffect(script, args)
 	stderrStr := string(stderr)
 	var result HyperliquidProtectionSyncResult
@@ -500,6 +598,9 @@ func RunHyperliquidSyncProtection(script, symbol, side string, size, avgCost, en
 			return nil, stderrStr, fmt.Errorf("script error: %w (stderr: %s; stdout: %s)", err, stderrStr, string(stdout))
 		}
 		return nil, stderrStr, fmt.Errorf("parse output: %w (stdout: %s)", jsonErr, string(stdout))
+	}
+	if hlProtectionSyncMovesChain(&result) {
+		hlNoteCoinSubmission(plan.Symbol)
 	}
 	if err != nil && result.Error == "" {
 		return &result, stderrStr, fmt.Errorf("script error: %w (stderr: %s)", err, stderrStr)
@@ -523,15 +624,14 @@ func parseHyperliquidUpdateStopLossOutput(stdout []byte, stderrStr string, runEr
 	return &result, stderrStr, nil
 }
 
-// parseHyperliquidExecuteOutput turns subprocess output into
-// (*HyperliquidExecuteResult, stderr, error). Extracted from RunHyperliquidExecute
-// so Go CI (no .venv) can test the parsing contract without spawning Python
-// — same pattern as parseHyperliquidCloseOutput (#341).
 func parseHyperliquidExecuteOutput(stdout []byte, stderrStr string, runErr error) (*HyperliquidExecuteResult, string, error) {
 	if runErr != nil {
 		var result HyperliquidExecuteResult
-		if jsonErr := json.Unmarshal(stdout, &result); jsonErr == nil && result.Error != "" {
-			return &result, stderrStr, nil
+		if jsonErr := json.Unmarshal(stdout, &result); jsonErr == nil {
+			if result.Error != "" {
+				return &result, stderrStr, nil
+			}
+			return &result, stderrStr, fmt.Errorf("execute error: %w (stderr: %s)", runErr, stderrStr)
 		}
 		return nil, stderrStr, fmt.Errorf("execute error: %w (stderr: %s)", runErr, stderrStr)
 	}
@@ -543,10 +643,99 @@ func parseHyperliquidExecuteOutput(stdout []byte, stderrStr string, runErr error
 	return &result, stderrStr, nil
 }
 
-// HyperliquidCloseFill is the parsed fill block from close_hyperliquid_position.py.
-// Mirrors HyperliquidFill; Fee is included so kill-switch close accounting
-// (fee totals, post-mortem PnL) can capture exchange fees just like the
-// normal execute path does.
+func confirmHyperliquidExecuteFill(res *HyperliquidExecuteResult, err error) (*HyperliquidExecuteResult, error) {
+	if err != nil {
+		return res, err
+	}
+	if res == nil {
+		return res, fmt.Errorf("exchange returned no confirmed fill")
+	}
+	if res.Error != "" {
+		return res, fmt.Errorf("%s", res.Error)
+	}
+	if res.Execution == nil || res.Execution.Fill == nil {
+		return res, fmt.Errorf("exchange returned no confirmed fill")
+	}
+	fill := res.Execution.Fill
+	if !(fill.AvgPx > 0) || !(fill.TotalSz > 0) || math.IsInf(fill.AvgPx, 0) || math.IsInf(fill.TotalSz, 0) {
+		return res, fmt.Errorf("exchange returned no confirmed fill (sz=%.8f px=%.8f)", fill.TotalSz, fill.AvgPx)
+	}
+	return res, nil
+}
+
+type hlCloseFillOutcome struct {
+	Filled float64
+	Known  bool
+}
+
+func hlExecuteFillOutcome(res *HyperliquidExecuteResult, err error, bookQty float64) hlCloseFillOutcome {
+	if res == nil {
+		return hlCloseFillOutcome{}
+	}
+	switch res.OrderOutcome {
+	case "rejected", "not_sent":
+		return hlCloseFillOutcome{Known: true}
+	case "filled":
+		if _, confirmErr := confirmHyperliquidExecuteFill(res, err); confirmErr != nil {
+			return hlCloseFillOutcome{}
+		}
+		booked, _, _ := manualCloseFillAttribution(bookQty, res.Execution.Fill)
+		return hlCloseFillOutcome{Filled: booked, Known: true}
+	}
+	return hlCloseFillOutcome{}
+}
+
+func hyperliquidExecuteSucceededCancelOIDs(result *HyperliquidExecuteResult, requested []int64) []int64 {
+	if result == nil {
+		return nil
+	}
+	if len(result.CancelStopLossSucceededOIDs) > 0 {
+		requestedSet := make(map[int64]struct{}, len(requested))
+		for _, oid := range requested {
+			if oid > 0 {
+				requestedSet[oid] = struct{}{}
+			}
+		}
+		if len(requestedSet) == 0 {
+			return nil
+		}
+		seen := make(map[int64]struct{}, len(result.CancelStopLossSucceededOIDs))
+		var out []int64
+		for _, oid := range result.CancelStopLossSucceededOIDs {
+			if oid <= 0 {
+				continue
+			}
+			if len(requestedSet) > 0 {
+				if _, ok := requestedSet[oid]; !ok {
+					continue
+				}
+			}
+			if _, ok := seen[oid]; ok {
+				continue
+			}
+			seen[oid] = struct{}{}
+			out = append(out, oid)
+		}
+		return out
+	}
+	if result.CancelStopLossSucceeded && result.CancelStopLossError == "" {
+		seen := make(map[int64]struct{}, len(requested))
+		var out []int64
+		for _, oid := range requested {
+			if oid <= 0 {
+				continue
+			}
+			if _, ok := seen[oid]; ok {
+				continue
+			}
+			seen[oid] = struct{}{}
+			out = append(out, oid)
+		}
+		return out
+	}
+	return nil
+}
+
 type HyperliquidCloseFill struct {
 	AvgPx   float64 `json:"avg_px"`
 	TotalSz float64 `json:"total_sz"`
@@ -554,47 +743,169 @@ type HyperliquidCloseFill struct {
 	Fee     float64 `json:"fee,omitempty"`
 }
 
-// HyperliquidClose is the close block from close_hyperliquid_position.py.
-// AlreadyFlat is set by the Python script when the SDK reports an empty
-// statuses list (no position to close at submit time, eventual-consistency
-// window after the Go-side fetch). The Go side reads this to route the
-// outcome through AlreadyFlat instead of ClosedCoins so operator messaging
-// distinguishes "we sent a close order" from "nothing to close" (#350).
 type HyperliquidClose struct {
 	Symbol      string                `json:"symbol"`
 	Fill        *HyperliquidCloseFill `json:"fill,omitempty"`
 	AlreadyFlat bool                  `json:"already_flat,omitempty"`
+	SubmittedSz float64               `json:"submitted_sz,omitempty"`
 }
 
-// HyperliquidCloseResult is the top-level JSON from close_hyperliquid_position.py.
-// Used by the portfolio kill switch to liquidate on-chain positions (#341).
-// CancelStopLossSucceeded / CancelStopLossError surface the optional
-// pre-close trigger-cancel that frees `Position.StopLossOID` when a CB or
-// kill switch flattens a strategy carrying a resting SL (#421).
 type HyperliquidCloseResult struct {
-	Close                   *HyperliquidClose `json:"close"`
-	Platform                string            `json:"platform"`
-	Timestamp               string            `json:"timestamp"`
-	Error                   string            `json:"error,omitempty"`
-	CancelStopLossError     string            `json:"cancel_stop_loss_error,omitempty"`
-	CancelStopLossSucceeded bool              `json:"cancel_stop_loss_succeeded,omitempty"`
+	Close                       *HyperliquidClose `json:"close"`
+	Platform                    string            `json:"platform"`
+	Timestamp                   string            `json:"timestamp"`
+	Error                       string            `json:"error,omitempty"`
+	CancelStopLossError         string            `json:"cancel_stop_loss_error,omitempty"`
+	CancelStopLossSucceeded     bool              `json:"cancel_stop_loss_succeeded,omitempty"`
+	CancelStopLossSucceededOIDs []int64           `json:"cancel_stop_loss_succeeded_oids,omitempty"`
+	CancelStopLossFailedOIDs    []int64           `json:"cancel_stop_loss_failed_oids,omitempty"`
+	OrderOutcome                string            `json:"order_outcome,omitempty"`
 }
 
-// RunHyperliquidClose runs close_hyperliquid_position.py to submit a reduce-only
-// market close for a single coin (#341). When partialSz is non-nil, submits a
-// partial close for that coin quantity (#356 shared-wallet circuit breakers).
-// When cancelStopLossOIDs is non-empty, the script first cancels those resting
-// trigger orders so per-strategy CB / kill-switch closes don't leave orphaned SLs
-// burning HL's open-order cap (#421, #479).
-//
-// Contract (load-bearing for kill-switch correctness): a non-nil error is
-// returned for ANY failure path — non-zero subprocess exit, malformed JSON,
-// or a JSON envelope with `error` populated. Callers that see (result, nil)
-// can treat the close as confirmed by the SDK. The previous contract returned
-// (result, nil) for "exit 1 + parseable JSON with error" which forced every
-// caller to also inspect result.Error and conflated subprocess success with
-// JSON-error success.
+type hlSizedCloseRequest struct {
+	Symbol        string
+	Side          string
+	Mode          hlCloseMode
+	Size          float64
+	CancelOIDs    []int64
+	CancelMinFill float64
+}
+
+type hlSizedCloser func(req hlSizedCloseRequest) (*HyperliquidCloseResult, error)
+
+func hlSizedCloseRequestError(req hlSizedCloseRequest) string {
+	if strings.TrimSpace(req.Symbol) == "" {
+		return "sized close has no symbol"
+	}
+	if req.Side != "buy" && req.Side != "sell" {
+		return fmt.Sprintf("sized close %s side %q is neither buy nor sell", req.Symbol, req.Side)
+	}
+	if req.Mode != hlCloseModeReduceOnly && req.Mode != hlCloseModeCross {
+		return fmt.Sprintf("sized close %s mode %s is neither reduce_only nor cross", req.Symbol, req.Mode)
+	}
+	if !finitePositive(req.Size) {
+		return fmt.Sprintf("sized close %s size %v is not a positive finite quantity", req.Symbol, req.Size)
+	}
+	for _, oid := range req.CancelOIDs {
+		if oid > 0 && !finitePositive(req.CancelMinFill) {
+			return fmt.Sprintf("sized close %s cancels protection but has no positive fill threshold", req.Symbol)
+		}
+	}
+	return ""
+}
+
+// hlFullCloseTolerance is the slack under which a fill still covers a
+// protective close. It is always below a positive quantity, so qty minus
+// this tolerance stays a positive cancel threshold.
+func hlFullCloseTolerance(qty float64) float64 {
+	if !finitePositive(qty) {
+		return 0
+	}
+	tol := qty * 0.01
+	if tol > 0.0001 {
+		return 0.0001
+	}
+	return tol
+}
+
+func buildHyperliquidSizedCloseArgs(req hlSizedCloseRequest) []string {
+	args := []string{
+		fmt.Sprintf("--symbol=%s", req.Symbol),
+		"--mode=live",
+		fmt.Sprintf("--sz=%s", strconv.FormatFloat(req.Size, 'f', -1, 64)),
+		fmt.Sprintf("--side=%s", req.Side),
+		"--close-mode=" + req.Mode.String(),
+	}
+	cancel := false
+	for _, oid := range req.CancelOIDs {
+		if oid > 0 {
+			args = append(args, fmt.Sprintf("--cancel-stop-loss-oid=%d", oid))
+			cancel = true
+		}
+	}
+	if cancel {
+		args = append(args, "--cancel-protection-after-close", fmt.Sprintf("--cancel-min-fill=%s", strconv.FormatFloat(req.CancelMinFill, 'f', -1, 64)))
+	}
+	return args
+}
+
+func RunHyperliquidSizedClose(script string, req hlSizedCloseRequest) (*HyperliquidCloseResult, string, error) {
+	if msg := hlSizedCloseRequestError(req); msg != "" {
+		return &HyperliquidCloseResult{Close: &HyperliquidClose{Symbol: req.Symbol}, Platform: "hyperliquid", Error: msg, OrderOutcome: "not_sent"}, "", fmt.Errorf("%s", msg)
+	}
+	stdout, stderr, runErr := runPythonSideEffect(script, buildHyperliquidSizedCloseArgs(req))
+	hlNoteCoinSubmission(req.Symbol)
+	return parseHyperliquidCloseOutput(stdout, string(stderr), runErr)
+}
+
+func defaultHyperliquidSizedCloser(req hlSizedCloseRequest) (*HyperliquidCloseResult, error) {
+	result, stderr, err := RunHyperliquidSizedClose(hyperliquidLiveCloseScript, req)
+	if stderr != "" {
+		fmt.Fprintf(os.Stderr, "[hl-sized-close] %s stderr: %s\n", req.Symbol, stderr)
+	}
+	return result, err
+}
+
+type hlSizedCloseOutcome struct {
+	Filled  float64
+	AvgPx   float64
+	Fee     float64
+	OID     int64
+	Known   bool
+	NotSent bool
+	Detail  string
+}
+
+func classifyHLSizedClose(res *HyperliquidCloseResult, err error) hlSizedCloseOutcome {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	} else if res == nil {
+		detail = "no close result returned"
+	} else if res.Error != "" {
+		detail = res.Error
+	}
+	if res == nil {
+		return hlSizedCloseOutcome{Detail: detail}
+	}
+	switch res.OrderOutcome {
+	case "not_sent":
+		return hlSizedCloseOutcome{Known: true, NotSent: true, Detail: detail}
+	case "rejected":
+		return hlSizedCloseOutcome{Known: true, Detail: detail}
+	case "filled":
+		if err != nil || res.Error != "" || res.Close == nil || res.Close.Fill == nil {
+			break
+		}
+		f := res.Close.Fill
+		if !finitePositive(f.TotalSz) || !finitePositive(f.AvgPx) {
+			detail = fmt.Sprintf("the close reported a fill with no usable size or price (sz=%v px=%v)", f.TotalSz, f.AvgPx)
+			break
+		}
+		return hlSizedCloseOutcome{Filled: f.TotalSz, AvgPx: f.AvgPx, Fee: f.Fee, OID: f.OID, Known: true}
+	}
+	if detail == "" {
+		detail = fmt.Sprintf("the close reported no readable outcome (order_outcome=%q)", res.OrderOutcome)
+	}
+	return hlSizedCloseOutcome{Detail: detail}
+}
+
 func RunHyperliquidClose(script, symbol string, partialSz *float64, cancelStopLossOIDs []int64) (*HyperliquidCloseResult, string, error) {
+	return runHyperliquidClose(script, symbol, partialSz, cancelStopLossOIDs, false)
+}
+
+func RunHyperliquidCloseCancelAfterFill(script, symbol string, partialSz *float64, cancelStopLossOIDs []int64) (*HyperliquidCloseResult, string, error) {
+	return runHyperliquidClose(script, symbol, partialSz, cancelStopLossOIDs, true)
+}
+
+func runHyperliquidClose(script, symbol string, partialSz *float64, cancelStopLossOIDs []int64, cancelProtectionAfterClose bool) (*HyperliquidCloseResult, string, error) {
+	args := buildHyperliquidCloseArgs(symbol, partialSz, cancelStopLossOIDs, cancelProtectionAfterClose)
+	stdout, stderr, runErr := runPythonSideEffect(script, args)
+	hlNoteCoinSubmission(symbol)
+	return parseHyperliquidCloseOutput(stdout, string(stderr), runErr)
+}
+
+func buildHyperliquidCloseArgs(symbol string, partialSz *float64, cancelStopLossOIDs []int64, cancelProtectionAfterClose bool) []string {
 	args := []string{
 		fmt.Sprintf("--symbol=%s", symbol),
 		"--mode=live",
@@ -607,47 +918,34 @@ func RunHyperliquidClose(script, symbol string, partialSz *float64, cancelStopLo
 			args = append(args, fmt.Sprintf("--cancel-stop-loss-oid=%d", oid))
 		}
 	}
-	stdout, stderr, runErr := runPythonSideEffect(script, args)
-	return parseHyperliquidCloseOutput(stdout, string(stderr), runErr)
+	if cancelProtectionAfterClose {
+		args = append(args, "--cancel-protection-after-close")
+	}
+	return args
 }
 
-// parseHyperliquidCloseOutput turns the raw subprocess result into
-// (*HyperliquidCloseResult, stderr, error) following the RunHyperliquidClose
-// contract. Extracted from RunHyperliquidClose so the decision logic can be
-// tested without spawning Python.
 func parseHyperliquidCloseOutput(stdout []byte, stderrStr string, runErr error) (*HyperliquidCloseResult, string, error) {
 	var result HyperliquidCloseResult
 	parseErr := json.Unmarshal(stdout, &result)
 
 	switch {
 	case runErr == nil && parseErr == nil && result.Error == "":
-		// Clean success: exit 0, valid JSON, no error field.
 		return &result, stderrStr, nil
 
 	case runErr == nil && parseErr == nil && result.Error != "":
-		// Exit 0 but the script reported an error — should not happen with
-		// the current Python contract (every error path also exits 1) but we
-		// honor the JSON envelope as authoritative.
 		return &result, stderrStr, fmt.Errorf("close reported error despite exit 0: %s", result.Error)
 
 	case parseErr == nil && result.Error != "":
-		// Exit non-zero with valid JSON error envelope — the expected error
-		// path. Surface as a non-nil error so callers don't need to also
-		// check result.Error.
 		return &result, stderrStr, fmt.Errorf("close failed: %s", result.Error)
 
 	case parseErr == nil && runErr != nil:
-		// Exit non-zero with valid JSON but no error field — unexpected. Treat
-		// as failure to avoid silently reporting success on a non-zero exit.
 		return &result, stderrStr, fmt.Errorf("close subprocess exit %v with no error field (stderr: %s)", runErr, stderrStr)
 
 	default:
-		// Malformed JSON. Always a failure regardless of exit code.
 		return nil, stderrStr, fmt.Errorf("parse close output: %v (run err: %v, stdout: %s)", parseErr, runErr, string(stdout))
 	}
 }
 
-// ContractSpec holds CME futures contract specifications from check_topstep.py.
 type ContractSpec struct {
 	TickSize   float64 `json:"tick_size"`
 	TickValue  float64 `json:"tick_value"`
@@ -655,7 +953,6 @@ type ContractSpec struct {
 	Margin     float64 `json:"margin"`
 }
 
-// TopStepResult is the JSON output from check_topstep.py (signal check mode).
 type TopStepResult struct {
 	StrategyDecisionFields
 	Strategy     string                 `json:"strategy"`
@@ -672,7 +969,6 @@ type TopStepResult struct {
 	Error        string                 `json:"error,omitempty"`
 }
 
-// TopStepFill holds fill details from a live TopStep order.
 type TopStepFill struct {
 	AvgPx          float64 `json:"avg_px"`
 	TotalContracts int     `json:"total_contracts"`
@@ -680,7 +976,6 @@ type TopStepFill struct {
 	Fee            float64 `json:"fee,omitempty"`
 }
 
-// TopStepExecution is the execution block from check_topstep.py --execute output.
 type TopStepExecution struct {
 	Action    string       `json:"action"`
 	Symbol    string       `json:"symbol"`
@@ -688,7 +983,6 @@ type TopStepExecution struct {
 	Fill      *TopStepFill `json:"fill,omitempty"`
 }
 
-// TopStepExecuteResult is the top-level JSON from check_topstep.py --execute.
 type TopStepExecuteResult struct {
 	Execution *TopStepExecution `json:"execution"`
 	Platform  string            `json:"platform"`
@@ -696,7 +990,6 @@ type TopStepExecuteResult struct {
 	Error     string            `json:"error,omitempty"`
 }
 
-// RunTopStepCheck runs check_topstep.py in signal check mode and parses the result.
 func RunTopStepCheck(script string, args []string) (*TopStepResult, string, error) {
 	stdout, stderr, err := RunPythonScript(script, args)
 	stderrStr := string(stderr)
@@ -715,7 +1008,6 @@ func RunTopStepCheck(script string, args []string) (*TopStepResult, string, erro
 	return &result, stderrStr, nil
 }
 
-// RunTopStepExecute runs check_topstep.py in execute mode (live orders).
 func RunTopStepExecute(script, symbol, side string, contracts int) (*TopStepExecuteResult, string, error) {
 	args := []string{
 		"--execute",
@@ -741,24 +1033,17 @@ func RunTopStepExecute(script, symbol, side string, contracts int) (*TopStepExec
 	return &result, stderrStr, nil
 }
 
-// TopStepCloseFill is the parsed fill block from close_topstep_position.py.
-// Mirrors TopStepFill but fields are optional (empty {} means already-flat
-// success) and OID is a string (TopStepX order IDs are opaque).
 type TopStepCloseFill struct {
 	AvgPx          float64 `json:"avg_px,omitempty"`
 	TotalContracts int     `json:"total_contracts,omitempty"`
 	OID            string  `json:"oid,omitempty"`
 }
 
-// TopStepClose is the close block from close_topstep_position.py.
 type TopStepClose struct {
 	Symbol string            `json:"symbol"`
 	Fill   *TopStepCloseFill `json:"fill,omitempty"`
 }
 
-// TopStepCloseResult is the top-level JSON from close_topstep_position.py.
-// Used by the portfolio kill switch to liquidate live TopStep futures
-// exposure (#347).
 type TopStepCloseResult struct {
 	Close     *TopStepClose `json:"close"`
 	Platform  string        `json:"platform"`
@@ -766,11 +1051,6 @@ type TopStepCloseResult struct {
 	Error     string        `json:"error,omitempty"`
 }
 
-// RunTopStepClose runs close_topstep_position.py to submit a market-flatten
-// for a single TopStep futures symbol (#347). Contract mirrors
-// RunHyperliquidClose / RunOKXClose / RunRobinhoodClose: any failure path
-// returns a non-nil error so the kill switch stays latched on ambiguous
-// responses.
 func RunTopStepClose(script, symbol string) (*TopStepCloseResult, string, error) {
 	args := []string{
 		fmt.Sprintf("--symbol=%s", symbol),
@@ -780,11 +1060,6 @@ func RunTopStepClose(script, symbol string) (*TopStepCloseResult, string, error)
 	return parseTopStepCloseOutput(stdout, string(stderr), runErr)
 }
 
-// parseTopStepCloseOutput turns raw subprocess output into
-// (*TopStepCloseResult, stderr, error) following the RunTopStepClose
-// contract. Extracted so decision logic can be tested without spawning
-// .venv/bin/python3 — same pattern as parseHyperliquidCloseOutput /
-// parseOKXCloseOutput / parseRobinhoodCloseOutput (#341/#342/#345/#346).
 func parseTopStepCloseOutput(stdout []byte, stderrStr string, runErr error) (*TopStepCloseResult, string, error) {
 	var result TopStepCloseResult
 	parseErr := json.Unmarshal(stdout, &result)
@@ -807,9 +1082,6 @@ func parseTopStepCloseOutput(stdout []byte, stderrStr string, runErr error) (*To
 	}
 }
 
-// TopStepPositionsResult is the JSON output from fetch_topstep_positions.py.
-// Size is signed (positive = long, negative = short) to mirror OKX/HL so
-// the kill-switch plan builder can treat all platforms symmetrically.
 type TopStepPositionsResult struct {
 	Positions []TopStepPositionJSON `json:"positions"`
 	Platform  string                `json:"platform"`
@@ -817,9 +1089,6 @@ type TopStepPositionsResult struct {
 	Error     string                `json:"error,omitempty"`
 }
 
-// TopStepPositionJSON is the per-position payload from
-// fetch_topstep_positions.py. Size is integer contracts (futures have no
-// fractional sizing).
 type TopStepPositionJSON struct {
 	Coin     string  `json:"coin"`
 	Size     int     `json:"size"`
@@ -827,20 +1096,11 @@ type TopStepPositionJSON struct {
 	Side     string  `json:"side"`
 }
 
-// RunTopStepFetchPositions runs fetch_topstep_positions.py and returns the
-// parsed result (#347). Like RunTopStepClose, any failure path returns a
-// non-nil error so the kill switch can latch and retry — a silent parse
-// failure would otherwise look like "no positions" and clear virtual state
-// while live exposure remained.
 func RunTopStepFetchPositions(script string) (*TopStepPositionsResult, string, error) {
 	stdout, stderr, runErr := RunPythonScript(script, nil)
 	return parseTopStepPositionsOutput(stdout, string(stderr), runErr)
 }
 
-// parseTopStepPositionsOutput is the pure parser, extracted from
-// RunTopStepFetchPositions so decision logic can be tested without
-// spawning Python. Mirrors parseOKXPositionsOutput / parseRobinhoodPositionsOutput
-// 5-case matrix.
 func parseTopStepPositionsOutput(stdout []byte, stderrStr string, runErr error) (*TopStepPositionsResult, string, error) {
 	var result TopStepPositionsResult
 	parseErr := json.Unmarshal(stdout, &result)
@@ -863,7 +1123,77 @@ func parseTopStepPositionsOutput(stdout []byte, stderrStr string, runErr error) 
 	}
 }
 
-// RobinhoodResult is the JSON output from check_robinhood.py (signal check mode).
+type TopStepBalanceResult struct {
+	Balance       float64 `json:"balance"`
+	UnrealizedPnL float64 `json:"unrealized_pnl"`
+	Platform      string  `json:"platform"`
+	Timestamp     string  `json:"timestamp"`
+	Error         string  `json:"error,omitempty"`
+}
+
+func RunTopStepFetchBalance(script string) (*TopStepBalanceResult, string, error) {
+	stdout, stderr, runErr := RunPythonScript(script, nil)
+	return parseTopStepBalanceOutput(stdout, string(stderr), runErr)
+}
+
+func parseTopStepBalanceOutput(stdout []byte, stderrStr string, runErr error) (*TopStepBalanceResult, string, error) {
+	var result TopStepBalanceResult
+	parseErr := json.Unmarshal(stdout, &result)
+
+	switch {
+	case runErr == nil && parseErr == nil && result.Error == "":
+		return &result, stderrStr, nil
+
+	case runErr == nil && parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("fetch balance reported error despite exit 0: %s", result.Error)
+
+	case parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("fetch balance failed: %s", result.Error)
+
+	case parseErr == nil && runErr != nil:
+		return &result, stderrStr, fmt.Errorf("fetch balance subprocess exit %v with no error field (stderr: %s)", runErr, stderrStr)
+
+	default:
+		return nil, stderrStr, fmt.Errorf("parse balance output: %v (run err: %v, stdout: %s)", parseErr, runErr, string(stdout))
+	}
+}
+
+type TopStepFillsResult struct {
+	Fills     []topstepFillRecord `json:"fills"`
+	Capped    bool                `json:"capped"`
+	Platform  string              `json:"platform"`
+	Timestamp string              `json:"timestamp"`
+	Error     string              `json:"error,omitempty"`
+}
+
+func RunTopStepFetchFills(script string, sinceMs int64) (*TopStepFillsResult, string, error) {
+	args := []string{fmt.Sprintf("--since-ms=%d", sinceMs)}
+	stdout, stderr, runErr := RunPythonScript(script, args)
+	return parseTopStepFillsOutput(stdout, string(stderr), runErr)
+}
+
+func parseTopStepFillsOutput(stdout []byte, stderrStr string, runErr error) (*TopStepFillsResult, string, error) {
+	var result TopStepFillsResult
+	parseErr := json.Unmarshal(stdout, &result)
+
+	switch {
+	case runErr == nil && parseErr == nil && result.Error == "":
+		return &result, stderrStr, nil
+
+	case runErr == nil && parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("fetch fills reported error despite exit 0: %s", result.Error)
+
+	case parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("fetch fills failed: %s", result.Error)
+
+	case parseErr == nil && runErr != nil:
+		return &result, stderrStr, fmt.Errorf("fetch fills subprocess exit %v with no error field (stderr: %s)", runErr, stderrStr)
+
+	default:
+		return nil, stderrStr, fmt.Errorf("parse fills output: %v (run err: %v, stdout: %s)", parseErr, runErr, string(stdout))
+	}
+}
+
 type RobinhoodResult struct {
 	StrategyDecisionFields
 	Strategy   string                 `json:"strategy"`
@@ -878,7 +1208,6 @@ type RobinhoodResult struct {
 	Error      string                 `json:"error,omitempty"`
 }
 
-// RobinhoodFill holds fill details from a live Robinhood order.
 type RobinhoodFill struct {
 	AvgPx    float64 `json:"avg_px"`
 	Quantity float64 `json:"quantity"`
@@ -886,7 +1215,6 @@ type RobinhoodFill struct {
 	Fee      float64 `json:"fee,omitempty"`
 }
 
-// RobinhoodExecution is the execution block from check_robinhood.py --execute output.
 type RobinhoodExecution struct {
 	Action    string         `json:"action"`
 	Symbol    string         `json:"symbol"`
@@ -895,7 +1223,6 @@ type RobinhoodExecution struct {
 	Fill      *RobinhoodFill `json:"fill,omitempty"`
 }
 
-// RobinhoodExecuteResult is the top-level JSON from check_robinhood.py --execute.
 type RobinhoodExecuteResult struct {
 	Execution *RobinhoodExecution `json:"execution"`
 	Platform  string              `json:"platform"`
@@ -903,7 +1230,6 @@ type RobinhoodExecuteResult struct {
 	Error     string              `json:"error,omitempty"`
 }
 
-// RunRobinhoodCheck runs check_robinhood.py in signal check mode and parses the result.
 func RunRobinhoodCheck(script string, args []string) (*RobinhoodResult, string, error) {
 	stdout, stderr, err := RunPythonScript(script, args)
 	stderrStr := string(stderr)
@@ -922,7 +1248,6 @@ func RunRobinhoodCheck(script string, args []string) (*RobinhoodResult, string, 
 	return &result, stderrStr, nil
 }
 
-// RunRobinhoodExecute runs check_robinhood.py in execute mode (live orders).
 func RunRobinhoodExecute(script, symbol, side string, amountUSD, quantity float64) (*RobinhoodExecuteResult, string, error) {
 	args := []string{
 		"--execute",
@@ -952,7 +1277,6 @@ func RunRobinhoodExecute(script, symbol, side string, amountUSD, quantity float6
 	return &result, stderrStr, nil
 }
 
-// OKXResult is the JSON output from check_okx.py (signal check mode).
 type OKXResult struct {
 	StrategyDecisionFields
 	Strategy   string                 `json:"strategy"`
@@ -967,7 +1291,6 @@ type OKXResult struct {
 	Error      string                 `json:"error,omitempty"`
 }
 
-// OKXFill holds fill details from a live OKX order.
 type OKXFill struct {
 	AvgPx   float64 `json:"avg_px"`
 	TotalSz float64 `json:"total_sz"`
@@ -975,7 +1298,6 @@ type OKXFill struct {
 	Fee     float64 `json:"fee,omitempty"`
 }
 
-// OKXExecution is the execution block from check_okx.py --execute output.
 type OKXExecution struct {
 	Action string   `json:"action"`
 	Symbol string   `json:"symbol"`
@@ -983,7 +1305,6 @@ type OKXExecution struct {
 	Fill   *OKXFill `json:"fill,omitempty"`
 }
 
-// OKXExecuteResult is the top-level JSON from check_okx.py --execute.
 type OKXExecuteResult struct {
 	Execution *OKXExecution `json:"execution"`
 	Platform  string        `json:"platform"`
@@ -991,7 +1312,6 @@ type OKXExecuteResult struct {
 	Error     string        `json:"error,omitempty"`
 }
 
-// RunOKXCheck runs check_okx.py in signal check mode and parses the result.
 func RunOKXCheck(script string, args []string) (*OKXResult, string, error) {
 	stdout, stderr, err := RunPythonScript(script, args)
 	stderrStr := string(stderr)
@@ -1010,7 +1330,6 @@ func RunOKXCheck(script string, args []string) (*OKXResult, string, error) {
 	return &result, stderrStr, nil
 }
 
-// RunOKXExecute runs check_okx.py in execute mode (live orders).
 func RunOKXExecute(script, symbol, side string, size float64, instType string) (*OKXExecuteResult, string, error) {
 	args := []string{
 		"--execute",
@@ -1037,11 +1356,6 @@ func RunOKXExecute(script, symbol, side string, size float64, instType string) (
 	return &result, stderrStr, nil
 }
 
-// OKXCloseFill is the parsed fill block from close_okx_position.py.
-// Mirrors HyperliquidCloseFill so kill-switch accounting is symmetric
-// across platforms. OID is a string (ccxt order IDs are opaque strings,
-// unlike HL's int64) and all fields are optional — empty {} means the
-// adapter found no position to close (already-flat success).
 type OKXCloseFill struct {
 	AvgPx   float64 `json:"avg_px,omitempty"`
 	TotalSz float64 `json:"total_sz,omitempty"`
@@ -1049,19 +1363,12 @@ type OKXCloseFill struct {
 	Fee     float64 `json:"fee,omitempty"`
 }
 
-// OKXClose is the close block from close_okx_position.py. AlreadyFlat is
-// set by the Python script when adapter.market_close returns {} (adapter
-// found no open position at submit time, eventual-consistency window
-// after the Go-side fetch). See HyperliquidClose for the reasoning (#350).
 type OKXClose struct {
 	Symbol      string        `json:"symbol"`
 	Fill        *OKXCloseFill `json:"fill,omitempty"`
 	AlreadyFlat bool          `json:"already_flat,omitempty"`
 }
 
-// OKXCloseResult is the top-level JSON from close_okx_position.py.
-// Used by the portfolio kill switch to liquidate on-chain OKX perps
-// positions (#345).
 type OKXCloseResult struct {
 	Close     *OKXClose `json:"close"`
 	Platform  string    `json:"platform"`
@@ -1069,17 +1376,6 @@ type OKXCloseResult struct {
 	Error     string    `json:"error,omitempty"`
 }
 
-// RunOKXClose runs close_okx_position.py to submit a reduce-only market
-// close for a single OKX swap coin (#345). When partialSz is non-nil, submits
-// a partial reduce-only close for that coin quantity (#360 shared-wallet
-// per-strategy circuit breakers).
-//
-// Contract mirrors RunHyperliquidClose: a non-nil error is returned for
-// ANY failure — non-zero subprocess exit, malformed JSON, or a JSON
-// envelope with `error` populated. Callers that see (result, nil) can
-// treat the close as confirmed by the adapter. Kill-switch correctness
-// depends on this: any ambiguous response must surface as error so the
-// switch stays latched and retries next cycle.
 func RunOKXClose(script, symbol string, partialSz *float64) (*OKXCloseResult, string, error) {
 	args := []string{
 		fmt.Sprintf("--symbol=%s", symbol),
@@ -1092,10 +1388,6 @@ func RunOKXClose(script, symbol string, partialSz *float64) (*OKXCloseResult, st
 	return parseOKXCloseOutput(stdout, string(stderr), runErr)
 }
 
-// parseOKXCloseOutput turns raw subprocess output into
-// (*OKXCloseResult, stderr, error) following the RunOKXClose contract.
-// Extracted so the decision logic can be tested without spawning
-// Python (same reason as parseHyperliquidCloseOutput, #341/#342).
 func parseOKXCloseOutput(stdout []byte, stderrStr string, runErr error) (*OKXCloseResult, string, error) {
 	var result OKXCloseResult
 	parseErr := json.Unmarshal(stdout, &result)
@@ -1118,8 +1410,6 @@ func parseOKXCloseOutput(stdout []byte, stderrStr string, runErr error) (*OKXClo
 	}
 }
 
-// OKXPositionsResult is the JSON output from fetch_okx_positions.py.
-// Size is signed (positive = long, negative = short) to mirror HLPosition.
 type OKXPositionsResult struct {
 	Positions []OKXPositionJSON `json:"positions"`
 	Platform  string            `json:"platform"`
@@ -1127,7 +1417,6 @@ type OKXPositionsResult struct {
 	Error     string            `json:"error,omitempty"`
 }
 
-// OKXPositionJSON is the per-position payload from fetch_okx_positions.py.
 type OKXPositionJSON struct {
 	Coin          string  `json:"coin"`
 	Size          float64 `json:"size"`
@@ -1136,47 +1425,26 @@ type OKXPositionJSON struct {
 	UnrealizedPnL float64 `json:"unrealized_pnl"`
 }
 
-// RunOKXFetchPositions runs fetch_okx_positions.py and returns the parsed
-// result (#345). Like RunOKXClose, any failure path returns a non-nil
-// error so the kill switch can latch and retry — a silent parse failure
-// would otherwise look like "no positions" and clear virtual state while
-// on-chain exposure remained.
 func RunOKXFetchPositions(script string) (*OKXPositionsResult, string, error) {
 	stdout, stderr, runErr := RunPythonScript(script, nil)
 	return parseOKXPositionsOutput(stdout, string(stderr), runErr)
 }
 
-// parseOKXPositionsOutput is the pure parser, extracted from
-// RunOKXFetchPositions so the decision logic can be tested without
-// spawning Python. Mirrors parseOKXCloseOutput / parseHyperliquidCloseOutput
-// 5-case matrix (contract drift here would be bad — the kill switch reads
-// every parser result the same way).
 func parseOKXPositionsOutput(stdout []byte, stderrStr string, runErr error) (*OKXPositionsResult, string, error) {
 	var result OKXPositionsResult
 	parseErr := json.Unmarshal(stdout, &result)
 
 	switch {
 	case runErr == nil && parseErr == nil && result.Error == "":
-		// Clean success: exit 0, valid JSON, no error field.
 		return &result, stderrStr, nil
 
 	case runErr == nil && parseErr == nil && result.Error != "":
-		// Exit 0 but the script reported an error — shouldn't happen with
-		// the current Python contract (every error path exits 1) but we
-		// honor the JSON envelope as authoritative and surface it as a
-		// contract-drift diagnostic.
 		return &result, stderrStr, fmt.Errorf("fetch positions reported error despite exit 0: %s", result.Error)
 
 	case parseErr == nil && result.Error != "":
-		// Expected error path: exit non-zero, valid JSON envelope. Surface
-		// as a non-nil error so callers don't need to double-check.
 		return &result, stderrStr, fmt.Errorf("fetch positions failed: %s", result.Error)
 
 	case parseErr == nil && runErr != nil:
-		// Exit non-zero with valid JSON but no error field — unexpected.
-		// Treat as failure to avoid silently reporting "no positions" on a
-		// non-zero exit (kill switch would clear virtual state while
-		// on-chain exposure remained — the #345 bug class).
 		return &result, stderrStr, fmt.Errorf("fetch positions subprocess exit %v with no error field (stderr: %s)", runErr, stderrStr)
 
 	default:
@@ -1184,28 +1452,55 @@ func parseOKXPositionsOutput(stdout []byte, stderrStr string, runErr error) (*OK
 	}
 }
 
-// OKXBalanceResult is the JSON output from fetch_okx_balance.py (#360).
 type OKXBalanceResult struct {
-	Balance   float64 `json:"balance"`
-	Platform  string  `json:"platform"`
-	Timestamp string  `json:"timestamp"`
-	Error     string  `json:"error,omitempty"`
+	Balance       float64 `json:"balance"`
+	UnrealizedPnL float64 `json:"unrealized_pnl"`
+	Platform      string  `json:"platform"`
+	Timestamp     string  `json:"timestamp"`
+	Error         string  `json:"error,omitempty"`
 }
 
-// RunOKXFetchBalance runs fetch_okx_balance.py and returns the parsed result
-// (#360 phase 2 of #357). Used by defaultSharedWalletBalance to unlock
-// multi-strategy OKX portfolio value correctness. Follows the same
-// contract as RunOKXClose / RunOKXFetchPositions: non-nil error on ANY
-// failure path so callers preserve the kill switch on uncertainty.
+type BloFinCopyBalanceResult struct {
+	TotalEquity       float64 `json:"total_equity"`
+	Available         float64 `json:"available"`
+	AccountType       string  `json:"account_type"`
+	Mode              string  `json:"mode"`
+	Timestamp         string  `json:"timestamp"`
+	ExchangeTimestamp int64   `json:"exchange_timestamp_ms"`
+	Error             string  `json:"error,omitempty"`
+}
+
+func RunBloFinCopyBalance(script, mode string) (*BloFinCopyBalanceResult, string, error) {
+	stdout, stderr, runErr := RunPythonScript(script, []string{mode})
+	return parseBloFinCopyBalanceOutput(stdout, string(stderr), runErr)
+}
+
+func parseBloFinCopyBalanceOutput(stdout []byte, stderrStr string, runErr error) (*BloFinCopyBalanceResult, string, error) {
+	var result BloFinCopyBalanceResult
+	parseErr := json.Unmarshal(stdout, &result)
+	switch {
+	case parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("fetch BloFin Copy balance failed: %s", result.Error)
+	case runErr != nil:
+		return &result, stderrStr, fmt.Errorf("fetch BloFin Copy balance subprocess failed: %w (stderr: %s)", runErr, stderrStr)
+	case parseErr != nil:
+		return nil, stderrStr, fmt.Errorf("parse BloFin Copy balance output: %w (stdout: %s)", parseErr, string(stdout))
+	case result.Mode != "perps" || result.AccountType != "copy_trading_futures":
+		return &result, stderrStr, fmt.Errorf("unexpected BloFin balance source: mode=%q account_type=%q", result.Mode, result.AccountType)
+	case math.IsNaN(result.TotalEquity) || math.IsInf(result.TotalEquity, 0) || result.TotalEquity <= 0:
+		return &result, stderrStr, fmt.Errorf("invalid BloFin Copy totalEquity %v", result.TotalEquity)
+	case result.Timestamp == "" || result.ExchangeTimestamp <= 0:
+		return &result, stderrStr, fmt.Errorf("BloFin Copy balance is missing a trustworthy timestamp")
+	default:
+		return &result, stderrStr, nil
+	}
+}
+
 func RunOKXFetchBalance(script string) (*OKXBalanceResult, string, error) {
 	stdout, stderr, runErr := RunPythonScript(script, nil)
 	return parseOKXBalanceOutput(stdout, string(stderr), runErr)
 }
 
-// parseOKXBalanceOutput is the pure parser for RunOKXFetchBalance. Extracted
-// so the decision logic can be tested without spawning Python. Mirrors
-// parseOKXPositionsOutput's 5-case matrix — contract drift across fetch
-// parsers would be bad.
 func parseOKXBalanceOutput(stdout []byte, stderrStr string, runErr error) (*OKXBalanceResult, string, error) {
 	var result OKXBalanceResult
 	parseErr := json.Unmarshal(stdout, &result)
@@ -1228,29 +1523,54 @@ func parseOKXBalanceOutput(stdout []byte, stderrStr string, runErr error) (*OKXB
 	}
 }
 
-// RobinhoodCloseFill is the parsed fill block from close_robinhood_position.py.
-// Mirrors OKXCloseFill. OID is a string (robin_stocks order IDs are opaque
-// UUIDs), fields are optional — empty {} means the adapter found no position
-// to close (already-flat success).
+type OKXBillsResult struct {
+	Bills     []okxBillRecord `json:"bills"`
+	Capped    bool            `json:"capped"`
+	Platform  string          `json:"platform"`
+	Timestamp string          `json:"timestamp"`
+	Error     string          `json:"error,omitempty"`
+}
+
+func RunOKXFetchBills(script string, sinceMs int64) (*OKXBillsResult, string, error) {
+	args := []string{fmt.Sprintf("--since-ms=%d", sinceMs)}
+	stdout, stderr, runErr := RunPythonScript(script, args)
+	return parseOKXBillsOutput(stdout, string(stderr), runErr)
+}
+
+func parseOKXBillsOutput(stdout []byte, stderrStr string, runErr error) (*OKXBillsResult, string, error) {
+	var result OKXBillsResult
+	parseErr := json.Unmarshal(stdout, &result)
+
+	switch {
+	case runErr == nil && parseErr == nil && result.Error == "":
+		return &result, stderrStr, nil
+
+	case runErr == nil && parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("fetch bills reported error despite exit 0: %s", result.Error)
+
+	case parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("fetch bills failed: %s", result.Error)
+
+	case parseErr == nil && runErr != nil:
+		return &result, stderrStr, fmt.Errorf("fetch bills subprocess exit %v with no error field (stderr: %s)", runErr, stderrStr)
+
+	default:
+		return nil, stderrStr, fmt.Errorf("parse bills output: %v (run err: %v, stdout: %s)", parseErr, runErr, string(stdout))
+	}
+}
+
 type RobinhoodCloseFill struct {
 	AvgPx   float64 `json:"avg_px,omitempty"`
 	TotalSz float64 `json:"total_sz,omitempty"`
 	OID     string  `json:"oid,omitempty"`
 }
 
-// RobinhoodClose is the close block from close_robinhood_position.py.
-// AlreadyFlat is set by the Python script when adapter.get_crypto_positions
-// returns qty<=0 at submit time (eventual-consistency window after the
-// Go-side fetch). See HyperliquidClose for the reasoning (#350).
 type RobinhoodClose struct {
 	Symbol      string              `json:"symbol"`
 	Fill        *RobinhoodCloseFill `json:"fill,omitempty"`
 	AlreadyFlat bool                `json:"already_flat,omitempty"`
 }
 
-// RobinhoodCloseResult is the top-level JSON from close_robinhood_position.py.
-// Used by the portfolio kill switch to liquidate live Robinhood crypto
-// exposure (#346).
 type RobinhoodCloseResult struct {
 	Close     *RobinhoodClose `json:"close"`
 	Platform  string          `json:"platform"`
@@ -1258,10 +1578,6 @@ type RobinhoodCloseResult struct {
 	Error     string          `json:"error,omitempty"`
 }
 
-// RunRobinhoodClose runs close_robinhood_position.py to submit a market close
-// for a single Robinhood crypto coin (#346). Contract mirrors
-// RunHyperliquidClose / RunOKXClose: any failure path returns a non-nil
-// error so the kill switch stays latched on ambiguous responses.
 func RunRobinhoodClose(script, symbol string) (*RobinhoodCloseResult, string, error) {
 	args := []string{
 		fmt.Sprintf("--symbol=%s", symbol),
@@ -1271,11 +1587,6 @@ func RunRobinhoodClose(script, symbol string) (*RobinhoodCloseResult, string, er
 	return parseRobinhoodCloseOutput(stdout, string(stderr), runErr)
 }
 
-// parseRobinhoodCloseOutput turns raw subprocess output into
-// (*RobinhoodCloseResult, stderr, error) following the RunRobinhoodClose
-// contract. Extracted so decision logic can be tested without spawning
-// Python — same pattern as parseHyperliquidCloseOutput /
-// parseOKXCloseOutput (#341/#342/#345).
 func parseRobinhoodCloseOutput(stdout []byte, stderrStr string, runErr error) (*RobinhoodCloseResult, string, error) {
 	var result RobinhoodCloseResult
 	parseErr := json.Unmarshal(stdout, &result)
@@ -1298,8 +1609,6 @@ func parseRobinhoodCloseOutput(stdout []byte, stderrStr string, runErr error) (*
 	}
 }
 
-// RobinhoodPositionsResult is the JSON output from fetch_robinhood_positions.py.
-// Size is unsigned — Robinhood crypto is spot, no short positions.
 type RobinhoodPositionsResult struct {
 	Positions []RobinhoodPositionJSON `json:"positions"`
 	Platform  string                  `json:"platform"`
@@ -1307,25 +1616,17 @@ type RobinhoodPositionsResult struct {
 	Error     string                  `json:"error,omitempty"`
 }
 
-// RobinhoodPositionJSON is the per-position payload from
-// fetch_robinhood_positions.py.
 type RobinhoodPositionJSON struct {
 	Coin     string  `json:"coin"`
 	Size     float64 `json:"size"`
 	AvgPrice float64 `json:"avg_price"`
 }
 
-// RunRobinhoodFetchPositions runs fetch_robinhood_positions.py and returns
-// the parsed result (#346). Like RunRobinhoodClose, any failure path
-// returns a non-nil error so the kill switch can latch and retry.
 func RunRobinhoodFetchPositions(script string) (*RobinhoodPositionsResult, string, error) {
 	stdout, stderr, runErr := RunPythonScript(script, nil)
 	return parseRobinhoodPositionsOutput(stdout, string(stderr), runErr)
 }
 
-// parseRobinhoodPositionsOutput is the pure parser, extracted from
-// RunRobinhoodFetchPositions so the decision logic can be tested without
-// spawning Python. Mirrors parseOKXPositionsOutput's 5-case matrix.
 func parseRobinhoodPositionsOutput(stdout []byte, stderrStr string, runErr error) (*RobinhoodPositionsResult, string, error) {
 	var result RobinhoodPositionsResult
 	parseErr := json.Unmarshal(stdout, &result)
@@ -1398,7 +1699,6 @@ func FetchPricesBestEffort(symbols []string, timeout time.Duration) (map[string]
 }
 
 // FuturesMarkModePaperFallback is the mode string returned by
-// FuturesMarkModePaperFallback is the mode string returned by
 // fetch_futures_marks.py when live mode init failed (e.g. missing deps,
 // network error) and the script silently degraded to yfinance paper quotes.
 // Callers that care about surfacing the downgrade compare against this
@@ -1406,22 +1706,6 @@ func FetchPricesBestEffort(symbols []string, timeout time.Duration) (map[string]
 // expected states, so the Go side does not act on them.
 const FuturesMarkModePaperFallback = "paper_fallback"
 
-// FetchFuturesMarks runs fetch_futures_marks.py and returns a map of
-// contract-symbol→mark-price for CME futures (TopStep), plus the mode
-// string embedded by the Python script. Mirrors FetchPrices but routes
-// through the TopStep adapter (yfinance in paper mode, TopStepX REST in
-// live mode) because BinanceUS does not quote ES/NQ/MES/MNQ/CL. See
-// issue #261: without this, PortfolioNotional revalued futures positions
-// at pos.AvgCost, freezing exposure at entry cost.
-//
-// The script embeds a reserved "_mode" metadata key in its JSON output
-// (one of "live", "paper", "paper_fallback"). We strip it from the
-// returned marks map (this is also the *only* filter site for "_mode" —
-// mergeFuturesMarks never sees it) and return it as a separate value so
-// callers can decide how to surface paper_fallback. Logging is NOT done
-// here because this function is called from both the main cycle loop
-// (naturally rate-limited) and /status (polled frequently, needs
-// throttled logging to avoid spam during sustained downgrades).
 func FetchFuturesMarks(symbols []string) (map[string]float64, string, error) {
 	if len(symbols) == 0 {
 		return map[string]float64{}, "", nil
@@ -1431,23 +1715,12 @@ func FetchFuturesMarks(symbols []string) (map[string]float64, string, error) {
 		return nil, "", fmt.Errorf("futures marks fetch error: %w (stderr: %s)", err, string(stderr))
 	}
 
-	// The script mixes float prices with a string "_mode" metadata key,
-	// so decode into interface{} first, then split into the
-	// float-keyed marks map and the mode string. This loop is the only
-	// place "_mode" is filtered out — downstream code (mergeFuturesMarks,
-	// PortfolioNotional) operates on the already-clean map[string]float64
-	// and never has to defend against the string key. If a future refactor
-	// changes this return type, the filter must move with it.
 	var raw map[string]interface{}
 	if err := json.Unmarshal(stdout, &raw); err != nil {
 		return nil, "", fmt.Errorf("parse futures marks: %w (stdout: %s)", err, string(stdout))
 	}
 
 	marks := make(map[string]float64, len(raw))
-	// mode is parsed on every call so callers can detect silent downgrades
-	// (paper_fallback); "live" and "paper" are expected happy-path states
-	// and are intentionally not logged anywhere — see callers in main.go
-	// and server.go which only branch on FuturesMarkModePaperFallback.
 	mode := ""
 	for k, v := range raw {
 		if k == "_mode" {
@@ -1466,24 +1739,27 @@ func FetchFuturesMarks(symbols []string) (map[string]float64, string, error) {
 // BloFinResult is the JSON output from check_blofin.py (signal check mode).
 type BloFinResult struct {
 	StrategyDecisionFields
-	Strategy   string                 `json:"strategy"`
-	Symbol     string                 `json:"symbol"`
-	Timeframe  string                 `json:"timeframe"`
-	Signal     int                    `json:"signal"`
-	Price      float64                `json:"price"`
-	Indicators map[string]interface{} `json:"indicators"`
-	Mode       string                 `json:"mode"`
-	Platform   string                 `json:"platform"`
-	Timestamp  string                 `json:"timestamp"`
-	Error      string                 `json:"error,omitempty"`
+	Strategy             string                 `json:"strategy"`
+	Symbol               string                 `json:"symbol"`
+	Timeframe            string                 `json:"timeframe"`
+	Signal               int                    `json:"signal"`
+	Price                float64                `json:"price"`
+	Indicators           map[string]interface{} `json:"indicators"`
+	Mode                 string                 `json:"mode"`
+	Platform             string                 `json:"platform"`
+	Timestamp            string                 `json:"timestamp"`
+	CloseContextWarnings []string               `json:"close_context_warnings,omitempty"`
+	Error                string                 `json:"error,omitempty"`
 }
 
 // BloFinFill holds fill details from a live BloFin order.
 type BloFinFill struct {
-	AvgPx   float64 `json:"avg_px"`
-	TotalSz float64 `json:"total_sz"`
-	OID     string  `json:"oid,omitempty"`
-	Fee     float64 `json:"fee,omitempty"`
+	AvgPx         float64 `json:"avg_px"`
+	TotalSz       float64 `json:"total_sz"`
+	OID           string  `json:"oid,omitempty"`
+	ClientOrderID string  `json:"client_order_id,omitempty"`
+	Fee           float64 `json:"fee,omitempty"`
+	ContractValue float64 `json:"contract_value,omitempty"`
 }
 
 // BloFinExecution is the execution block from check_blofin.py --execute output.
@@ -1500,6 +1776,7 @@ type BloFinExecuteResult struct {
 	Platform  string           `json:"platform"`
 	Timestamp string           `json:"timestamp"`
 	Error     string           `json:"error,omitempty"`
+	Skipped   string           `json:"skipped,omitempty"`
 }
 
 // BloFinCloseFill is the parsed fill block from close_blofin_position.py.
@@ -1561,13 +1838,25 @@ func RunBloFinCheck(script string, args []string) (*BloFinResult, string, error)
 }
 
 // RunBloFinExecute runs check_blofin.py in execute mode (live orders).
-func RunBloFinExecute(script, symbol, side string, size float64, slPrice float64, tpPrices ...float64) (*BloFinExecuteResult, string, error) {
+func RunBloFinExecute(script, symbol, side string, size float64, slPrice float64, sizeInContracts bool, posSideHint string, isClose bool, leverage float64, tpPrices ...float64) (*BloFinExecuteResult, string, error) {
 	args := []string{
 		"--execute",
 		fmt.Sprintf("--symbol=%s", symbol),
 		fmt.Sprintf("--side=%s", side),
 		fmt.Sprintf("--size=%g", size),
 		"--mode=live",
+	}
+	if sizeInContracts {
+		args = append(args, "--size-in-contracts")
+	}
+	if posSideHint == "long" || posSideHint == "short" {
+		args = append(args, "--pos-side-hint="+posSideHint)
+	}
+	if isClose {
+		args = append(args, "--is-close")
+	}
+	if leverage > 0 {
+		args = append(args, fmt.Sprintf("--leverage=%g", leverage))
 	}
 	if slPrice > 0 {
 		args = append(args, fmt.Sprintf("--sl-price=%g", slPrice))

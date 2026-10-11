@@ -8,15 +8,6 @@ import (
 	"strings"
 )
 
-// ui_reports.go (#956): serves the strategy-audit report as an in-dashboard HTML
-// page under a "Reports" section. The audit data lives here as Go structs — the
-// single source of truth feeding the template — so the page never drifts from the
-// numbers in the issue-956 audit comment. Loopback-only, same auth/draining posture
-// as the rest of the UI; no external assets (styling reuses /dashboard/styles.css).
-
-// auditRow is one strategy's aggregated backtest result across the 6 (symbol,
-// timeframe) runs. Verdict is a CSS class (keep|watch|deprecate|bug|na); VerdictLabel
-// is the human display text (may carry a qualifier, e.g. "watch (short leg unmeasured)").
 type auditRow struct {
 	Strategy     string
 	Registry     string
@@ -40,8 +31,6 @@ func (r auditRow) VsBHText() string {
 	return fmt.Sprintf("%+.1f", r.VsBH)
 }
 
-// VsBHSort returns a sort key that pushes the unmeasured ("—") rows to the bottom
-// of an ascending sort instead of letting a 0 interleave with real edges.
 func (r auditRow) VsBHSort() float64 {
 	if !r.HasVsBH {
 		return -1000
@@ -49,7 +38,6 @@ func (r auditRow) VsBHSort() float64 {
 	return r.VsBH
 }
 
-// oosRow is one strategy's out-of-sample check (BTC/USDT 1h, since 2026-01-01).
 type oosRow struct {
 	Strategy  string
 	ReturnPct float64
@@ -63,7 +51,6 @@ func (r oosRow) ReturnText() string { return fmt.Sprintf("%.1f", r.ReturnPct) }
 func (r oosRow) SharpeText() string { return fmt.Sprintf("%.2f", r.Sharpe) }
 func (r oosRow) EdgeText() string   { return fmt.Sprintf("%+.1f", r.EdgeVsBH) }
 
-// deprecationItem and candidateVerdict are the narrative sections of the report.
 type deprecationItem struct {
 	Strategy  string
 	Rationale string
@@ -71,11 +58,10 @@ type deprecationItem struct {
 
 type candidateVerdict struct {
 	Name    string
-	Verdict string // CONFIRM | CUT | BLOCKED
+	Verdict string
 	Body    string
 }
 
-// reportMeta describes one available report for the /reports index.
 type reportMeta struct {
 	Slug        string
 	Title       string
@@ -83,7 +69,6 @@ type reportMeta struct {
 	Generated   string
 }
 
-// strategyAuditReport is the full dataset for /reports/strategy-audit.
 type strategyAuditReport struct {
 	Meta          reportMeta
 	Method        []string
@@ -96,11 +81,8 @@ type strategyAuditReport struct {
 	Candidates    []candidateVerdict
 }
 
-// availableReports is the index registry. Add new reports here.
 var availableReports = []reportMeta{strategyAuditReportData.Meta}
 
-// strategyAuditReportData is the single source of truth for the audit page, mirroring
-// the audit comment on issue #956 (2026-06-10, backtest-only, 12-month bear window).
 var strategyAuditReportData = strategyAuditReport{
 	Meta: reportMeta{
 		Slug:        "strategy-audit",
@@ -131,15 +113,15 @@ var strategyAuditReportData = strategyAuditReport{
 		{"chart_pattern", "both", -0.27, -11.5, 37.1, true, -60.5, 185, "watch", "watch"},
 		{"momentum_pro", "both", -0.32, -12.0, 36.5, true, -55.9, 51, "watch", "watch"},
 		{"range_scalper", "both", -0.38, -14.2, 34.4, true, -55.9, 9, "deprecate", "deprecate (M1 degenerate; M5 gross <= 0)"},
-		{"donchian_breakout", "both", -0.42, -17.6, 31.0, true, -55.5, 355, "watch", "watch"},
+		{"donchian_breakout", "both", -0.42, -17.6, 31.0, true, -55.5, 355, "deprecate", "deprecate (#985: no gate/profile clears protocol OOS + held-outs)"},
 		{"ichimoku_cloud", "both", -0.43, -8.5, 40.1, true, -65.5, 173, "watch", "watch"},
 		{"order_blocks", "both", -0.52, -19.9, 28.7, true, -63.4, 295, "watch", "watch"},
-		{"amd_ifvg", "both", -0.53, -19.6, 28.9, true, -63.4, 87, "watch", "watch"},
+		{"amd_ifvg", "both", -0.53, -19.6, 28.9, true, -63.4, 87, "deprecate", "deprecate (#1023: DST/session-timing corrected + 15m rebaseline; passes OOS but failed 2023/2024 held-outs on both 15m and 1h/4h)"},
 		{"sweep_squeeze_combo", "both", -0.55, -29.4, 19.2, true, -73.5, 26, "watch", "watch"},
 		{"momentum", "spot", -0.58, -22.1, 26.5, true, -58.1, 126, "watch", "watch"},
 		{"sma_crossover", "both", -0.68, -24.0, 24.5, true, -70.7, 360, "watch", "watch"},
 		{"volume_weighted", "both", -0.72, -26.6, 22.0, true, -64.6, 287, "watch", "watch"},
-		{"session_breakout", "futures", -0.79, -28.4, 20.2, true, -67.3, 371, "watch", "watch (short leg unmeasured)"},
+		{"session_breakout", "futures", -0.79, -28.4, 20.2, true, -67.3, 371, "deprecate", "deprecate (#1031: short leg failed bull-year held-outs)"},
 		{"atr_breakout", "both", -0.89, -22.7, 25.9, true, -69.8, 389, "watch", "watch"},
 		{"tema_cross", "both", -0.90, -17.9, 30.6, true, -49.5, 451, "watch", "watch"},
 		{"momentum", "futures", -0.92, -30.2, 18.4, true, -62.3, 287, "watch", "watch"},
@@ -173,6 +155,9 @@ var strategyAuditReportData = strategyAuditReport{
 		{"rsi", "-45.3%, +3.3pt edge over 118 trades."},
 		{"liquidity_sweeps", "Long leg was -16.94% gross in M5; #1022 short-leg screen passes protocol OOS but fails 2023/2024 held-outs with SOL liquidations."},
 		{"range_scalper", "#987 current-cache M1 is degenerate in every window (0/3 held-outs) and M5 remains gross-negative (-7.46% gross over 7 trades)."},
+		{"session_breakout", "#1031 short leg: gross edge real on OOS (Sharpe up to 2.50) but bear gate + atr_stop + zscore all fail the 2023/2024 bull-year held-outs (best 1/3); the short edge can't survive an uptrend and exits amputate the long-hold winners."},
+		{"amd_ifvg", "#1023: session timing was UTC-fixed/DST-unaware and the M5 deprecate baseline ran on 1h/4h, not the designed 15m. Corrected to NY-anchored ICT killzones (DST-aware civil sessions) and rebaselined at 15m + 1h/4h. The corrected baseline clears protocol OOS but fails the 2023 and 2024 held-out years on both timeframes (1/3 held-out) — competitive only in chop, lags incumbents in trends. Concept disproven on a sound implementation."},
+		{"donchian_breakout", "#985 full M1: the long leg (shipped default) fails every window ungated, and no mechanism rescues it — ADX trending_up gate and composite trending_up_clean gate flip IS only, the entry_period plateau wanders per window (30 passes 2023, 40 passes 2024, nothing passes 2025H1), the best tuned config (period 40 + gate) fails the one protocol-OOS look on DDadj, and the #977 M4 dual profile (20/55 on the ADX switch) fails all five windows. The short leg has a real OOS edge (Sharpe 1.62 gated vs bar -0.75) but fails the 2023/2024 bull-year held-outs at every period and under both classifiers (best 1/3) — the #1031 session_breakout failure shape. Both sides measured per the M5 unscreened_short requirement."},
 		{"bollinger_bands", "-44.0%, +4.6pt edge over 344 trades."},
 		{"ema_crossover", "-40.8% over 559 trades; dominated by sma_crossover and tema_cross."},
 		{"adx_trend", "-38.5%, -76.1% worst DD; trend filter that doesn't filter."},
@@ -199,8 +184,6 @@ var strategyAuditReportData = strategyAuditReport{
 	},
 }
 
-// handleReports serves the reports index (/reports) and dispatches the audit page
-// (/reports/strategy-audit). Loopback-only and drain-aware like the rest of the UI.
 func (ss *StatusServer) handleReports(w http.ResponseWriter, r *http.Request) {
 	if ss.rejectIfDraining(w) {
 		return
@@ -233,7 +216,6 @@ func (ss *StatusServer) renderHTML(w http.ResponseWriter, tmpl *template.Templat
 	w.Write(buf.Bytes())
 }
 
-// reportPageFuncs are shared template helpers.
 var reportPageFuncs = template.FuncMap{
 	"lower": strings.ToLower,
 }

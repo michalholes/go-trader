@@ -1,7 +1,8 @@
-"""Registry for position-aware close strategy evaluators."""
 
 from __future__ import annotations
 
+import math
+import json
 import os
 import sys
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -25,10 +26,14 @@ from tiered_tp_pct import evaluate as tiered_tp_pct_evaluate
 from time_stop import evaluate as time_stop_evaluate
 from atr_stop import evaluate as atr_stop_evaluate
 from zscore_target import evaluate as zscore_target_evaluate
+from avwap_stop import evaluate as avwap_stop_evaluate
 
 VALID_PLATFORMS: Tuple[str, ...] = ("spot", "futures", "options")
+VALID_PLATFORM_KEYS: Tuple[str, ...] = (*VALID_PLATFORMS, "blofin-perps")
 
-# name -> {fn, description, default_params, platforms}
+with open(os.path.join(_THIS_DIR, "support_matrix.json"), encoding="utf-8") as _support_file:
+    CLOSE_SUPPORT_MATRIX = json.load(_support_file)
+
 STRATEGIES: Dict[str, Dict[str, Any]] = {}
 
 
@@ -36,18 +41,30 @@ def register(
     name: str,
     description: str,
     default_params: dict,
-    platforms: Tuple[str, ...] = VALID_PLATFORMS,
+    platforms: Optional[Tuple[str, ...]] = None,
 ) -> Callable:
     if name in STRATEGIES:
         raise ValueError(f"Close strategy '{name}' is already registered")
-    platforms = tuple(platforms)
+    platforms = tuple(platforms or VALID_PLATFORMS)
+    blofin_support = (
+        CLOSE_SUPPORT_MATRIX.get("platforms", {})
+        .get("blofin-perps", {})
+        .get(name, {
+            "supported": False,
+            "required_context": [],
+            "stop_owner": "",
+            "notes": "No BloFin support entry is declared.",
+        })
+    )
+    if blofin_support.get("supported"):
+        platforms = (*platforms, "blofin-perps")
     if not platforms:
         raise ValueError(f"{name}: platforms must be non-empty")
-    bad = set(platforms) - set(VALID_PLATFORMS)
+    bad = set(platforms) - set(VALID_PLATFORM_KEYS)
     if bad:
         raise ValueError(
             f"{name}: unknown platforms {sorted(bad)}; "
-            f"expected subset of {VALID_PLATFORMS}"
+            f"expected subset of {VALID_PLATFORM_KEYS}"
         )
 
     def decorator(fn):
@@ -56,6 +73,7 @@ def register(
             "description": description,
             "default_params": dict(default_params),
             "platforms": platforms,
+            "support": {"blofin-perps": dict(blofin_support)},
         }
         return fn
 
@@ -63,15 +81,16 @@ def register(
 
 
 def build_close_registry(platform: str) -> Dict[str, Dict[str, Any]]:
-    if platform not in VALID_PLATFORMS:
+    if platform not in VALID_PLATFORM_KEYS:
         raise ValueError(
-            f"Unknown platform {platform!r}; expected one of {VALID_PLATFORMS}"
+            f"Unknown platform {platform!r}; expected one of {VALID_PLATFORM_KEYS}"
         )
     return {
         name: {
             "fn": entry["fn"],
             "description": entry["description"],
             "default_params": dict(entry["default_params"]),
+            "support": {k: dict(v) for k, v in entry.get("support", {}).items()},
         }
         for name, entry in STRATEGIES.items()
         if platform in entry["platforms"]
@@ -86,11 +105,41 @@ def _normalize_result(name: str, result: Optional[dict]) -> dict:
         close_fraction = 0.0
     close_fraction = min(max(close_fraction, 0.0), 1.0)
     reason = str(result.get("reason") or f"{name}:no_reason")
-    return {"close_fraction": close_fraction, "reason": reason}
+
+    out = {"close_fraction": close_fraction, "reason": reason}
+
+    sl_raw = result.get("sl_price")
+    if sl_raw is not None:
+        try:
+            sl_price = float(sl_raw)
+        except (TypeError, ValueError):
+            sl_price = 0.0
+        if sl_price > 0:
+            out["sl_price"] = sl_price
+
+    atr_raw = result.get("atr_value")
+    if atr_raw is not None:
+        try:
+            atr_value = float(atr_raw)
+        except (TypeError, ValueError):
+            atr_value = 0.0
+        if atr_value > 0:
+            out["atr_value"] = atr_value
+
+    tier = result.get("tp_tier")
+    if tier is not None and isinstance(tier, (str, int, float)) and not isinstance(tier, bool):
+        out["tp_tier"] = tier
+
+    try:
+        fill_price = float(result.get("tier_fill_price", 0) or 0)
+    except (TypeError, ValueError):
+        fill_price = 0.0
+    if close_fraction > 0 and math.isfinite(fill_price) and fill_price > 0:
+        out["tier_fill_price"] = fill_price
+    return out
 
 
 def _rewrite_deprecated_close(name: str, params: Optional[dict]) -> tuple[str, dict]:
-    """One-window shim: tp_at_pct → single-tier tiered_tp_pct (#841)."""
     if name != "tp_at_pct":
         return name, dict(params or {})
     warn_deprecated_close_key("tp_at_pct", "tiered_tp_pct")
@@ -131,44 +180,40 @@ register(
 
 register(
     "tiered_tp_atr_live",
-    "Tiered take-profit by ATR multiples using live ATR per tick (atr_source: live|entry)",
+    "Tiered take-profit by ATR multiples; Hyperliquid (tp_model resting_limit) uses entry ATR and the risk anchor like the on-chain tiers, live ATR only without an entry ATR; other platforms read live ATR per tick (atr_source: live|entry)",
     {"tp_tiers": list(DEFAULT_ATR_TIERS), "atr_source": "live"},
 )(tiered_tp_atr_live_evaluate)
 
 register(
     "tiered_tp_atr_regime",
-    "Regime-aware tiered TP — ATR multiples resolved at open via Position.Regime (#733)",
-    # default_params intentionally empty: the Go config loader expands
-    # `use_defaults: true` into a concrete tier list before evaluator
-    # invocation, and any other shape must be operator-supplied.
+    "Regime-aware tiered TP — ATR multiples resolved at open via Position.Regime (#733); Hyperliquid prices tiers from the risk anchor and rejects a non-increasing ladder like the on-chain tiers (#1576)",
     {},
 )(tiered_tp_atr_regime_evaluate)
 
 register(
     "tiered_tp_atr_live_regime",
-    "Regime-aware tiered TP — live ATR + per-tick regime classification (#733)",
+    "Regime-aware tiered TP — Hyperliquid (tp_model resting_limit) freezes entry ATR, position regime and risk anchor like the on-chain tiers (#1576); other platforms use live ATR + per-tick regime (#733)",
     {"atr_source": "live"},
 )(tiered_tp_atr_live_regime_evaluate)
 
 register(
     "tiered_tp_atr_live_regime_dynamic",
-    "Unified per-regime TP/SL — live ATR-regime re-resolution (#843; HL live uses on-chain sync)",
+    "Unified per-regime TP/SL — Hyperliquid prices tiers from entry ATR, risk anchor and applied regime for on-chain sync; BloFin perps persist two-cycle regime confirmation and manage a virtual ATR stop",
     {"atr_source": "live", "regime_confirm_cycles": 2},
 )(tiered_tp_atr_live_regime_dynamic_evaluate)
 
 register(
     "trailing_tp_ratchet",
-    "Tiered trail ratchet — tightens trailing_stop_atr_mult at each ATR tier (close_fraction may be 0)",
+    "Tiered trail ratchet — tightens trailing_stop_atr_mult at each ATR tier (close_fraction may be 0); BloFin perps use a persisted scheduler-managed virtual stop",
     {"tp_tiers": [dict(t) for t in DEFAULT_RATCHET_TIERS]},
 )(trailing_tp_ratchet_evaluate)
 
 register(
     "trailing_tp_ratchet_regime",
-    "Regime-keyed tiered trail ratchet — frozen at open via Position.Regime (#844)",
+    "Regime-keyed tiered trail ratchet — frozen at open via Position.Regime; BloFin perps use a persisted scheduler-managed virtual stop",
     {},
 )(trailing_tp_ratchet_regime_evaluate)
 
-# #997 M3 exit-quality knobs — default-off; backtest-wired, live wiring deferred.
 register(
     "time_stop",
     "Holding-time cap — full close after max_bars held (default-off; needs bars_held context)",
@@ -186,3 +231,9 @@ register(
     "Z-score target exit — full close when price stretches z_target sigma in favour (default-off; needs zscore context)",
     {"lookback": 0, "z_target": 0.0},
 )(zscore_target_evaluate)
+
+register(
+    "avwap_stop",
+    "AVWAP loss-of-line exit — full close when the mark breaches the anchored VWAP by buffer_atr_mult ATR (needs market avwap context; atr_source: live|entry)",
+    {"buffer_atr_mult": 0.25, "atr_source": "live"},
+)(avwap_stop_evaluate)

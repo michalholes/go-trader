@@ -1,31 +1,4 @@
 #!/usr/bin/env python3
-"""Holding-time / excursion diagnostics for exit-quality refinement (#997 M3).
-
-Step 1 of methodology M3 in one command: *where does a strategy's PnL die* —
-early reversal (loser runs straight against the entry), late giveback (winner
-peaks then bleeds back), or fee churn on the exit leg? The answer points at the
-mechanism to try next (atr_stop / time_stop / zscore_target), instead of a
-blind close-param sweep.
-
-It runs the SAME audit-identical harness as the M1 scorer: it imports the
-versioned ``WINDOWS`` / ``DATASETS`` / ``PLATFORM`` from ``eval_windows.py`` so
-diagnosis and scoring see byte-identical data slices, then reads the per-trade
-hold telemetry the backtester stamps (#997: ``bars_held``, ``mfe_pct`` /
-``mae_pct`` excursions, ``entry_fee`` / ``exit_fee``, ``exit_reason``).
-
-Usage:
-  uv run --no-sync python backtest/exit_diagnostics.py --strategy ichimoku_cloud
-  uv run --no-sync python backtest/exit_diagnostics.py --strategy ichimoku_cloud \
-      --registry spot --windows is,oos --json /tmp/diag.json
-  # diagnose a candidate WITH close refs (use --direction long to keep it
-  # long-only; the open/close engine opens shorts on signal=-1 otherwise):
-  uv run --no-sync python backtest/exit_diagnostics.py --strategy ichimoku_cloud \
-      --close-strategies '[{"name":"atr_stop","params":{"atr_mult":2.5}}]' \
-      --direction long
-
-All aggregation logic is pure (operates on lists of trade dicts) so it is unit
-tested without data access — same architecture as eval_windows.py.
-"""
 
 from __future__ import annotations
 
@@ -41,43 +14,24 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
-from eval_windows import (  # noqa: E402  (path bootstrap above)
+from eval_windows import (
     DATASETS,
     DEFAULT_CAPITAL,
-    PLATFORM,
+    FEE_PLATFORM,
     WINDOWS,
     dataset_key,
     parse_dataset_arg,
 )
 
-# --------------------------------------------------------------------------
-# Tunable classification thresholds (documented; not magic numbers).
-# --------------------------------------------------------------------------
 
-# Holding-time buckets (inclusive bar-count ranges).
 HOLD_BUCKETS = [(1, 1), (2, 5), (6, 20), (21, 50), (51, math.inf)]
 
-# A favourable excursion below this (percent) is "never meaningfully in profit".
 MFE_MIN_PCT = 1.0
-# late_giveback: captured at most this fraction of the peak favourable move.
 CAPTURE_FRAC = 0.5
-# early_reversal: a loser whose peak favourable move stayed under this (percent).
 EARLY_MFE_MAX_PCT = 0.5
 
 
-# --------------------------------------------------------------------------
-# Pure per-trade + aggregation helpers (unit-tested without data access).
-# --------------------------------------------------------------------------
-
 def trade_metrics(t: dict) -> dict:
-    """Derive gross/net/fee fractions + excursions from a stamped trade dict.
-
-    ``pnl_pct`` / ``mfe_pct`` / ``mae_pct`` are already percent (Trade.to_dict).
-    Fees are absolute; convert to percent of this leg's notional using shares
-    and prices so the result is independent of which run path booked the leg
-    (the plain path keeps Trade.pnl gross, the open/close path nets the exit
-    commission — but pnl_pct is gross on both, so we key off it).
-    """
     gross_pct = float(t.get("pnl_pct", 0.0) or 0.0)
     shares = float(t.get("shares", 0.0) or 0.0)
     entry_price = float(t.get("entry_price", 0.0) or 0.0)
@@ -135,7 +89,6 @@ def _mean(xs):
 
 
 def holding_time_summary(metrics: List[dict]) -> dict:
-    """Bars-held distribution + PnL bucketed by holding time."""
     if not metrics:
         return {"trades": 0, "buckets": [], "bars_held": {}}
     bars = [m["bars_held"] for m in metrics]
@@ -163,7 +116,6 @@ def holding_time_summary(metrics: List[dict]) -> dict:
 
 
 def _pct(xs, q):
-    """Linear-interpolation percentile (q in 0..100); xs non-empty."""
     s = sorted(xs)
     if len(s) == 1:
         return float(s[0])
@@ -176,11 +128,6 @@ def _pct(xs, q):
 
 
 def excursion_summary(metrics: List[dict]) -> dict:
-    """MFE/MAE excursion profile, aggregate + per holding-time bucket.
-
-    MAE/MFE are reported in ATR multiples too — read the atr_stop knob straight
-    off ``mae_atr`` percentiles (set the stop just beyond winners' typical MAE).
-    """
     if not metrics:
         return {"aggregate": {}, "buckets": []}
     winners = [m for m in metrics if m["net_pct"] > 0]
@@ -213,18 +160,6 @@ def excursion_summary(metrics: List[dict]) -> dict:
 
 
 def classify_bleed_modes(metrics: List[dict]) -> dict:
-    """Tag each trade with the dominant bleed mode → where the PnL dies.
-
-    Priority (first match wins):
-      fee_churn      — fees flipped a gross win to a net loss, or the gross
-                       price move was smaller than the round-trip fee.
-      late_giveback  — peaked >= MFE_MIN_PCT favourable then captured <=
-                       CAPTURE_FRAC of it (gave the profit back). → time_stop.
-      early_reversal — a net loser that never got meaningfully favourable
-                       (MFE < EARLY_MFE_MAX_PCT): ran against from the open.
-                       → atr_stop.
-      clean_win / clean_loss — the residual.
-    """
     counts: dict = {}
     for m in metrics:
         gross, net, fee = m["gross_pct"], m["net_pct"], m["fee_pct"]
@@ -256,7 +191,6 @@ def classify_bleed_modes(metrics: List[dict]) -> dict:
 
 
 def fee_churn_summary(metrics: List[dict]) -> dict:
-    """Exit-leg fee-drag read + exit-reason tally."""
     if not metrics:
         return {"trades": 0}
     fees = [m["fee_pct"] for m in metrics]
@@ -278,7 +212,6 @@ def fee_churn_summary(metrics: List[dict]) -> dict:
 
 
 def diagnose_trades(trades: List[dict]) -> dict:
-    """Full diagnostic for one set of trade dicts."""
     metrics = [trade_metrics(t) for t in trades]
     return {
         "holding_time": holding_time_summary(metrics),
@@ -288,26 +221,33 @@ def diagnose_trades(trades: List[dict]) -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# Leg execution (I/O; everything above stays pure).
-# --------------------------------------------------------------------------
-
 def run_leg_trades(reg, name: str, params: Optional[dict], symbol: str,
                    timeframe: str, window: tuple, capital: float,
                    close_strategies: Optional[List[dict]] = None,
                    direction: Optional[str] = None,
-                   invert_signal: bool = False) -> Optional[List[dict]]:
-    """One (strategy, dataset, window) leg → its list of trade dicts.
+                   invert_signal: bool = False,
+                   comparison_mode: Optional[str] = None) -> Optional[List[dict]]:
+    results = run_leg_results(reg, name, params, symbol, timeframe, window, capital,
+                              close_strategies=close_strategies, direction=direction,
+                              invert_signal=invert_signal,
+                              comparison_mode=comparison_mode)
+    return None if results is None else results.get("trades", [])
 
-    Mirrors eval_windows.run_leg's harness construction exactly (audit-identical
-    fees/data) but returns the full per-trade telemetry instead of collapsed
-    metrics.
-    """
+
+def run_leg_results(reg, name: str, params: Optional[dict], symbol: str,
+                    timeframe: str, window: tuple, capital: float,
+                    close_strategies: Optional[List[dict]] = None,
+                    direction: Optional[str] = None,
+                    invert_signal: bool = False,
+                    comparison_mode: Optional[str] = None) -> Optional[dict]:
     from atr import ensure_atr_indicator
     from data_fetcher import load_cached_data
-    from backtester import Backtester
+    from backtester import Backtester, validate_close_capabilities
     from run_backtest import FUNDING_COLUMN_STRATEGIES, _attach_funding_if_needed
 
+    validate_close_capabilities(close_refs=close_strategies,
+                                comparison_mode=comparison_mode,
+                                platform=FEE_PLATFORM, phase="preflight")
     start, end = window
     df = load_cached_data(symbol, timeframe, start_date=start, end_date=end)
     if df.empty:
@@ -321,23 +261,17 @@ def run_leg_trades(reg, name: str, params: Optional[dict], symbol: str,
     strat_params = params if params is not None else strat["default_params"]
 
     df_signals = reg.apply_strategy(name, df, strat_params)
-    # Always inject ATR so entry_atr telemetry (and MAE-in-ATR readout) is
-    # populated even for strategies that emit no `atr` column. This is
-    # diagnostics-only: with no ATR stop/close configured the backtester reads
-    # the series solely to stamp Trade.entry_atr, so trade behaviour — and any
-    # downstream M1 score, which runs through eval_windows, not here — is
-    # unchanged.
     df_signals = ensure_atr_indicator(df_signals)
 
     bt = Backtester(
-        initial_capital=capital, platform=PLATFORM,
+        initial_capital=capital, platform=FEE_PLATFORM,
         open_strategy={"name": name, "params": dict(strat_params or {})},
         close_strategies=close_strategies,
         direction=direction, invert_signal=invert_signal,
+        comparison_mode=comparison_mode,
     )
-    results = bt.run(df_signals, strategy_name=name, symbol=symbol,
-                     timeframe=timeframe, params=strat_params, save=False)
-    return results.get("trades", [])
+    return bt.run(df_signals, strategy_name=name, symbol=symbol,
+                  timeframe=timeframe, params=strat_params, save=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -359,6 +293,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--invert-signal", action="store_true")
     p.add_argument("--json", default=None, dest="json_out",
                    help="Write the full structured diagnostic to this path")
+    p.add_argument("--comparison-mode", dest="comparison_mode", default=None,
+                   metavar="MODE",
+                   help="#1683 close comparison mode. Omitted = strict (refuses "
+                        "time_stop/zscore_target and HL-live-only closes); "
+                        "'approximate' diagnoses research exits and carries "
+                        "close_validation with incomplete parity.")
     return p
 
 
@@ -419,6 +359,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     params = json.loads(args.params) if args.params else None
 
+    from backtester import (CloseCapabilityError, aggregate_close_validations,
+                            format_close_validation, validate_close_capabilities)
+    try:
+        validate_close_capabilities(close_refs=close_strategies,
+                                    comparison_mode=args.comparison_mode,
+                                    platform=FEE_PLATFORM, phase="preflight")
+    except CloseCapabilityError as exc:
+        raise SystemExit(str(exc))
+
     if args.windows:
         window_names = [w.strip() for w in args.windows.split(",") if w.strip()]
         unknown = [w for w in window_names if w not in WINDOWS]
@@ -436,21 +385,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     reg = load_registry(args.registry)
 
     per_window: dict = {}
+    validations = []
     for wname in window_names:
         window = WINDOWS[wname]
         per_window[wname] = {}
         for symbol, timeframe in datasets:
             ds = dataset_key(symbol, timeframe)
-            trades = run_leg_trades(
+            results = run_leg_results(
                 reg, args.strategy, params, symbol, timeframe, window,
                 args.capital, close_strategies=close_strategies,
                 direction=args.direction, invert_signal=args.invert_signal,
+                comparison_mode=args.comparison_mode,
             )
-            per_window[wname][ds] = diagnose_trades(trades or [])
+            diag = diagnose_trades((results or {}).get("trades") or [])
+            diag["close_validation"] = (results or {}).get("close_validation")
+            if results is not None:
+                validations.append(diag["close_validation"])
+            per_window[wname][ds] = diag
+    if not validations:
+        from backtester import validate_close_capabilities
+        validations.append(validate_close_capabilities(
+            close_refs=close_strategies, comparison_mode=args.comparison_mode,
+            platform=FEE_PLATFORM, phase="preflight").to_dict())
+    close_validation = aggregate_close_validations(validations)
 
     print(f"strategy: {args.strategy}  registry: {args.registry}  "
           f"close: {close_strategies or 'none'}  direction: {args.direction or 'default'}")
     print(format_report(per_window))
+    print(format_close_validation(close_validation))
 
     if args.json_out:
         payload = {
@@ -459,6 +421,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "params": params,
             "close_strategies": close_strategies,
             "direction": args.direction,
+            "comparison_mode": args.comparison_mode,
+            "close_validation": close_validation,
             "windows": per_window,
         }
         with open(args.json_out, "w") as fh:

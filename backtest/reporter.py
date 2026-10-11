@@ -1,9 +1,6 @@
-"""
-Performance reporting — generates text-based reports with comprehensive metrics.
-Supports single-strategy reports, comparisons, and multi-asset analysis.
-"""
 
 import sys
+import re
 import os
 import json
 from typing import List, Dict, Optional
@@ -17,8 +14,19 @@ import pandas as pd
 from storage import get_backtest_results
 
 
+def _close_validation_line(obj) -> str:
+    from backtester import format_close_validation
+    return format_close_validation(obj)
+
+
+def _fmt_opt(value, spec: str = ".3f", none_text: str = "n/a") -> str:
+    if value is None:
+        m = re.match(r">?(\d+)", spec)
+        return none_text.rjust(int(m.group(1))) if m else none_text
+    return format(value, spec)
+
+
 def format_single_report(results: dict) -> str:
-    """Format a single backtest result into a detailed text report."""
     lines = [
         f"\n{'='*70}",
         f"  BACKTEST REPORT: {results.get('strategy_name', 'Unknown')}",
@@ -37,26 +45,27 @@ def format_single_report(results: dict) -> str:
         f"{'─'*70}",
         f"  RISK METRICS",
         f"    Sharpe Ratio:    {results.get('sharpe_ratio', 0):.3f}",
-        f"    Sortino Ratio:   {results.get('sortino_ratio', 0):.3f}",
+        f"    Sortino Ratio:   {_fmt_opt(results.get('sortino_ratio', 0))}",
         f"    Max Drawdown:    {results.get('max_drawdown_pct', 0):.2f}%",
         f"    Calmar Ratio:    {results.get('calmar_ratio', 0):.3f}",
         f"{'─'*70}",
         f"  TRADE STATS",
         f"    Total Trades:    {results.get('total_trades', 0)}",
         f"    Win Rate:        {results.get('win_rate', 0):.1f}%",
-        f"    Profit Factor:   {results.get('profit_factor', 0):.3f}",
+        f"    Profit Factor:   {_fmt_opt(results.get('profit_factor', 0))}",
         f"    Avg Win:         {results.get('avg_win_pct', 0):+.2f}%",
         f"    Avg Loss:        {results.get('avg_loss_pct', 0):+.2f}%",
+        f"{'─'*70}",
+        f"  {_close_validation_line(results.get('close_validation'))}",
     ]
 
-    # Trade log
     trades = results.get("trades", [])
     if trades:
         lines.append(f"{'─'*70}")
         lines.append(f"  TRADE LOG ({len(trades)} trades)")
         lines.append(f"  {'Entry Date':<22} {'Exit Date':<22} {'Entry $':>10} {'Exit $':>10} {'PnL %':>8}")
         lines.append(f"  {'─'*74}")
-        for t in trades[:20]:  # Show first 20
+        for t in trades[:20]:
             lines.append(
                 f"  {str(t.get('entry_date',''))[:19]:<22} "
                 f"{str(t.get('exit_date',''))[:19]:<22} "
@@ -72,7 +81,6 @@ def format_single_report(results: dict) -> str:
 
 
 def format_comparison_report(results_list: List[dict], title: str = "STRATEGY COMPARISON") -> str:
-    """Format multiple backtest results into a comparison table."""
     if not results_list:
         return "No results to compare."
 
@@ -92,27 +100,29 @@ def format_comparison_report(results_list: List[dict], title: str = "STRATEGY CO
             f"{r.get('symbol','?'):<10} "
             f"{r.get('total_return_pct',0):>+7.1f}% "
             f"{r.get('sharpe_ratio',0):>7.2f} "
-            f"{r.get('sortino_ratio',0):>7.2f} "
+            f"{_fmt_opt(r.get('sortino_ratio',0), '>7.2f'):} "
             f"{r.get('max_drawdown_pct',0):>+7.1f}% "
             f"{r.get('win_rate',0):>6.1f}% "
-            f"{r.get('profit_factor',0):>5.2f} "
+            f"{_fmt_opt(r.get('profit_factor',0), '>5.2f'):} "
             f"{r.get('total_trades',0):>6}"
         )
 
-    # Summary stats
     returns = [r.get("total_return_pct", 0) for r in sorted_results]
     sharpes = [r.get("sharpe_ratio", 0) for r in sorted_results]
     lines.extend([
         f"  {'─'*88}",
         f"  Best Return: {max(returns):+.2f}% | Best Sharpe: {max(sharpes):.3f}",
         f"  Mean Return: {np.mean(returns):+.2f}% | Mean Sharpe: {np.mean(sharpes):.3f}",
+    ])
+    from backtester import aggregate_close_validations
+    lines.extend([
+        f"  {_close_validation_line(aggregate_close_validations(r.get('close_validation') for r in results_list))}",
         f"{'='*90}",
     ])
     return "\n".join(lines)
 
 
 def format_multi_asset_report(results_by_asset: Dict[str, List[dict]]) -> str:
-    """Format results across multiple assets."""
     lines = [
         f"\n{'#'*90}",
         f"  MULTI-ASSET ANALYSIS",
@@ -123,7 +133,6 @@ def format_multi_asset_report(results_by_asset: Dict[str, List[dict]]) -> str:
         lines.append(f"\n  ▸ {symbol}")
         lines.append(format_comparison_report(results, title=f"{symbol} Results"))
 
-    # Cross-asset summary
     all_results = []
     for results in results_by_asset.values():
         all_results.extend(results)
@@ -146,7 +155,6 @@ def format_multi_asset_report(results_by_asset: Dict[str, List[dict]]) -> str:
 
 
 def format_walk_forward_report(wf_result: dict) -> str:
-    """Format walk-forward optimization results."""
     lines = [
         f"\n{'='*70}",
         f"  WALK-FORWARD OPTIMIZATION: {wf_result.get('strategy', 'Unknown')}",
@@ -167,13 +175,13 @@ def format_walk_forward_report(wf_result: dict) -> str:
         f"  STABILITY",
         f"    Most Stable Params: {wf_result.get('most_common_best_params', 'N/A')}",
     ]
+    lines.append(f"    {_close_validation_line(wf_result.get('close_validation'))}")
     swept_closes = wf_result.get("close_stack_grid_size", 1) > 1
     if swept_closes:
         lines.append(
             f"    Most Stable Close Stack: "
             f"{wf_result.get('most_common_best_close_stack', 'N/A')}")
 
-    # Per-fold details
     windows = wf_result.get("window_results", [])
     if windows:
         lines.append(f"{'─'*70}")
@@ -201,7 +209,6 @@ def generate_full_report(
     wf_results: Optional[List[dict]] = None,
     title: str = "TRADING BOT ANALYSIS REPORT"
 ) -> str:
-    """Generate a comprehensive report combining all analyses."""
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         f"\n{'#'*90}",
@@ -210,7 +217,6 @@ def generate_full_report(
         f"{'#'*90}",
     ]
 
-    # Group by symbol
     by_symbol = {}
     for r in results_list:
         sym = r.get("symbol", "Unknown")
@@ -221,7 +227,6 @@ def generate_full_report(
     else:
         lines.append(format_comparison_report(results_list))
 
-    # Walk-forward results
     if wf_results:
         lines.append(f"\n{'#'*90}")
         lines.append(f"  WALK-FORWARD OPTIMIZATION RESULTS")
@@ -233,7 +238,6 @@ def generate_full_report(
 
 
 if __name__ == "__main__":
-    # Test with dummy data
     dummy = [
         {"strategy_name": "sma_crossover", "symbol": "BTC/USDT", "total_return_pct": 15.2,
          "sharpe_ratio": 1.2, "sortino_ratio": 1.8, "max_drawdown_pct": -12.5,

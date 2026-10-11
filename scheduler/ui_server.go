@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,49 +26,76 @@ type UIStrategy struct {
 	Symbol    string `json:"symbol"`
 	Timeframe string `json:"timeframe"`
 	Direction string `json:"direction,omitempty"`
+	Paused    bool   `json:"paused,omitempty"`
+
+	Partition   string `json:"partition"`
+	PaperSource string `json:"paper_source,omitempty"`
 }
 
 type UIStrategyOverview struct {
-	ID               string                 `json:"id"`
-	Platform         string                 `json:"platform"`
-	Symbol           string                 `json:"symbol"`
-	PnLPct           float64                `json:"pnl_pct"`
-	WinRate          float64                `json:"win_rate,omitempty"`
-	Sharpe           float64                `json:"sharpe,omitempty"`
-	Regime           string                 `json:"regime,omitempty"`
-	Direction        string                 `json:"direction,omitempty"`
-	PnL              float64                `json:"pnl"`
-	PortfolioValue   float64                `json:"portfolio_value"`
-	InitialCapital   float64                `json:"initial_capital"`
-	RegimeDivergence *RegimeDivergenceState `json:"regime_divergence,omitempty"` // #907: active window-divergence state; nil when none
-	RegimeConfig     *RegimeConfig              `json:"regime_config,omitempty"`        // global regime config from top-level
+	ID                    string                 `json:"id"`
+	Type                  string                 `json:"type"`
+	Platform              string                 `json:"platform"`
+	Symbol                string                 `json:"symbol"`
+	PnLPct                float64                `json:"pnl_pct"`
+	WinRate               float64                `json:"win_rate,omitempty"`
+	Sharpe                float64                `json:"sharpe,omitempty"`
+	DrawdownPct           float64                `json:"drawdown_pct,omitempty"`
+	Regime                string                 `json:"regime,omitempty"`
+	Direction             string                 `json:"direction,omitempty"`
+	Mode                  string                 `json:"mode"`
+	TradeCount            int                    `json:"trade_count"`
+	CloseStrategy         string                 `json:"close_strategy,omitempty"`
+	PnL                   float64                `json:"pnl"`
+	RealizedPnL           float64                `json:"realized_pnl,omitempty"`
+	UnrealizedPnL         float64                `json:"unrealized_pnl,omitempty"`
+	PortfolioValue        float64                `json:"portfolio_value"`
+	InitialCapital        float64                `json:"initial_capital"`
+	PoolBudget            bool                   `json:"pool_budget,omitempty"`
+	RegimeDivergence      *RegimeDivergenceState `json:"regime_divergence,omitempty"`
+	Paused                bool                   `json:"paused,omitempty"`
+	RegimeGateFailClosed  bool                   `json:"regime_gate_fail_closed,omitempty"`
+	CashReconcileRequired bool                   `json:"cash_reconcile_required,omitempty"`
+
+	Partition   string `json:"partition"`
+	PaperSource string `json:"paper_source,omitempty"`
 }
 
 type UIStrategyStatus struct {
-	ID               string                     `json:"id"`
-	Type             string                     `json:"type"`
-	Platform         string                     `json:"platform"`
-	Symbol           string                     `json:"symbol"`
-	Timeframe        string                     `json:"timeframe"`
-	Direction        string                     `json:"direction,omitempty"`
-	Cash             float64                    `json:"cash"`
-	InitialCapital   float64                    `json:"initial_capital"`
-	PortfolioValue   float64                    `json:"portfolio_value"`
-	PnL              float64                    `json:"pnl"`
-	PnLPct           float64                    `json:"pnl_pct"`
-	TradeCount       int                        `json:"trade_count"`
-	WinRate          float64                    `json:"win_rate,omitempty"`
-	LifetimeStats    LifetimeTradeStats         `json:"lifetime_stats"`
-	Sharpe           float64                    `json:"sharpe,omitempty"`
-	Regime           string                     `json:"regime,omitempty"`
-	RegimeDivergence *RegimeDivergenceState     `json:"regime_divergence,omitempty"` // #907: active window-divergence state; nil when none
-	RegimeConfig     *RegimeConfig              `json:"regime_config,omitempty"`        // global regime config from top-level
-	RiskState        RiskState                  `json:"risk_state"`
-	Positions        map[string]*Position       `json:"positions"`
-	OptionPositions  map[string]*OptionPosition `json:"option_positions"`
-	Leverage         float64                    `json:"leverage,omitempty"`
-	SizingLeverage   float64                    `json:"sizing_leverage,omitempty"`
-	MarginMode       string                     `json:"margin_mode,omitempty"`
+	ID                    string                     `json:"id"`
+	Type                  string                     `json:"type"`
+	Platform              string                     `json:"platform"`
+	Symbol                string                     `json:"symbol"`
+	Timeframe             string                     `json:"timeframe"`
+	Direction             string                     `json:"direction,omitempty"`
+	Cash                  float64                    `json:"cash"`
+	InitialCapital        float64                    `json:"initial_capital"`
+	PortfolioValue        float64                    `json:"portfolio_value"`
+	PnL                   float64                    `json:"pnl"`
+	PnLPct                float64                    `json:"pnl_pct"`
+	PoolBudget            bool                       `json:"pool_budget,omitempty"`
+	TradeCount            int                        `json:"trade_count"`
+	WinRate               float64                    `json:"win_rate,omitempty"`
+	LifetimeStats         LifetimeTradeStats         `json:"lifetime_stats"`
+	Sharpe                float64                    `json:"sharpe,omitempty"`
+	Regime                string                     `json:"regime,omitempty"`
+	RegimeDivergence      *RegimeDivergenceState     `json:"regime_divergence,omitempty"`
+	RiskState             RiskState                  `json:"risk_state"`
+	Positions             map[string]*Position       `json:"positions"`
+	OptionPositions       map[string]*OptionPosition `json:"option_positions"`
+	Leverage              float64                    `json:"leverage,omitempty"`
+	SizingLeverage        float64                    `json:"sizing_leverage,omitempty"`
+	MarginMode            string                     `json:"margin_mode,omitempty"`
+	Paused                bool                       `json:"paused,omitempty"`
+	CashReconcileRequired bool                       `json:"cash_reconcile_required,omitempty"`
+
+	EffectiveDirection             string              `json:"effective_direction,omitempty"`
+	EffectiveInvertSignal          bool                `json:"effective_invert_signal,omitempty"`
+	RegimeDirectionalPolicy        bool                `json:"regime_directional_policy,omitempty"`
+	EffectivePolicyRegime          string              `json:"effective_policy_regime,omitempty"`
+	DirectionalCertificationStatus string              `json:"directional_certification_status,omitempty"`
+	DirectionalCertificationCell   string              `json:"directional_certification_cell,omitempty"`
+	RegimeProfile                  *RegimeProfileState `json:"regime_profile,omitempty"`
 }
 
 type UIEquityPoint struct {
@@ -75,8 +103,6 @@ type UIEquityPoint struct {
 	V float64 `json:"v"`
 }
 
-// uiEquityLookbackLimit caps closed-position rows for dashboard equity curves (#805).
-// Independent of sharpeLookbackLimit so Sharpe tuning does not shrink sparklines.
 const uiEquityLookbackLimit = 500
 
 type UITradeMarker struct {
@@ -117,6 +143,40 @@ func (ss *StatusServer) requireAPIAuth(w http.ResponseWriter, r *http.Request) b
 	return false
 }
 
+// dashboardAccentCSS returns CSS variable overrides remapping the
+// green-tinted surfaces to blue-gray for the given accent name.
+// Empty string means default (green) - no override. Semantic colors
+// (profit green, loss red, warning amber) are intentionally untouched.
+func dashboardAccentCSS(accent string) string {
+	switch strings.ToLower(strings.TrimSpace(accent)) {
+	case "blue":
+		return ":root{--bg:#f2f4f8;--line:#d5dbe5;--line-strong:#b4bdcb;--text:#1d232e;--muted:#66707f;--sidebar-bg:#fafbfe;--topbar-bg:rgba(248,250,255,.8);--strategy-hover:#edf1f8;--strategy-active-border:#9db0d6;--strategy-active-bg:#e8edf7;--empty-bg:#ffffff;--position-line:#e9edf3;--focus-ring:rgba(37,99,235,.16);--focus-border:#2f5fc0;}" +
+			"html.dark{--bg:#11151c;--panel:#1a2029;--line:#2a3340;--line-strong:#3a4657;--text:#e6ebf2;--muted:#8b96a5;--sidebar-bg:#161b24;--topbar-bg:rgba(22,27,38,.92);--input-bg:#1f2630;--strategy-hover:#232a35;--strategy-active-border:#4a5f8a;--strategy-active-bg:#28303f;--empty-bg:#1a2029;--position-line:#2a3340;--focus-ring:rgba(91,156,246,.25);--focus-border:#5b9cf6;}"
+	default:
+		return ""
+	}
+}
+
+// accentStylesheet appends the DASHBOARD_ACCENT override to the dashboard
+// stylesheet so every page using it (dashboard, tuning, reports) follows
+// the configured accent. Empty accent means default (green).
+func accentStylesheet(css []byte) []byte {
+	override := dashboardAccentCSS(os.Getenv("DASHBOARD_ACCENT"))
+	if override == "" {
+		return css
+	}
+	out := make([]byte, 0, len(css)+len(override)+64)
+	out = append(out, css...)
+	if len(out) == 0 || out[len(out)-1] != 10 {
+		out = append(out, 10)
+	}
+	out = append(out, "/* DASHBOARD_ACCENT override */"...)
+	out = append(out, 10)
+	out = append(out, override...)
+	out = append(out, 10)
+	return out
+}
+
 func (ss *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if ss.rejectIfDraining(w) {
 		return
@@ -125,16 +185,47 @@ func (ss *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	// Domaci lab za CloudFlare: ziadne cachovanie UI assetov, inak po deployi
+	// chodia stare app.js/index.html z edge cache.
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
 	sub, err := fs.Sub(uiAssets, "static/ui")
 	if err != nil {
 		http.Error(w, "ui assets unavailable", http.StatusInternalServerError)
 		return
+	}
+	if r.URL.Path == "/dashboard/styles.css" && r.Method == http.MethodGet {
+		if data, err := fs.ReadFile(sub, "styles.css"); err == nil {
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+			w.Write(accentStylesheet(data))
+			return
+		}
 	}
 	if r.URL.Path == "/dashboard" || r.URL.Path == "/dashboard/" {
 		http.ServeFileFS(w, r, sub, "index.html")
 		return
 	}
 	http.StripPrefix("/dashboard/", http.FileServer(http.FS(sub))).ServeHTTP(w, r)
+}
+
+func (ss *StatusServer) handleTuning(w http.ResponseWriter, r *http.Request) {
+	if ss.rejectIfDraining(w) {
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Path != "/tuning" && r.URL.Path != "/tuning/" {
+		http.NotFound(w, r)
+		return
+	}
+	sub, err := fs.Sub(uiAssets, "static/ui")
+	if err != nil {
+		http.Error(w, "ui assets unavailable", http.StatusInternalServerError)
+		return
+	}
+	http.ServeFileFS(w, r, sub, "tuning.html")
 }
 
 func (ss *StatusServer) handleAPIStrategies(w http.ResponseWriter, r *http.Request) {
@@ -152,7 +243,11 @@ func (ss *StatusServer) handleAPIStrategies(w http.ResponseWriter, r *http.Reque
 		http.NotFound(w, r)
 		return
 	}
-	strategies := ss.uiStrategies()
+	filter, ok := ss.uiPartitionParam(w, r)
+	if !ok {
+		return
+	}
+	strategies := ss.uiStrategiesInPartition(filter)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string][]UIStrategy{"strategies": strategies})
 }
@@ -173,16 +268,50 @@ func (ss *StatusServer) handleAPIStrategiesOverview(w http.ResponseWriter, r *ht
 		return
 	}
 
-	configs := ss.uiStrategies()
-	out := make([]UIStrategyOverview, 0, len(configs))
-	for _, item := range configs {
-		overview, _, ok := ss.uiStrategyOverview(item.ID)
-		if !ok {
-			continue
-		}
-		out = append(out, overview)
+	filter, ok := ss.uiPartitionParam(w, r)
+	if !ok {
+		return
 	}
-	writeJSON(w, map[string][]UIStrategyOverview{"strategies": out})
+	ss.overviewCacheMu.RLock()
+	cached := ss.overviewCache
+	cachedAt := ss.overviewCacheAt
+	ss.overviewCacheMu.RUnlock()
+	var rows []UIStrategyOverview
+	if cached != nil && time.Since(cachedAt) < 5*time.Minute {
+		rows = cached
+	} else {
+		configs := ss.uiStrategiesInPartition(filter)
+		prices := ss.fetchLiveMarkPrices()
+		out := make([]UIStrategyOverview, 0, len(configs))
+		for _, item := range configs {
+			overview, _, found := ss.uiStrategyOverviewWithPrices(item.ID, prices)
+			if !found {
+				continue
+			}
+			out = append(out, overview)
+		}
+		ss.overviewCacheMu.Lock()
+		ss.overviewCache = out
+		ss.overviewCacheAt = time.Now()
+		ss.overviewCacheMu.Unlock()
+		rows = out
+	}
+	resp := append([]UIStrategyOverview(nil), rows...)
+	if filter.All || filter.Partition.IsLive() {
+		// Funding/profit-share live outside strategy books; surface them as
+		// their own line so the header R ties to the exchange net.
+		ss.strategiesMu.RLock()
+		cfgs := append([]StrategyConfig(nil), ss.strategies...)
+		ss.strategiesMu.RUnlock()
+		if adj := blofinCopyAdjustmentsTotalStore(ss.stateDB, cfgs); adj != 0 {
+			resp = append(resp, UIStrategyOverview{
+				ID: "live-blofin-funding", Type: "funding", Platform: "blofin", Symbol: "FUNDING",
+				Mode: "live", PnL: adj, RealizedPnL: adj, PortfolioValue: adj,
+				Partition: livePartition.String(),
+			})
+		}
+	}
+	writeJSON(w, map[string][]UIStrategyOverview{"strategies": resp})
 }
 
 func (ss *StatusServer) handleAPIStrategy(w http.ResponseWriter, r *http.Request) {
@@ -237,6 +366,14 @@ func (ss *StatusServer) handleAPIStrategy(w http.ResponseWriter, r *http.Request
 			return
 		}
 		ss.handleAPIStrategySimulate(w, r, id)
+	case "pause":
+		ss.handleAPIStrategyPause(w, r, id)
+	case "notifications":
+		ss.handleAPIStrategyNotifications(w, r, id)
+	case "open", "add", "close", "force-close", "update-sl", "cancel-sl":
+		ss.handleAPIStrategyTradeAction(w, r, id, resource)
+	case "remove-strategy", "paper-to-live", "apply-regime-gate":
+		ss.handleAPIStrategyStructural(w, r, id, resource)
 	default:
 		http.NotFound(w, r)
 	}
@@ -259,12 +396,19 @@ func parseStrategyAPIPath(p string) (id, resource string, ok bool) {
 }
 
 func (ss *StatusServer) uiStrategies() []UIStrategy {
+	return ss.uiStrategiesInPartition(uiPartitionFilter{All: true})
+}
+
+func (ss *StatusServer) uiStrategiesInPartition(filter uiPartitionFilter) []UIStrategy {
 	ss.strategiesMu.RLock()
 	configs := append([]StrategyConfig(nil), ss.strategies...)
 	ss.strategiesMu.RUnlock()
 
 	out := make([]UIStrategy, 0, len(configs))
 	for _, sc := range configs {
+		if !filter.includes(sc) {
+			continue
+		}
 		out = append(out, uiStrategyFromConfig(sc))
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -285,6 +429,10 @@ func uiStrategyFromConfig(sc StrategyConfig) UIStrategy {
 		Symbol:    strategyDisplaySymbol(sc),
 		Timeframe: strategyDisplayTimeframe(sc),
 		Direction: strategyDisplayDirection(sc),
+		Paused:    sc.Paused,
+
+		Partition:   partitionFor(sc).String(),
+		PaperSource: partitionFor(sc).Source,
 	}
 }
 
@@ -414,6 +562,10 @@ func (ss *StatusServer) handleAPIStrategyTrades(w http.ResponseWriter, r *http.R
 }
 
 func (ss *StatusServer) uiStrategyOverview(id string) (UIStrategyOverview, LifetimeTradeStats, bool) {
+	return ss.uiStrategyOverviewWithPrices(id, ss.fetchLiveMarkPrices())
+}
+
+func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[string]float64) (UIStrategyOverview, LifetimeTradeStats, bool) {
 	sc, ok := ss.strategyConfig(id)
 	if !ok {
 		return UIStrategyOverview{}, LifetimeTradeStats{}, false
@@ -430,7 +582,6 @@ func (ss *StatusServer) uiStrategyOverview(id string) (UIStrategyOverview, Lifet
 		return UIStrategyOverview{}, LifetimeTradeStats{}, false
 	}
 
-	prices := ss.fetchLiveMarkPrices()
 	pv := displayStrategyValue(&snapshot, prices)
 	initCap := EffectiveInitialCapital(sc, &snapshot)
 	pnl := pv - initCap
@@ -441,6 +592,8 @@ func (ss *StatusServer) uiStrategyOverview(id string) (UIStrategyOverview, Lifet
 
 	lifetime := LifetimeTradeStats{}
 	sharpe := 0.0
+	var realizedPnL float64
+	realizedPnLFromLedger := false
 	if ss.stateDB != nil {
 		if stats, err := ss.stateDB.LifetimeTradeStatsForStrategy(id); err == nil {
 			lifetime = stats
@@ -448,25 +601,153 @@ func (ss *StatusServer) uiStrategyOverview(id string) (UIStrategyOverview, Lifet
 		if closed, _, err := ss.stateDB.QueryClosedPositions(id, "", time.Time{}, time.Time{}, sharpeLookbackLimit, 0); err == nil {
 			sharpe = ComputeSharpeRatio(closed, initCap, DefaultAnnualRiskFreeRate)
 		}
+		if rpnl, err := ss.stateDB.RealizedPnLForStrategy(id); err == nil {
+			realizedPnL = rpnl
+			realizedPnLFromLedger = true
+		}
+	}
+	flat := len(snapshot.Positions) == 0 && len(snapshot.OptionPositions) == 0
+	liveBloFinLedger := realizedPnLFromLedger && sc.Platform == "blofin" && sc.Type == "perps" && partitionFor(sc).IsLive()
+	if liveBloFinLedger && ss.stateDB != nil {
+		// Exchange fills store gross PnL; dashboards must show net of fees.
+		if net, err := ss.stateDB.RealizedNetPnLForStrategy(id); err == nil {
+			realizedPnL = net
+		}
+	}
+	var unrealizedPnL float64
+	var openNotional float64
+	paperSpotLedger := realizedPnLFromLedger && sc.Type == "spot" && !partitionFor(sc).IsLive() && ss.stateDB != nil
+	if paperSpotLedger {
+		netPnL, err := ss.stateDB.RealizedNetPnLForStrategy(id)
+		if err != nil {
+			paperSpotLedger = false
+		} else {
+			realizedPnL = netPnL
+		}
+	}
+	if paperSpotLedger {
+		for sym, pos := range snapshot.Positions {
+			if pos == nil {
+				continue
+			}
+			px, ok := prices[sym]
+			if !ok || px <= 0 {
+				px = pos.AvgCost
+			}
+			move := px - pos.AvgCost
+			if strings.EqualFold(pos.Side, "short") {
+				move = -move
+			}
+			unrealizedPnL += pos.Quantity * move
+		}
+		pnl = realizedPnL + unrealizedPnL
+		pv = initCap + pnl
+		pnlPct = 0
+		if initCap > 0 {
+			pnlPct = pnl / initCap * 100
+		}
+	} else if liveBloFinLedger {
+		// For live BloFin, realized comes from exchange fills. Calculate open PnL
+		// directly so stale virtual cash/old fees are not mislabelled as U.
+		for sym, pos := range snapshot.Positions {
+			if pos == nil {
+				continue
+			}
+			px, ok := prices[sym]
+			if !ok || px <= 0 {
+				px = pos.AvgCost
+			}
+			mult := pos.Multiplier
+			if mult <= 0 {
+				mult = 1
+			}
+			move := px - pos.AvgCost
+			if strings.EqualFold(pos.Side, "short") {
+				move = -move
+			}
+			unrealizedPnL += pos.Quantity * mult * move
+			openNotional += pos.Quantity * mult * px
+		}
+		if openNotional > 0 {
+			unrealizedPnL -= CalculatePlatformSpotFee(sc.Platform, openNotional)
+		}
+		pnl = realizedPnL + unrealizedPnL
+		pv = initCap + pnl
+		pnlPct = 0
+		if initCap > 0 {
+			pnlPct = pnl / initCap * 100
+		}
+	} else {
+		unrealizedPnL = pnl - realizedPnL
+		if flat {
+			realizedPnL = pnl
+			unrealizedPnL = 0
+		}
+		for sym, pos := range snapshot.Positions {
+			if pos == nil {
+				continue
+			}
+			px, ok := prices[sym]
+			if !ok || px <= 0 {
+				px = pos.AvgCost
+			}
+			mult := pos.Multiplier
+			if mult <= 0 {
+				mult = 1
+			}
+			openNotional += pos.Quantity * mult * px
+		}
+		if openNotional > 0 {
+			unrealizedPnL -= CalculatePlatformSpotFee(sc.Platform, openNotional)
+		}
 	}
 	winRate := 0.0
 	if lifetime.Wins+lifetime.Losses > 0 {
 		winRate = float64(lifetime.Wins) / float64(lifetime.Wins+lifetime.Losses) * 100
 	}
 
+	activeTradesNow := len(snapshot.Positions) + len(snapshot.OptionPositions)
+	if activeTradesNow < 0 {
+		activeTradesNow = 0
+	}
+
 	return UIStrategyOverview{
-		ID:               id,
-		Platform:         sc.Platform,
-		Symbol:           strategyDisplaySymbol(sc),
-		PnLPct:           pnlPct,
-		WinRate:          winRate,
-		Sharpe:           sharpe,
-		Regime:           snapshot.Regime,
-		Direction:        strategyDisplayDirection(sc),
-		PnL:              pnl,
-		PortfolioValue:   pv,
-		InitialCapital:   initCap,
-		RegimeDivergence: snapshot.RegimeDivergence,
+		ID:       id,
+		Type:     sc.Type,
+		Platform: sc.Platform,
+		Symbol:   strategyDisplaySymbol(sc),
+		PnLPct:   pnlPct,
+		WinRate:  winRate,
+		Sharpe:   sharpe,
+		DrawdownPct: func() float64 {
+			peak := snapshot.RiskState.PeakValue
+			if peak > 0 {
+				dd := (peak - pv) / peak * 100
+				if dd < 0 {
+					dd = 0
+				}
+				return dd
+			}
+			return 0
+		}(),
+		Regime:                strategyDisplayRegimeLabel(&snapshot, sc, ss.regime),
+		Direction:             strategyDisplayDirection(sc),
+		Mode:                  strategyDisplayMode(sc),
+		TradeCount:            lifetime.Wins + lifetime.Losses,
+		CloseStrategy:         strategyDisplayCloseStrategy(sc),
+		PnL:                   pnl,
+		RealizedPnL:           realizedPnL,
+		UnrealizedPnL:         unrealizedPnL,
+		PortfolioValue:        pv,
+		InitialCapital:        initCap,
+		PoolBudget:            usesSharedWalletPoolBudget(sc),
+		RegimeDivergence:      snapshot.RegimeDivergence,
+		Paused:                sc.Paused,
+		RegimeGateFailClosed:  regimeGateFailClosedActive(sc, &snapshot, ss.regime),
+		CashReconcileRequired: snapshot.CashReconcileRequired,
+
+		Partition:   partitionFor(sc).String(),
+		PaperSource: partitionFor(sc).Source,
 	}, lifetime, true
 }
 
@@ -499,31 +780,41 @@ func (ss *StatusServer) handleAPIStrategyStatus(w http.ResponseWriter, r *http.R
 	}
 
 	resp := UIStrategyStatus{
-		ID:               overview.ID,
-		Type:             sc.Type,
-		Platform:         overview.Platform,
-		Symbol:           overview.Symbol,
-		Timeframe:        strategyDisplayTimeframe(sc),
-		Direction:        overview.Direction,
-		Cash:             snapshot.Cash,
-		InitialCapital:   overview.InitialCapital,
-		PortfolioValue:   overview.PortfolioValue,
-		PnL:              overview.PnL,
-		PnLPct:           overview.PnLPct,
-		RegimeConfig:     ss.regime,
-		TradeCount:       len(snapshot.TradeHistory),
-		WinRate:          overview.WinRate,
-		LifetimeStats:    lifetime,
-		Sharpe:           overview.Sharpe,
-		Regime:           overview.Regime,
-		RegimeDivergence: overview.RegimeDivergence,
-		RiskState:        snapshot.RiskState,
-		Positions:        snapshot.Positions,
-		OptionPositions:  snapshot.OptionPositions,
-		Leverage:         EffectiveExchangeLeverage(sc),
-		SizingLeverage:   EffectiveSizingLeverage(sc),
-		MarginMode:       sc.MarginMode,
+		ID:                    overview.ID,
+		Type:                  sc.Type,
+		Platform:              overview.Platform,
+		Symbol:                overview.Symbol,
+		Timeframe:             strategyDisplayTimeframe(sc),
+		Direction:             overview.Direction,
+		Cash:                  snapshot.Cash,
+		InitialCapital:        overview.InitialCapital,
+		PortfolioValue:        overview.PortfolioValue,
+		PnL:                   overview.PnL,
+		PnLPct:                overview.PnLPct,
+		PoolBudget:            overview.PoolBudget,
+		TradeCount:            len(snapshot.TradeHistory),
+		WinRate:               overview.WinRate,
+		LifetimeStats:         lifetime,
+		Sharpe:                overview.Sharpe,
+		Regime:                overview.Regime,
+		RegimeDivergence:      overview.RegimeDivergence,
+		RiskState:             snapshot.RiskState,
+		Positions:             snapshot.Positions,
+		OptionPositions:       snapshot.OptionPositions,
+		Leverage:              EffectiveExchangeLeverage(sc),
+		SizingLeverage:        EffectiveSizingLeverage(sc),
+		MarginMode:            sc.MarginMode,
+		Paused:                sc.Paused,
+		CashReconcileRequired: snapshot.CashReconcileRequired,
+		RegimeProfile:         snapshot.RegimeProfile,
 	}
+	dirView := directionalStatusForStrategy(sc, &snapshot, ss.regime, time.Now().UTC())
+	resp.EffectiveDirection = dirView.EffectiveDirection
+	resp.EffectiveInvertSignal = dirView.EffectiveInvertSignal
+	resp.RegimeDirectionalPolicy = dirView.PolicyConfigured
+	resp.EffectivePolicyRegime = dirView.EffectivePolicyRegime
+	resp.DirectionalCertificationStatus = dirView.CertStatus
+	resp.DirectionalCertificationCell = dirView.CertCell
 	writeJSON(w, resp)
 }
 
@@ -549,12 +840,6 @@ func (ss *StatusServer) handleAPIStrategyEquity(w http.ResponseWriter, r *http.R
 	}
 
 	initCap := EffectiveInitialCapital(sc, &snapshot)
-	// Cost-basis terminal point only — avoids N× external mark fetches when
-	// loadSparklines polls one equity URL per visible strategy (#813). For a
-	// shared-wallet member this returns the exchange-derived value (#918) so the
-	// sparkline's last point matches the overview card; it still adds no mark
-	// fetch (displayStrategyValue falls through to the same PortfolioValue when
-	// the gate is unset).
 	pv := displayStrategyValue(&snapshot, map[string]float64{})
 
 	var closed []ClosedPosition
@@ -575,8 +860,6 @@ func (ss *StatusServer) handleAPIStrategyEquity(w http.ResponseWriter, r *http.R
 	})
 }
 
-// buildEquityCurvePoints builds a mini equity curve from initial capital, realized
-// PnL at each closed position (ASC), and the current portfolio value.
 func buildEquityCurvePoints(initCap float64, closed []ClosedPosition, currentPV float64, limit int) []UIEquityPoint {
 	if limit <= 0 {
 		limit = 40
@@ -714,7 +997,6 @@ func tradeMarkers(trades []Trade) []UITradeMarker {
 	return out
 }
 
-// tradeMarkersForTable returns a copy of markers (already oldest-first from tradeMarkers) for the trades JSON key (#808).
 func tradeMarkersForTable(markers []UITradeMarker) []UITradeMarker {
 	if len(markers) == 0 {
 		return []UITradeMarker{}
@@ -810,6 +1092,7 @@ func cloneUIPositions(in map[string]*Position) map[string]*Position {
 		cp := *v
 		cp.TPOIDs = append([]int64(nil), v.TPOIDs...)
 		cp.TPArmedTiers = append([]bool(nil), v.TPArmedTiers...)
+		cp.TPConsumptions = cloneTPConsumptions(v.TPConsumptions)
 		if v.StopLossATRMult != nil {
 			x := *v.StopLossATRMult
 			cp.StopLossATRMult = &x
@@ -853,4 +1136,18 @@ func cloneUIRiskState(in RiskState) RiskState {
 		out.PendingCircuitCloses[k] = &cp
 	}
 	return out
+}
+
+func strategyDisplayMode(sc StrategyConfig) string {
+	if isLiveArgs(sc.Args) {
+		return "live"
+	}
+	return "paper"
+}
+
+func strategyDisplayCloseStrategy(sc StrategyConfig) string {
+	if sc.CloseStrategy == nil {
+		return ""
+	}
+	return sc.CloseStrategy.Name
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 )
 
 const (
@@ -12,8 +13,6 @@ const (
 	dynamicCloseParamConfirmCycles = "regime_confirm_cycles"
 )
 
-// strategyUsesDynamicRegimeClose reports whether the strategy's close ref is
-// tiered_tp_atr_live_regime_dynamic with the unified per-regime block (#843).
 func strategyUsesDynamicRegimeClose(sc StrategyConfig) bool {
 	for _, ref := range sc.closeRefs() {
 		if strings.ToLower(strings.TrimSpace(ref.Name)) == dynamicCloseStrategyName {
@@ -23,8 +22,6 @@ func strategyUsesDynamicRegimeClose(sc StrategyConfig) bool {
 	return false
 }
 
-// dynamicCloseConfirmCycles returns regime_confirm_cycles from the close ref
-// (default 2). Values < 1 are treated as 1.
 func dynamicCloseConfirmCycles(sc StrategyConfig) int {
 	for _, ref := range sc.closeRefs() {
 		if strings.ToLower(strings.TrimSpace(ref.Name)) != dynamicCloseStrategyName {
@@ -46,8 +43,6 @@ func dynamicCloseConfirmCycles(sc StrategyConfig) int {
 	return defaultRegimeConfirmCycles
 }
 
-// strategyCurrentATRRegime returns the live ATR-window regime label from the
-// strategy's most recent check output, mirroring strategyCurrentDirectionalRegime.
 func strategyCurrentATRRegime(stratState *StrategyState, sc StrategyConfig) string {
 	if stratState == nil {
 		return ""
@@ -61,9 +56,6 @@ func strategyCurrentATRRegime(stratState *StrategyState, sc StrategyConfig) stri
 	return strings.TrimSpace(stratState.Regime)
 }
 
-// dynamicCloseATRRegimeLabel returns the ATR regime label used to resolve SL,
-// TP tiers, and sl_after for dynamic close strategies. While a pending label
-// is counting toward confirm cycles, the last applied label stays in effect.
 func dynamicCloseATRRegimeLabel(pos *Position, sc StrategyConfig) string {
 	if pos == nil {
 		return ""
@@ -74,9 +66,6 @@ func dynamicCloseATRRegimeLabel(pos *Position, sc StrategyConfig) string {
 	return positionATRRegimeLabel(pos, sc)
 }
 
-// advanceDynamicCloseRegime updates confirm-cycle state on pos and reports
-// whether the applied ATR regime label changed this cycle. Call under the
-// state lock while a position is open.
 func advanceDynamicCloseRegime(pos *Position, stratState *StrategyState, sc StrategyConfig) (regimeChanged bool) {
 	if pos == nil || stratState == nil || !strategyUsesDynamicRegimeClose(sc) {
 		return false
@@ -113,9 +102,76 @@ func advanceDynamicCloseRegime(pos *Position, stratState *StrategyState, sc Stra
 	return old != current
 }
 
-// protectionATRRegimeLabel selects the ATR regime for on-chain protection and
-// post-TP SL resolution: dynamic close uses the applied label; everything else
-// uses the stamped position label.
+func advancePaperDynamicCloseRegime(sc StrategyConfig, stratState *StrategyState, db *StateDB, symbol string, mark float64, mu *sync.RWMutex, logger *StrategyLogger) (int, string) {
+	if sc.Platform != "hyperliquid" || hyperliquidIsLive(sc.Args) || !strategyUsesDynamicRegimeClose(sc) {
+		return 0, ""
+	}
+	if stratState == nil || mu == nil || symbol == "" {
+		return 0, ""
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	pos, ok := stratState.Positions[symbol]
+	if !ok || pos == nil || pos.Quantity <= 0 {
+		return 0, ""
+	}
+	if tpConsumptionHoldsRegime(pos) {
+		if logger != nil {
+			logger.InfoOnChange("tp-consumption-hold", symbol, "Paper dynamic close regime held for %s: confirmed take-profit consumption is still unprocessed", symbol)
+		}
+		return 0, ""
+	}
+	oldLabel := pos.RegimeAppliedLabel
+	if !advanceDynamicCloseRegime(pos, stratState, sc) {
+		return 0, ""
+	}
+	if logger != nil {
+		logger.Info("Paper dynamic close regime confirmed for %s: %s -> %s", symbol, oldLabel, pos.RegimeAppliedLabel)
+	}
+	newTrigger, move := paperDynamicFlipStopTrigger(sc, pos)
+	if !move {
+		return 0, ""
+	}
+	oldTrigger := pos.StopLossTriggerPx
+	pos.StopLossTriggerPx = newTrigger
+	stampOpenTradeWithProtectionSnapshot(stratState, db, sc, symbol, pos)
+	if logger != nil {
+		logger.Info("Paper SL re-armed for the confirmed regime %s: $%.4f -> $%.4f", pos.RegimeAppliedLabel, oldTrigger, newTrigger)
+	}
+	if !trailingStopBreached(pos.Side, mark, newTrigger) {
+		return 0, ""
+	}
+	fillPx := paperStopFillPx(pos.Side, mark, newTrigger)
+	if !recordPerpsStopLossClose(stratState, symbol, fillPx, paperStopReasonATR, logger) {
+		return 0, ""
+	}
+	return 1, fmt.Sprintf("[%s] %s %s @ $%.2f", sc.ID, paperStopLossDetailLabel(paperStopReasonATR), symbol, fillPx)
+}
+
+func dynamicRegimeStopMoves(sc StrategyConfig, pos *Position, currentPx, candidatePx float64) bool {
+	if pos == nil || candidatePx <= 0 || math.IsNaN(candidatePx) || math.IsInf(candidatePx, 0) {
+		return false
+	}
+	if effectiveTrailingStopPct(sc, pos) > 0 || strategyUsesTrailingTPRatchetClose(sc) {
+		return false
+	}
+	if pos.SLAfterMoved && !hlTriggerStrictlyTighter(pos.Side, candidatePx, currentPx) {
+		return false
+	}
+	return triggerPxMoveExceedsMinPct(currentPx, candidatePx, effectiveTrailingStopMinMovePct(sc))
+}
+
+func paperDynamicFlipStopTrigger(sc StrategyConfig, pos *Position) (float64, bool) {
+	if pos == nil || pos.StopLossTriggerPx <= 0 {
+		return 0, false
+	}
+	newPx := fixedStopLossATRTriggerPx(sc, pos.Side, pos)
+	if !dynamicRegimeStopMoves(sc, pos, pos.StopLossTriggerPx, newPx) {
+		return 0, false
+	}
+	return newPx, true
+}
+
 func protectionATRRegimeLabel(pos *Position, sc StrategyConfig) string {
 	if strategyUsesDynamicRegimeClose(sc) {
 		return dynamicCloseATRRegimeLabel(pos, sc)
@@ -123,7 +179,6 @@ func protectionATRRegimeLabel(pos *Position, sc StrategyConfig) string {
 	return positionATRRegimeLabel(pos, sc)
 }
 
-// atrTierTriggerPx computes the reduce-only TP trigger for one tier.
 func atrTierTriggerPx(side string, avgCost, entryATR, atrMult float64) float64 {
 	if avgCost <= 0 || entryATR <= 0 || atrMult <= 0 {
 		return 0
@@ -139,7 +194,6 @@ func atrTierTriggerPx(side string, avgCost, entryATR, atrMult float64) float64 {
 	}
 }
 
-// atrStopLossTriggerPx computes the fixed ATR stop trigger for one side.
 func atrStopLossTriggerPx(side string, avgCost, entryATR, slMult float64) float64 {
 	if avgCost <= 0 || entryATR <= 0 || slMult <= 0 {
 		return 0
@@ -154,8 +208,6 @@ func atrStopLossTriggerPx(side string, avgCost, entryATR, slMult float64) float6
 	}
 }
 
-// triggerPxMoveExceedsMinPct reports whether replacing oldPx with newPx clears
-// the trailing-stop min-move debounce (same 0.5% default as HL trailing SL).
 func triggerPxMoveExceedsMinPct(oldPx, newPx, minMovePct float64) bool {
 	if newPx <= 0 {
 		return false
@@ -170,8 +222,6 @@ func triggerPxMoveExceedsMinPct(oldPx, newPx, minMovePct float64) bool {
 	return movePct >= minMovePct
 }
 
-// dynamicProtectionSurplusTPOIDs returns resting TP OIDs at indices >= newTierCount
-// that must be canceled when a regime flip shrinks the per-regime ladder (#843).
 func dynamicProtectionSurplusTPOIDs(tpOIDs []int64, newTierCount int) []int64 {
 	if newTierCount >= len(tpOIDs) {
 		return nil
@@ -185,8 +235,6 @@ func dynamicProtectionSurplusTPOIDs(tpOIDs []int64, newTierCount int) []int64 {
 	return out
 }
 
-// dynamicProtectionForceReplace computes per-tier TP and SL force-replace flags
-// after the applied regime changes. Filled tiers (armed with OID 0) are skipped.
 func dynamicProtectionForceReplace(
 	sc StrategyConfig,
 	pos *Position,
@@ -197,21 +245,25 @@ func dynamicProtectionForceReplace(
 	if !regimeChanged || pos == nil {
 		return false, nil
 	}
-	minMove := effectiveTrailingStopMinMovePct(sc)
-
-	if plan.StopLossATRMult > 0 {
-		oldSL := 0.0
-		if v, ok := unifiedCloseStopLossATR(sc, oldRegime); ok {
-			oldSL = atrStopLossTriggerPx(plan.Side, plan.AvgCost, plan.EntryATR, v)
+	label := protectionATRRegimeLabel(pos, sc)
+	newMult := 0.0
+	if v, ok := unifiedCloseStopLossATR(sc, label); ok {
+		newMult = v
+	} else if plan.StopLossATRMult > 0 {
+		newMult = plan.StopLossATRMult
+	}
+	if newMult > 0 {
+		newSL := atrStopLossTriggerPx(plan.Side, plan.AvgCost, plan.EntryATR, newMult)
+		current := pos.StopLossTriggerPx
+		if current <= 0 {
+			if v, ok := unifiedCloseStopLossATR(sc, oldRegime); ok {
+				current = atrStopLossTriggerPx(plan.Side, plan.AvgCost, plan.EntryATR, v)
+			}
 		}
-		newSL := atrStopLossTriggerPx(plan.Side, plan.AvgCost, plan.EntryATR, plan.StopLossATRMult)
-		cur := pos.StopLossTriggerPx
-		if cur > 0 {
-			oldSL = cur
-		}
-		forceSL = triggerPxMoveExceedsMinPct(oldSL, newSL, minMove)
+		forceSL = dynamicRegimeStopMoves(sc, pos, current, newSL)
 	}
 
+	minMove := effectiveTrailingStopMinMovePct(sc)
 	oldTiers := strategyTPTiersForRegime(sc, oldRegime)
 	if len(plan.Tiers) == 0 {
 		return forceSL, nil
@@ -222,7 +274,6 @@ func dynamicProtectionForceReplace(
 			continue
 		}
 		if i < len(pos.TPOIDs) && pos.TPOIDs[i] == 0 && (i >= len(pos.TPArmedTiers) || !pos.TPArmedTiers[i]) {
-			// Never armed — sync will place fresh.
 			continue
 		}
 		oldMult := 0.0
@@ -238,23 +289,17 @@ func dynamicProtectionForceReplace(
 	return forceSL, forceTP
 }
 
-// validateDynamicRegimeClose validates tiered_tp_atr_live_regime_dynamic params.
 func validateDynamicRegimeClose(params map[string]interface{}, labels []string, ctxLabel string) []string {
 	var errs []string
 	if params == nil {
 		errs = append(errs, fmt.Sprintf("%s: params required", ctxLabel))
 		return errs
 	}
-	for k := range params {
-		if k != regimeClassifierKey && k != "atr_source" && k != dynamicCloseParamConfirmCycles {
-			errs = append(errs, fmt.Sprintf("%s: unknown param %q (allowed: trend_regime, atr_source, regime_confirm_cycles)", ctxLabel, k))
-		}
-	}
 	if v, ok := params[dynamicCloseParamConfirmCycles]; ok {
-		if f, err := floatFromAnyChecked(v); err != nil || f < 1 {
-			errs = append(errs, fmt.Sprintf("%s.%s: must be >= 1", ctxLabel, dynamicCloseParamConfirmCycles))
+		if f, err := floatFromAnyChecked(v); err != nil || f < 1 || f != math.Trunc(f) || f >= float64(math.MaxInt64) {
+			errs = append(errs, fmt.Sprintf("%s.%s: must be a whole number >= 1, got %#v", ctxLabel, dynamicCloseParamConfirmCycles, v))
 		}
 	}
-	errs = append(errs, validateUnifiedRegimeClose(params, labels, ctxLabel)...)
+	errs = append(errs, validateUnifiedRegimeClose(params, labels, ctxLabel, dynamicCloseParamConfirmCycles)...)
 	return errs
 }

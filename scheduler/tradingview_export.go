@@ -40,11 +40,19 @@ type tradingViewExportOptions struct {
 func runExport(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "Usage: go-trader export tradingview [--config scheduler/config.json] (--all | --strategy <id>...) --output <file>")
+		fmt.Fprintln(os.Stderr, "       "+strings.TrimPrefix(ledgerCaptureUsage, "Usage: "))
+		fmt.Fprintln(os.Stderr, "       "+strings.TrimPrefix(ledgerExportUsage, "Usage: "))
 		return 2
 	}
 	switch args[0] {
 	case "tradingview":
 		return runTradingViewExport(args[1:])
+	case "capture":
+		return runLedgerCapture(args[1:])
+	case "ledger":
+		return runLedgerExport(args[1:])
+	case captureWorkerTarget:
+		return runLedgerCaptureWorker(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown export target %q\n", args[0])
 		return 2
@@ -71,7 +79,7 @@ func runTradingViewExport(args []string) int {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		return 1
 	}
-	stateDB, err := OpenStateDB(cfg.DBFile)
+	stateDB, err := openToolStateStore(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open state DB: %v\n", err)
 		return 1
@@ -91,7 +99,7 @@ func runTradingViewExport(args []string) int {
 	return 0
 }
 
-func exportTradingViewCSVFile(stateDB *StateDB, cfg *Config, opts tradingViewExportOptions) (int, error) {
+func exportTradingViewCSVFile(stateDB *StateStore, cfg *Config, opts tradingViewExportOptions) (int, error) {
 	if strings.TrimSpace(opts.OutputPath) == "" {
 		return 0, fmt.Errorf("--output is required")
 	}
@@ -251,9 +259,6 @@ func tradingViewSide(sc StrategyConfig, trade Trade) (string, error) {
 		if strings.EqualFold(trade.TradeType, "options") || strings.EqualFold(sc.Type, "options") {
 			return tradingViewOptionCloseSide(trade)
 		}
-		// Close trades from circuit-breaker / portfolio paths encode the
-		// position direction in Details ("Close long" / "Close short"); see
-		// risk.go and portfolio.go. Closing a long → sell, closing a short → buy.
 		details := strings.ToLower(trade.Details)
 		switch {
 		case strings.Contains(details, "close long"):
@@ -267,8 +272,6 @@ func tradingViewSide(sc StrategyConfig, trade Trade) (string, error) {
 	}
 }
 
-// tradingViewTradeRef returns a short reference (exchange order id when set,
-// otherwise the symbol) to make export-error logs traceable.
 func tradingViewTradeRef(trade Trade) string {
 	if id := strings.TrimSpace(trade.ExchangeOrderID); id != "" {
 		return "order=" + id
@@ -288,8 +291,6 @@ func tradingViewOptionCloseSide(trade Trade) (string, error) {
 			return "sell", nil
 		}
 	}
-	// Legacy long-option position IDs do not include action; closing a bought
-	// option is a sell transaction in TradingView.
 	return "sell", nil
 }
 
@@ -421,7 +422,6 @@ func splitCryptoPair(symbol string) (string, string, bool) {
 	parts := strings.FieldsFunc(strings.ToUpper(strings.TrimSpace(symbol)), func(r rune) bool {
 		return r == '/' || r == '-' || r == '_' || r == ' '
 	})
-	// Filter instrument suffixes so BTC-USDT-SWAP becomes BTC/USDT.
 	filtered := parts[:0]
 	for _, part := range parts {
 		if part != "" && part != "SWAP" && part != "PERP" && part != "PERPS" {

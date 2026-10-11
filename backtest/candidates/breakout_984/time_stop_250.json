@@ -1,0 +1,13 @@
+{
+  "name": "breakout",
+  "direction": "long",
+  "close_strategies": [
+    {
+      "name": "time_stop",
+      "params": {
+        "max_bars": 250
+      }
+    }
+  ],
+  "comparison_mode": "approximate"
+}

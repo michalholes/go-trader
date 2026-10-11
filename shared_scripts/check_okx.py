@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
-"""
-OKX spot/perps strategy check script.
-Fetches OHLCV from OKX via CCXT, runs strategy, outputs JSON to stdout, exits.
-
-Signal check mode (paper or live):
-    check_okx.py <strategy> <symbol> <timeframe> [--mode=paper|live] [--htf-filter] [--inst-type=spot|swap]
-
-Execution mode (live only, called by Go as phase 2):
-    check_okx.py --execute --symbol=BTC --side=buy|sell --size=0.01 [--mode=live] [--inst-type=spot|swap]
-"""
 
 import sys
 import os
 import json
 import math
+import time
 import traceback
 from datetime import datetime, timezone
 
-# Add paths: platforms/okx/ for adapter, shared_tools/ for utilities.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'platforms', 'okx'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools'))
 
 from atr import ensure_atr_indicator, latest_atr
+from closed_bar import (
+    ClosedBarHold,
+    fetch_rows_or_hold,
+    hold_metadata,
+    htf_closed_fetcher,
+    select_opening_time,
+    unsupported_open_strategy_reason,
+)
 from regime import latest_regime, parse_regime_windows_spec_json, prepare_check_regime
 
-# Use futures registry for perps (swap), spot registry for spot.
-# Default is swap, matching argparse defaults below.
 _inst_type = "swap"
 for _arg in sys.argv:
     if _arg.startswith("--inst-type="):
@@ -38,7 +34,6 @@ else:
 
 
 def _make_dataframe(candles):
-    """Convert raw OHLCV list to pandas DataFrame compatible with strategy functions."""
     import pandas as pd
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
@@ -57,6 +52,7 @@ def _position_ctx_from_args(args):
         ("position_qty", "current_quantity"),
         ("position_initial_qty", "initial_quantity"),
         ("position_entry_atr", "entry_atr"),
+        ("position_risk_anchor_price", "risk_anchor_price"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
@@ -77,7 +73,6 @@ def _float_or_none(value):
 
 
 def _extract_fee(response):
-    """Extract ccxt unified order fee.cost when present."""
     if not isinstance(response, dict):
         return None
     fee_info = response.get("fee")
@@ -92,8 +87,9 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                      position_side="", position_ctx=None,
                      regime_enabled=False, regime_windows_spec=None, ohlcv_limit=200, regime_atr_window="",
                      regime_payload_json=None,
-                     close_params_by_name=None):
-    """Run strategy signal check using OKX OHLCV data."""
+                     close_params_by_name=None,
+                     atr_method="simple", gate_mode=None, acknowledgement=None,
+                     closed_bar=False, decision_regime_timeframe=""):
     try:
         from adapter import OKXExchangeAdapter
         from strategies import apply_strategy, get_strategy, list_strategies
@@ -107,15 +103,19 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             finalize_decision,
             normalize_signal,
             parse_close_strategies,
-            validate_close_strategy_names,
+            admit_configured_strategies,
+            GateMode,
+            Acknowledgement,
+            GATE_MODE_MISSING,
         )
 
         open_close_enabled = bool(open_strategy or close_strategies)
-        configured_names = [open_strategy or strategy_name]
-        for name in configured_names:
-            get_strategy(name)
-        validate_close_strategy_names(
-            parse_close_strategies(close_strategies),
+        admit_configured_strategies(
+            strategy_name,
+            open_strategy,
+            close_strategies,
+            gate_mode if gate_mode is not None else GateMode(GATE_MODE_MISSING),
+            acknowledgement if acknowledgement is not None else Acknowledgement(False),
             get_strategy,
             get_close_strategy,
             list_strategies,
@@ -124,7 +124,16 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
 
         adapter = OKXExchangeAdapter()
 
-        # Fetch funding rate data for delta-neutral strategy (perps only)
+        if closed_bar:
+            for name in (strategy_name, open_strategy or strategy_name):
+                why = unsupported_open_strategy_reason(name)
+                if why:
+                    raise ValueError(f"closed_bar_decisions does not support {name}: {why}")
+            if (open_strategy or strategy_name) == "funding_skew":
+                raise ValueError("closed_bar_decisions does not support funding_skew on OKX: this check has no timestamped funding history")
+            if getattr(adapter, "OHLCV_TIMESTAMP_KIND", "") != "open":
+                raise ValueError("closed_bar_decisions needs opening-time candle timestamps from the OKX adapter")
+
         strategy_params = {}
         if strategy_name == "delta_neutral_funding" and inst_type == "swap":
             try:
@@ -140,7 +149,13 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 print(f"Warning: failed to fetch funding rate: {e}", file=sys.stderr)
 
         print(f"Fetching {symbol} {timeframe} from OKX ({mode}, {inst_type})...", file=sys.stderr)
-        if inst_type == "swap":
+        cutoff_ms = 0
+        raw_rows = None
+        if closed_bar:
+            cutoff_ms = int(time.time() * 1000)
+            raw_rows = adapter.fetch_candles(symbol, timeframe, ohlcv_limit + 1, inst_type=inst_type)
+            candles = raw_rows[-ohlcv_limit:]
+        elif inst_type == "swap":
             candles = adapter.get_perp_ohlcv(symbol, interval=timeframe, limit=ohlcv_limit)
         else:
             candles = adapter.get_ohlcv(symbol, interval=timeframe, limit=ohlcv_limit)
@@ -168,23 +183,72 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             atr_window=regime_atr_window,
             injected_payload_json=regime_payload_json,
         )
-        strategy_params["regime"] = strategy_regime
+        current_params = dict(strategy_params)
+        current_params["regime"] = strategy_regime
         if strategy_params_override:
-            merged = {**strategy_params_override, **strategy_params}
-            strategy_params = merged
+            current_params = {**strategy_params_override, **current_params}
+        strategy_params = current_params
+
+        closed_meta = None
+        decision_regime_payload = None
+        decision_df = df
+        protection_kwargs = {}
+        htf_frame = None
+        htf_strategy_name = open_strategy or strategy_name
+        if closed_bar:
+            hold = ""
+            try:
+                selection = select_opening_time(
+                    raw_rows, timeframe=timeframe, cutoff_ms=cutoff_ms, keep=ohlcv_limit)
+                decision_params = dict(strategy_params_override or {})
+                if regime_enabled:
+                    regime_tf = decision_regime_timeframe or timeframe
+                    if regime_tf == timeframe:
+                        regime_rows = selection.rows
+                    else:
+                        regime_rows = select_opening_time(
+                            fetch_rows_or_hold(lambda: adapter.fetch_candles(symbol, regime_tf, ohlcv_limit + 1, inst_type=inst_type), symbol, regime_tf),
+                            timeframe=regime_tf, cutoff_ms=selection.boundary_ms, keep=ohlcv_limit).rows
+                    decision_regime_payload, _decision_live, decision_strategy_regime = prepare_check_regime(
+                        _make_dataframe(regime_rows),
+                        regime_enabled=True,
+                        windows_spec=regime_windows_spec,
+                        injected_payload_json=None,
+                    )
+                    decision_params["regime"] = decision_strategy_regime
+                else:
+                    decision_params["regime"] = strategy_regime
+                if htf_filter_enabled and htf_strategy_name != "delta_neutral_funding":
+                    from htf_filter import get_default_htf
+                    htf_tf = get_default_htf(timeframe)
+                    htf_frame = _make_dataframe(select_opening_time(
+                        fetch_rows_or_hold(lambda: adapter.fetch_candles(symbol, htf_tf, 61, inst_type=inst_type), symbol, htf_tf),
+                        timeframe=htf_tf, cutoff_ms=selection.boundary_ms, keep=60, min_rows=50).rows)
+                decision_df = _make_dataframe(selection.rows)
+                closed_meta = selection.metadata()
+            except ClosedBarHold as e:
+                hold = e.reason
+            protection_kwargs = {"protection_df": df, "protection_params": strategy_params}
+            if hold:
+                closed_meta = hold_metadata(hold, cutoff_ms)
+                decision_regime_payload = None
+                decision_df = None
+                print(f"Closed-bar decision held for {symbol} {timeframe}: {hold}", file=sys.stderr)
+            else:
+                strategy_params = decision_params
+
         decision = None
         if open_close_enabled:
             market_ctx = {"mark_price": float(df["close"].iloc[-1])}
-            atr_now = latest_atr(df)
+            atr_now = latest_atr(df, method=atr_method)
             if atr_now > 0:
                 market_ctx["atr"] = atr_now
-            # #733: live regime label for tiered_tp_atr_live_regime evaluator.
             if live_regime:
                 market_ctx["regime"] = live_regime
             evaluation = evaluate_open_close(
                 apply_strategy,
                 get_strategy,
-                df,
+                decision_df,
                 strategy_name,
                 open_strategy,
                 parse_close_strategies(close_strategies),
@@ -194,29 +258,40 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 close_evaluate=close_evaluate,
                 market_ctx=market_ctx,
                 close_params_by_name=close_params_by_name,
+                **protection_kwargs,
             )
             result_df = evaluation.open_result_df
             signal = evaluation.open_signal
-        else:
-            result_df = apply_strategy(strategy_name, df, strategy_params or None)
+        elif decision_df is not None:
+            result_df = apply_strategy(strategy_name, decision_df, strategy_params or None)
             signal = normalize_signal(result_df.iloc[-1].get("signal", 0))
+        else:
+            get_strategy(strategy_name)
+            result_df = None
+            signal = 0
 
-        ensure_atr_indicator(result_df)
-        last = result_df.iloc[-1]
-        price = float(last["close"])
+        last = None
+        if result_df is not None and not result_df.empty:
+            ensure_atr_indicator(result_df, method=atr_method)
+            last = result_df.iloc[-1]
+        if closed_bar:
+            price = float(df["close"].iloc[-1])
+        else:
+            price = float(last["close"])
 
-        # Apply HTF trend filter if enabled (skip for funding-rate strategies — #103)
         htf_info = {}
-        htf_strategy_name = open_strategy or strategy_name
-        if htf_filter_enabled and htf_strategy_name != "delta_neutral_funding":
+        if decision_df is not None and htf_filter_enabled and htf_strategy_name != "delta_neutral_funding":
             from htf_filter import htf_trend_filter, apply_htf_filter
 
-            def _fetch_htf(sym, tf, limit):
-                if inst_type == "swap":
-                    candles = adapter.get_perp_ohlcv(sym, interval=tf, limit=limit)
-                else:
-                    candles = adapter.get_ohlcv(sym, interval=tf, limit=limit)
-                return _make_dataframe(candles) if candles else None
+            if closed_bar:
+                _fetch_htf = htf_closed_fetcher(htf_frame)
+            else:
+                def _fetch_htf(sym, tf, limit):
+                    if inst_type == "swap":
+                        candles = adapter.get_perp_ohlcv(sym, interval=tf, limit=limit)
+                    else:
+                        candles = adapter.get_ohlcv(sym, interval=tf, limit=limit)
+                    return _make_dataframe(candles) if candles else None
 
             htf_info = htf_trend_filter(symbol, timeframe, _fetch_htf)
             original_signal = signal
@@ -228,7 +303,6 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             decision = finalize_decision(evaluation, position_side, signal)
             signal = decision["signal"]
 
-        # Freshen price with live mid if available
         try:
             if inst_type == "swap":
                 mid = adapter.get_perp_price(symbol)
@@ -244,7 +318,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             "open", "high", "low", "close", "volume",
             "timestamp", "signal", "position", "datetime",
         }
-        for col in result_df.columns:
+        for col in (result_df.columns if last is not None else []):
             if col in skip_cols:
                 continue
             val = last.get(col)
@@ -256,7 +330,6 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 except (ValueError, TypeError):
                     pass
 
-        # Merge HTF indicators
         if htf_info:
             for k, v in htf_info.items():
                 if isinstance(v, (int, float)):
@@ -276,6 +349,10 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         }
         if decision:
             output.update(decision)
+        if closed_meta is not None:
+            output["closed_bar_decision"] = closed_meta
+            if decision_regime_payload is not None:
+                output["decision_regime"] = decision_regime_payload
         print(json.dumps(output))
 
     except Exception as e:
@@ -297,7 +374,6 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
 
 
 def run_execute(symbol, side, size, mode, inst_type="swap"):
-    """Place a live market order on OKX."""
     if mode != "live":
         print(json.dumps({"error": "--execute requires --mode=live"}))
         sys.exit(1)
@@ -309,7 +385,6 @@ def run_execute(symbol, side, size, mode, inst_type="swap"):
         is_buy = side.lower() == "buy"
         result = adapter.market_open(symbol, is_buy, size, inst_type=inst_type)
 
-        # Extract fill info from ccxt response structure
         fill = {}
         try:
             fill = {
@@ -349,7 +424,6 @@ def run_execute(symbol, side, size, mode, inst_type="swap"):
 
 def main():
     if "--execute" in sys.argv:
-        # Execute mode: --execute --symbol=BTC --side=buy|sell --size=0.01 [--mode=live] [--inst-type=spot|swap]
         import argparse
         parser = argparse.ArgumentParser()
         parser.add_argument("--execute", action="store_true")
@@ -361,7 +435,6 @@ def main():
         args = parser.parse_args()
         run_execute(args.symbol, args.side, args.size, args.mode, args.inst_type)
     else:
-        # Signal check mode: <strategy> <symbol> <timeframe> [--mode=paper|live] [--htf-filter] [--inst-type=spot|swap]
         import argparse
         parser = argparse.ArgumentParser()
         parser.add_argument("strategy")
@@ -373,9 +446,8 @@ def main():
         parser.add_argument("--regime-windows-spec-json", default="")
         parser.add_argument("--ohlcv-limit", type=int, default=200)
         parser.add_argument("--regime-atr-window", default="")
-        # #879: precomputed global-store regime payload; presence (even empty)
-        # disables inline regime computation.
         parser.add_argument("--regime-payload-json", default=None)
+        parser.add_argument("--atr-method", default="simple", choices=["simple", "wilder"])
         parser.add_argument("--regime-directional-window", default="")
         parser.add_argument("--inst-type", default="swap", choices=["spot", "swap"])
         parser.add_argument("--params", default=None)
@@ -388,13 +460,19 @@ def main():
         parser.add_argument("--position-initial-qty", type=float, default=None)
         parser.add_argument("--position-entry-atr", type=float, default=None)
         parser.add_argument("--position-regime", default="")
+        parser.add_argument("--position-risk-anchor-price", type=float, default=None)
         parser.add_argument("--mark-price", type=float, default=0.0, help="Accepted for argv-shape compatibility with check_hyperliquid.py (#768); ignored on this platform.")
+        parser.add_argument("--allow-no-edge", nargs="?", const=True, default=None)
+        parser.add_argument("--closed-bar-decisions", action="store_true", default=False,
+            help="#1712: decide signals and entry ATR on the last closed bar; protection keeps current inputs.")
+        parser.add_argument("--decision-regime-timeframe", default="",
+            help="#1712: regime timeframe for the closed-bar decision view; defaults to the strategy timeframe.")
         parser.add_argument("--probe-only", action="store_true",
             help="Startup compatibility probe (#645): validate argv shape and exit 0.")
         args = parser.parse_args()
         if args.probe_only:
             sys.exit(0)
-        from strategy_composition import parse_strategy_refs_arg
+        from strategy_composition import parse_allow_no_edge_tokens, parse_raw_gate_mode, parse_strategy_refs_arg
         refs = parse_strategy_refs_arg(args.strategy_refs)
         open_strategy_name = refs["open_name"] if refs else args.open_strategy
         close_strategies_arg = refs["close_csv"] if refs else args.close_strategies
@@ -413,6 +491,11 @@ def main():
             regime_atr_window=args.regime_atr_window,
             regime_payload_json=args.regime_payload_json,
             close_params_by_name=close_params_by_name,
+            atr_method=args.atr_method,
+            gate_mode=parse_raw_gate_mode(sys.argv[1:]),
+            acknowledgement=parse_allow_no_edge_tokens(sys.argv[1:]),
+            closed_bar=args.closed_bar_decisions,
+            decision_regime_timeframe=args.decision_regime_timeframe,
         )
 
 

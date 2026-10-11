@@ -11,6 +11,7 @@ Environment variables:
     BLOFIN_BASE_URL      — API base URL (demo or live)
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -41,6 +42,7 @@ class BloFinExchangeAdapter:
         self.base_url = os.environ.get("BLOFIN_BASE_URL", "https://demo-trading-openapi.blofin.com")
 
         self._is_live = bool(self.api_key and self.api_secret and self.passphrase)
+        self.trade_account = os.environ.get("BLOFIN_TRADE_ACCOUNT", "standard").strip().lower()
 
     @property
     def is_live(self) -> bool:
@@ -59,14 +61,15 @@ class BloFinExchangeAdapter:
     # ─────────────────────────────────────────────
 
     def _generate_signature(self, method: str, request_path: str, body: str = "") -> tuple[str, str, str]:
-        timestamp = str(int(time.time()))
+        timestamp = str(int(time.time() * 1000))
         nonce = str(int(time.time() * 1000)) + str(int(time.monotonic_ns() % 100000))
-        msg = timestamp + method.upper() + request_path + nonce + body
+        msg = request_path + method.upper() + timestamp + nonce + body
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
             msg.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+        signature = base64.b64encode(signature.encode()).decode()
         return timestamp, nonce, signature
 
     def _headers(self, method: str, request_path: str, body: str = "") -> dict:
@@ -92,13 +95,13 @@ class BloFinExchangeAdapter:
             raise RuntimeError(f"BloFin API error {path}: {data.get('msg', data)}")
         return data
 
-    def _private_get(self, path: str, params: dict = None) -> dict:
+    def _private_get(self, path: str, params: dict = None, timeout: float = 15) -> dict:
         full_path = path
         if params:
             full_path += "?" + urlencode(params)
         headers = self._headers("GET", full_path)
         url = f"{self.base_url}{full_path}"
-        resp = http_requests.get(url, headers=headers, timeout=15)
+        resp = http_requests.get(url, headers=headers, timeout=timeout)
         data = resp.json()
         if data.get("code") != "0":
             raise RuntimeError(f"BloFin API error {path}: {data.get('msg', data)}")
@@ -155,27 +158,42 @@ class BloFinExchangeAdapter:
         bar = self._ccxt_to_blofin_bar(interval)
         # Perps need "-USDT" suffix; keep raw symbol if it already has a dash
         inst_id = symbol if "-" in symbol else f"{symbol}-USDT"
-        data = self._public_get("/api/v1/market/candles", {
-            "instId": inst_id,
-            "bar": bar,
-            "limit": str(limit),
-        })
-        candles = data.get("data", [])
-        result = []
-        for c in candles:
-            try:
-                result.append([
-                    int(c[0]),
-                    float(c[1]),
-                    float(c[2]),
-                    float(c[3]),
-                    float(c[4]),
-                    float(c[5]),
-                ])
-            except (IndexError, ValueError, TypeError):
-                continue
-        result.sort(key=lambda x: x[0])
-        return result
+        requested = max(int(limit), 0)
+        if requested == 0:
+            return []
+        page_size = min(requested, 1440)
+        after = None
+        by_ts = {}
+        while len(by_ts) < requested:
+            params = {"instId": inst_id, "bar": bar, "limit": str(page_size)}
+            if after is not None:
+                params["after"] = str(after)
+            data = self._public_get("/api/v1/market/candles", params)
+            candles = data.get("data", [])
+            if not candles:
+                break
+            page_ts = []
+            for c in candles:
+                try:
+                    row = [int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
+                except (IndexError, ValueError, TypeError):
+                    continue
+                page_ts.append(row[0])
+                by_ts[row[0]] = row
+            if not page_ts:
+                break
+            oldest = min(page_ts)
+            if after is not None and oldest >= after:
+                break  # Endpoint ignored cursor; avoid an infinite loop.
+            if len(by_ts) >= requested:
+                break
+            if len(page_ts) == 0:
+                break
+            after = oldest
+            # A short page is the oldest available history.
+            if len(candles) < page_size:
+                break
+        return [by_ts[ts] for ts in sorted(by_ts)[-requested:]]
 
     def get_perp_ohlcv(self, symbol: str, interval: str = "1h", limit: int = 200) -> list:
         return self.get_ohlcv(f"{symbol}-USDT", interval, limit)
@@ -224,14 +242,20 @@ class BloFinExchangeAdapter:
     def get_account_balance(self) -> float:
         data = self._private_get("/api/v1/account/balance", {"productType": "USDT-FUTURES"})
         balances = data.get("data", [])
+        if isinstance(balances, dict):
+            balances = [balances]
         for b in balances:
+            if not isinstance(b, dict):
+                continue
             details = b.get("details", [])
             for d in details:
                 if d.get("currency") == "USDT":
-                    return float(d.get("eq", 0) or 0)
+                    return float(d.get("equity", d.get("eq", 0)) or 0)
         return 0.0
 
     def get_positions(self, inst_id: str = "") -> list:
+        if self.trade_account == "copy":
+            return self.get_copy_positions_normalized(inst_id)
         params = {}
         if inst_id:
             params["instId"] = inst_id
@@ -247,20 +271,138 @@ class BloFinExchangeAdapter:
         return infos[0] if infos else {}
 
     def set_leverage(self, inst_id: str, leverage: str, margin_mode: str = "cross", pos_side: str = "") -> dict:
+        if self.trade_account == "copy":
+            return self._private_post("/api/v1/copytrading/account/set-leverage", {
+                "instId": inst_id, "leverage": str(leverage),
+                "marginMode": margin_mode, "positionSide": pos_side or "net",
+            })
         body = {"instId": inst_id, "lever": leverage, "mgnMode": margin_mode}
         if pos_side:
             body["posSide"] = pos_side
         return self._private_post("/api/v1/account/set-leverage", body)
 
+    def get_copy_positions(self, inst_id: str = "") -> list:
+        params = {}
+        if inst_id:
+            params["instId"] = inst_id
+        data = self._private_get("/api/v1/copytrading/account/positions-by-contract", params)
+        out = data.get("data", [])
+        return out if isinstance(out, list) else []
+
+    def get_copy_positions_normalized(self, inst_id: str = "") -> list:
+        """Copy positions mapped to the standard shape (instId/posSide/pos/avgPx/upl).""" 
+        out = []
+        for q in self.get_copy_positions(inst_id):
+            try:
+                qty = float(q.get("positions", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            out.append({
+                "instId": q.get("instId", ""),
+                "posSide": str(q.get("positionSide", "net") or "net").lower(),
+                "pos": qty,
+                "avgPx": q.get("averagePrice", 0),
+                "upl": q.get("unrealizedPnl", 0),
+                "markPrice": q.get("markPrice", 0),
+                "leverage": q.get("leverage", 0),
+            })
+        return out
+
+    def get_copy_order_fill(self, order_id: str, inst_id: str, tries: int = 10,
+                            client_order_id: str = "", max_pages: int = 5,
+                            request_timeout: float = 15, retry_delay: float = 3) -> dict:
+        """Poll copy order history by its order ID or stable client order ID."""
+        wanted_order_id = str(order_id or "")
+        wanted_client_order_id = str(client_order_id or "")
+        if not inst_id or (not wanted_order_id and not wanted_client_order_id):
+            return {}
+        for _ in range(max(1, tries)):
+            try:
+                cursor = ""
+                for _page in range(max(1, max_pages)):
+                    params = {"instId": inst_id, "limit": "20"}
+                    if cursor:
+                        params["before"] = cursor
+                    items = self._private_get(
+                        "/api/v1/copytrading/trade/orders-history", params,
+                        timeout=request_timeout,
+                    ).get("data", [])
+                    for o in items:
+                        copy_order_id = str(o.get("orderId", "") or "")
+                        history_client_order_id = str(o.get("clientOrderId") or o.get("clOrdId") or "")
+                        if copy_order_id != wanted_order_id and (
+                            not wanted_client_order_id or history_client_order_id != wanted_client_order_id
+                        ):
+                            continue
+                        filled = float(o.get("filledSize", 0) or 0)
+                        if filled > 0:
+                            return {
+                                "avg_px": float(o.get("averagePrice", 0) or 0),
+                                "total_sz": filled,
+                                "fee": float(o.get("fee", 0) or 0),
+                                "oid": copy_order_id or wanted_order_id,
+                            }
+                    if len(items) < 20:
+                        break
+                    next_cursor = str(items[-1].get("orderId", ""))
+                    if not next_cursor or next_cursor == cursor:
+                        break
+                    cursor = next_cursor
+            except Exception:
+                pass
+            if _ + 1 < max(1, tries):
+                time.sleep(retry_delay)
+        return {}
+
     # ─────────────────────────────────────────────
     # Order execution (live mode only)
     # ─────────────────────────────────────────────
+
+    _lot_size_cache: dict = {}
+
+    def quantize_size(self, inst_id: str, size: float, size_in_contracts: bool = False) -> str:
+        """Floor size to contracts: size/contractValue unless already contracts,
+        floored to lotSize. Copy API counts size in contracts."""
+        try:
+            lot, cv = self._lot_size_cache.get(inst_id, (None, None))
+            if lot is None:
+                data = self._public_get("/api/v1/market/instruments", {"instId": inst_id})
+                items = data.get("data", [])
+                lot = float(items[0].get("lotSize", "1") or "1") if items else 1.0
+                cv = float(items[0].get("contractValue", "1") or "1") if items else 1.0
+                if lot <= 0:
+                    lot = 1.0
+                if cv <= 0:
+                    cv = 1.0
+                self._lot_size_cache[inst_id] = (lot, cv)
+            contracts = size if size_in_contracts else size / cv
+            steps = int(contracts / lot + 1e-9)
+            if steps <= 0:
+                return ""
+            q = steps * lot
+            s = ("%.8f" % q).rstrip("0").rstrip(".")
+            return s if s else ""
+        except Exception:
+            return str(size)
 
     def place_order(self, inst_id: str, margin_mode: str, side: str, order_type: str,
                     size: str, price: str = "", pos_side: str = "net",
                     reduce_only: bool = False, client_oid: str = "",
                     tp_trigger_px: str = "", tp_order_px: str = "",
                     sl_trigger_px: str = "", sl_order_px: str = "") -> dict:
+        if self.trade_account == "copy":
+            if pos_side not in ("long", "short"):
+                raise RuntimeError("copy account is hedge mode: pos_side must be long/short, got %r" % (pos_side,))
+            body = {"instId": inst_id, "marginMode": margin_mode, "positionSide": pos_side,
+                    "side": side, "orderType": order_type, "size": str(size),
+                    "brokerId": (os.environ.get("BLOFIN_BROKER_ID", "") or "")[:16]}
+            if price:
+                body["price"] = price
+            if client_oid:
+                body["clientOrderId"] = client_oid
+            return self._private_post("/api/v1/copytrading/trade/place-order", body)
         body = {
             "instId": inst_id,
             "tdMode": margin_mode,
@@ -294,19 +436,71 @@ class BloFinExchangeAdapter:
             body["clientOrderId"] = client_oid
         return self._private_post("/api/v1/trade/close-position", body)
 
-    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap") -> dict:
+    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap", size_in_contracts: bool = False, pos_side_hint: str = "", is_close: bool = False, leverage: float = 0.0, client_order_id: str = "") -> dict:
         if not self._is_live:
             raise RuntimeError(
                 "market_open requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
             )
         side = "buy" if is_buy else "sell"
+        pos_side = "net"
+        if self.trade_account == "copy":
+            hint = (pos_side_hint or "").strip().lower()
+            # Burzova pozicia je vzdy pravda - nacitaj ju prvu.
+            exch = ""
+            try:
+                for q in self.get_copy_positions(f"{symbol}-USDT"):
+                    if float(q.get("positions", 0) or 0) > 0:
+                        exch = str(q.get("positionSide", "") or "").lower()
+                        break
+            except Exception:
+                exch = ""
+            if is_close and hint in ("long", "short"):
+                # Close: burza musi mat rovnaku stranu, inak je DB zastarana.
+                # Otocenie strany (open opposite) je zakazane - fail-closed.
+                want_close = (hint == "long" and not is_buy) or (hint == "short" and is_buy)
+                if want_close and exch != "" and exch != hint:
+                    raise RuntimeError(f"DB says {hint} but exchange has {exch} for {symbol} - refusing (stale DB?)")
+                if want_close and exch == "":
+                    raise RuntimeError(f"DB says {hint} but exchange has no position for {symbol} - refusing (already closed?)")
+                pos_side = hint
+            elif is_close:
+                # Close bez hintu: pouzi burzovu stranu, inak fail.
+                if exch in ("long", "short"):
+                    pos_side = exch
+                else:
+                    raise RuntimeError(f"SKIP: cannot determine position side for {symbol} (no hint, no exchange position) - refusing to open opposite side")
+            else:
+                # Copy accounts use hedge mode: a flat buy opens long and a
+                # flat sell opens short. Do not infer the new order side from
+                # another strategy's position on the same instrument.
+                desired_side = "long" if is_buy else "short"
+                if hint in ("long", "short") and hint != desired_side:
+                    raise RuntimeError(
+                        f"SKIP: cannot open {desired_side} for {symbol} while DB tracks {hint}; close/flip first"
+                    )
+                pos_side = desired_side
+        inst_id = f"{symbol}-USDT"
+        qsize = self.quantize_size(inst_id, float(size), size_in_contracts)
+        cv = (self._lot_size_cache.get(inst_id, (None, None))[1] if isinstance(self._lot_size_cache.get(inst_id), tuple) else None) or 1.0
+        if not qsize:
+            raise RuntimeError(f"size {size} below lotSize for {inst_id}")
+        if self.trade_account == "copy" and not is_close and leverage > 0:
+            leverage_value = str(int(leverage)) if float(leverage).is_integer() else str(leverage)
+            self.set_leverage(inst_id, leverage_value, margin_mode="cross", pos_side=pos_side)
         result = self.place_order(
-            inst_id=f"{symbol}-USDT",
+            inst_id=inst_id,
             margin_mode="cross",
             side=side,
             order_type="market",
-            size=str(size),
+            size=qsize,
+            pos_side=pos_side,
+            client_oid=client_order_id,
         )
+        try:
+            if isinstance(result, dict):
+                result["contract_value"] = cv
+        except Exception:
+            pass
         return result
 
     def market_close(self, symbol: str, sz: Optional[float] = None) -> dict:
@@ -332,6 +526,13 @@ class BloFinExchangeAdapter:
             close_qty = min(sz, pos_qty)
             if close_qty <= 0:
                 return {}
+        if self.trade_account == "copy":
+            if pos_side not in ("long", "short"):
+                raise RuntimeError("copy account is hedge mode: cannot close unknown side %r" % (pos_side,))
+            return self._private_post("/api/v1/copytrading/trade/close-position-by-contract", {
+                "instId": inst_id, "size": str(close_qty), "marginMode": "cross",
+                "positionSide": pos_side, "closeType": "pnl",
+            })
         close_side = "sell" if pos_side in ("long", "net") else "buy"
         result = self.place_order(
             inst_id=inst_id,

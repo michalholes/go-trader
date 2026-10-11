@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-TopStep futures strategy check script.
-Fetches OHLCV from TopStepX API, runs strategy, outputs JSON to stdout, exits.
-
-Signal check mode (paper or live):
-    check_topstep.py <strategy> <symbol> <timeframe> [--mode=paper|live]
-
-Execution mode (live only, called by Go as phase 2):
-    check_topstep.py --execute --symbol=ES --side=buy|sell --contracts=2 [--mode=live]
-"""
 
 import sys
 import os
@@ -17,17 +7,29 @@ import math
 import traceback
 from datetime import datetime, timezone
 
-# Add paths for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'platforms', 'topstep'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_strategies', 'open', 'futures'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools'))
 
 from atr import ensure_atr_indicator, latest_atr
 from regime import latest_regime, parse_regime_windows_spec_json, prepare_check_regime
+from ob_touch_data import closed_ltf_frame
+
+# Minimum LTF history measured against a deep reference: NQ needs about 2k
+# 5m bars and 1.2k 15m bars before the swing-50 filter produces stable state.
+# This is independent of the separately fetched HTF history.
+_OB_TOUCH_MIN_LTF_BARS = {"5m": 2000, "15m": 1200}
+
+
+def _ob_touch_ltf_limit(timeframe: str, requested: int) -> int:
+    floor = _OB_TOUCH_MIN_LTF_BARS.get(str(timeframe).lower(), 600)
+    try:
+        return max(int(requested or 0), floor)
+    except (TypeError, ValueError):
+        return floor
 
 
 def _make_dataframe(candles):
-    """Convert raw OHLCV list to pandas DataFrame compatible with strategy functions."""
     import pandas as pd
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
@@ -46,6 +48,7 @@ def _position_ctx_from_args(args):
         ("position_qty", "current_quantity"),
         ("position_initial_qty", "initial_quantity"),
         ("position_entry_atr", "entry_atr"),
+        ("position_risk_anchor_price", "risk_anchor_price"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
@@ -92,7 +95,6 @@ def _extract_fee_value(value, fee_context=False):
 
 
 def _extract_fee(response):
-    """Best-effort TopStep fill fee extraction; absent fees fall back in Go."""
     if not isinstance(response, dict):
         return None
     for key in _FEE_CONTAINER_KEYS:
@@ -108,8 +110,9 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                      position_side="", position_ctx=None,
                      regime_enabled=False, regime_windows_spec=None, ohlcv_limit=200, regime_atr_window="",
                      regime_payload_json=None,
-                     close_params_by_name=None):
-    """Run strategy signal check using TopStep market data."""
+                     close_params_by_name=None,
+                     atr_method="simple", gate_mode=None, acknowledgement=None,
+                     htf_timeframe="", htf_limit=300):
     try:
         from adapter import TopStepExchangeAdapter
         from strategies import apply_strategy, get_strategy, list_strategies
@@ -123,15 +126,19 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             finalize_decision,
             normalize_signal,
             parse_close_strategies,
-            validate_close_strategy_names,
+            admit_configured_strategies,
+            GateMode,
+            Acknowledgement,
+            GATE_MODE_MISSING,
         )
 
         open_close_enabled = bool(open_strategy or close_strategies)
-        configured_names = [open_strategy or strategy_name]
-        for name in configured_names:
-            get_strategy(name)
-        validate_close_strategy_names(
-            parse_close_strategies(close_strategies),
+        admit_configured_strategies(
+            strategy_name,
+            open_strategy,
+            close_strategies,
+            gate_mode if gate_mode is not None else GateMode(GATE_MODE_MISSING),
+            acknowledgement if acknowledgement is not None else Acknowledgement(False),
             get_strategy,
             get_close_strategy,
             list_strategies,
@@ -140,7 +147,6 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
 
         adapter = TopStepExchangeAdapter(mode=mode)
 
-        # Check market hours
         market_open = adapter.is_market_open()
         if not market_open:
             print(json.dumps({
@@ -157,6 +163,12 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }))
             return
+
+        # Enforce the measured per-timeframe LTF history floor after argparse
+        # so a scheduler-appended --ohlcv-limit cannot shrink it again.
+        eff_open_for_depth = (open_strategy or strategy_name or "").strip()
+        if htf_timeframe and eff_open_for_depth == "ob_touch":
+            ohlcv_limit = _ob_touch_ltf_limit(timeframe, ohlcv_limit)
 
         print(f"Fetching {symbol} {timeframe} from TopStepX ({mode})...", file=sys.stderr)
         candles = adapter.get_ohlcv(symbol, interval=timeframe, limit=ohlcv_limit)
@@ -179,6 +191,8 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             sys.exit(1)
 
         df = _make_dataframe(candles)
+        eff_open = (open_strategy or strategy_name or "").strip()
+        df = closed_ltf_frame(df, eff_open, htf_timeframe)
         stdout_regime, live_regime, strategy_regime = prepare_check_regime(
             df,
             regime_enabled=regime_enabled,
@@ -188,13 +202,39 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         )
         strategy_params = (strategy_params or {})
         strategy_params["regime"] = strategy_regime
+        # Deep HTF frame for strategies with in-chart HTF confirmation
+        # (ob_touch). Paper mode serves it from yfinance (NQ=F); the core
+        # drops the forming HTF candle. Fetch failure is fatal (fail-closed).
+        if htf_timeframe and eff_open == "ob_touch":
+            print(f"Fetching {symbol} {htf_timeframe} HTF from TopStepX ({mode})...", file=sys.stderr)
+            try:
+                htf_candles = adapter.get_ohlcv(symbol, interval=htf_timeframe, limit=htf_limit)
+            except Exception as e:
+                htf_candles = []
+                print(f"HTF fetch error: {e}", file=sys.stderr)
+            if not htf_candles or len(htf_candles) < 3:
+                print(json.dumps({
+                    "strategy": strategy_name,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "signal": 0,
+                    "price": 0,
+                    "contract_spec": adapter.get_contract_spec(symbol),
+                    "market_open": market_open,
+                    "indicators": {},
+                    "mode": mode,
+                    "platform": "topstep",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error": f"Insufficient HTF data: {len(htf_candles) if htf_candles else 0} candles",
+                }))
+                sys.exit(1)
+            strategy_params["htf_df"] = _make_dataframe(htf_candles)
         decision = None
         if open_close_enabled:
             market_ctx = {"mark_price": float(df["close"].iloc[-1])}
-            atr_now = latest_atr(df)
+            atr_now = latest_atr(df, method=atr_method)
             if atr_now > 0:
                 market_ctx["atr"] = atr_now
-            # #733: live regime label for tiered_tp_atr_live_regime evaluator.
             if live_regime:
                 market_ctx["regime"] = live_regime
             evaluation = evaluate_open_close(
@@ -217,11 +257,10 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             result_df = apply_strategy(strategy_name, df, strategy_params)
             signal = normalize_signal(result_df.iloc[-1].get("signal", 0))
 
-        ensure_atr_indicator(result_df)
+        ensure_atr_indicator(result_df, method=atr_method)
         last = result_df.iloc[-1]
         price = float(last["close"])
 
-        # Apply HTF trend filter if enabled (skip for funding-rate strategies — #103)
         htf_info = {}
         htf_strategy_name = open_strategy or strategy_name
         if htf_filter_enabled and htf_strategy_name != "delta_neutral_funding":
@@ -241,7 +280,6 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             decision = finalize_decision(evaluation, position_side, signal)
             signal = decision["signal"]
 
-        # Freshen price with live quote if available
         try:
             live = adapter.get_price(symbol)
             if live > 0:
@@ -266,7 +304,6 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 except (ValueError, TypeError):
                     pass
 
-        # Merge HTF indicators
         if htf_info:
             for k, v in htf_info.items():
                 if isinstance(v, (int, float)):
@@ -311,7 +348,6 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
 
 
 def run_execute(symbol, side, contracts, mode):
-    """Place a live market order on TopStep."""
     if mode != "live":
         print(json.dumps({"error": "--execute requires --mode=live"}))
         sys.exit(1)
@@ -323,7 +359,6 @@ def run_execute(symbol, side, contracts, mode):
         is_buy = side.lower() == "buy"
         result = adapter.market_open(symbol, is_buy, contracts)
 
-        # Extract fill info from API response
         fill = {}
         try:
             fill = {
@@ -385,10 +420,13 @@ def main():
         parser.add_argument("--regime-enabled", action="store_true", default=False)
         parser.add_argument("--regime-windows-spec-json", default="")
         parser.add_argument("--ohlcv-limit", type=int, default=200)
+        parser.add_argument("--htf-timeframe", default="",
+                            help="Deep HTF candles for in-chart HTF confirmation (ob_touch); "
+                                 "empty disables the separate HTF fetch.")
+        parser.add_argument("--htf-limit", type=int, default=300)
         parser.add_argument("--regime-atr-window", default="")
-        # #879: precomputed global-store regime payload; presence (even empty)
-        # disables inline regime computation.
         parser.add_argument("--regime-payload-json", default=None)
+        parser.add_argument("--atr-method", default="simple", choices=["simple", "wilder"])
         parser.add_argument("--regime-directional-window", default="")
         parser.add_argument("--params", default=None)
         parser.add_argument("--open-strategy", default=None)
@@ -400,13 +438,34 @@ def main():
         parser.add_argument("--position-initial-qty", type=float, default=None)
         parser.add_argument("--position-entry-atr", type=float, default=None)
         parser.add_argument("--position-regime", default="")
+        parser.add_argument("--position-risk-anchor-price", type=float, default=None)
         parser.add_argument("--mark-price", type=float, default=0.0, help="Accepted for argv-shape compatibility with check_hyperliquid.py (#768); ignored on this platform.")
+        parser.add_argument("--allow-no-edge", nargs="?", const=True, default=None)
+        parser.add_argument("--closed-bar-decisions", action="store_true", default=False,
+            help="#1712: accepted for argv-shape compatibility; this platform refuses closed-bar decisions.")
+        parser.add_argument("--decision-regime-timeframe", default="",
+            help="#1712: accepted for argv-shape compatibility; this platform refuses closed-bar decisions.")
         parser.add_argument("--probe-only", action="store_true",
             help="Startup compatibility probe (#645): validate argv shape and exit 0.")
         args = parser.parse_args()
         if args.probe_only:
             sys.exit(0)
-        from strategy_composition import parse_strategy_refs_arg
+        if args.closed_bar_decisions:
+            print(json.dumps({
+                "strategy": args.strategy,
+                "symbol": args.symbol,
+                "timeframe": args.timeframe,
+                "signal": 0,
+                "price": 0,
+                "indicators": {},
+                "regime": None,
+                "mode": args.mode,
+                "platform": "topstep",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": "closed_bar_decisions is not supported on topstep: TopStep candles carry no verified closure contract that accounts for trading sessions",
+            }))
+            sys.exit(1)
+        from strategy_composition import parse_allow_no_edge_tokens, parse_raw_gate_mode, parse_strategy_refs_arg
         refs = parse_strategy_refs_arg(args.strategy_refs)
         open_strategy_name = refs["open_name"] if refs else args.open_strategy
         close_strategies_arg = refs["close_csv"] if refs else args.close_strategies
@@ -425,6 +484,11 @@ def main():
             regime_atr_window=args.regime_atr_window,
             regime_payload_json=args.regime_payload_json,
             close_params_by_name=close_params_by_name,
+            atr_method=args.atr_method,
+            htf_timeframe=args.htf_timeframe,
+            htf_limit=args.htf_limit,
+            gate_mode=parse_raw_gate_mode(sys.argv[1:]),
+            acknowledgement=parse_allow_no_edge_tokens(sys.argv[1:]),
         )
 
 

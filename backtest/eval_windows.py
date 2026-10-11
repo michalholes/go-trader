@@ -1,38 +1,4 @@
 #!/usr/bin/env python3
-"""
-eval_windows.py — M1 multi-window incumbent-relative validation harness (#977).
-
-One command per application issue (#979-#993): runs a candidate strategy config
-across the audit datasets and protocol/held-out windows, recomputes the
-incumbent-median bar per (window, dataset) on the identical harness, and emits
-per-dataset Sharpe / return / max-DD / DD-adjusted-return / trades, pass/fail
-verdicts, and optional plateau sweeps.
-
-Harness is audit-identical (#956/#963/#976): registry default or supplied
-params, single mode, binanceus fee model, long-leg signal path unless the
-candidate config supplies close refs / direction. Sharpe uses the Backtester's
-timeframe-annualized scale, the same scale on both sides of the bar.
-
-The incumbent set and window definitions are versioned HERE so bars stay
-reproducible as data accrues — change them only with a corresponding note on
-#977.
-
-Examples:
-  # Full protocol + held-out verdict table for a candidate with default params
-  uv run --no-sync python backtest/eval_windows.py --strategy regime_adaptive_htf
-
-  # Explicit params, futures registry, OOS window only
-  uv run --no-sync python backtest/eval_windows.py --strategy breakout \\
-      --registry futures --params '{"period": 20}' --windows oos
-
-  # Plateau sweep (M1 step 6) over htf_factor on the protocol OOS window
-  uv run --no-sync python backtest/eval_windows.py --strategy regime_adaptive_htf \\
-      --sweep htf_factor=4,5,6,8,10,12
-
-  # Short leg of a short-only strategy (#989: signal=-1 opens, +1 closes)
-  uv run --no-sync python backtest/eval_windows.py --strategy bear_pullback_st \\
-      --registry futures --direction short
-"""
 
 import argparse
 import itertools
@@ -45,13 +11,6 @@ from typing import List, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools'))
 
-# ---------------------------------------------------------------------------
-# Versioned harness definitions (#977). The incumbent set is the #963/#976
-# eight: the #956 audit's OOS top-8 with futures-only `breakout` excluded from
-# the long-leg harness and `sma_crossover` (next-ranked "both" strategy) in its
-# slot. All eight exist byte-identical in both registries, so the bar is valid
-# for spot and futures candidates alike.
-# ---------------------------------------------------------------------------
 INCUMBENTS = [
     "momentum_pro",
     "chart_pattern",
@@ -63,7 +22,6 @@ INCUMBENTS = [
     "sma_crossover",
 ]
 
-# The six audit datasets (#956): BTC/ETH/SOL x 1h/4h.
 DATASETS = [
     ("BTC/USDT", "1h"),
     ("BTC/USDT", "4h"),
@@ -73,9 +31,6 @@ DATASETS = [
     ("SOL/USDT", "4h"),
 ]
 
-# (start, end) date strings; end=None means "latest cached bar". The protocol
-# split mirrors #963/#976 (IS since 2025-06-10, OOS since 2026-01-01); the
-# held-out windows (M1 step 7) were never used during any incumbent's design.
 WINDOWS = {
     "is":     ("2025-06-10", "2026-01-01"),
     "oos":    ("2026-01-01", None),
@@ -87,50 +42,110 @@ PROTOCOL_WINDOWS = ("is", "oos")
 HELD_OUT_WINDOWS = ("2023", "2024", "2025H1")
 
 DEFAULT_CAPITAL = 1000.0
-PLATFORM = "binanceus"  # audit fee model; fixed, not a knob
+PLATFORM = "binanceus"
+
+FEE_PLATFORM = "hyperliquid"
 
 
-# ---------------------------------------------------------------------------
-# Pure scoring helpers (unit-tested without data access).
-# ---------------------------------------------------------------------------
+def trade_samples_from_results(results: dict) -> List[dict]:
+    out = []
+    for t in results.get("trades") or []:
+        gross = float(t["pnl_pct"])
+        notional = float(t.get("shares") or 0.0) * float(t.get("entry_price") or 0.0)
+        net = (float(t["pnl"]) / notional * 100.0
+               if notional > 0 and t.get("pnl") is not None else gross)
+        out.append({"entry_date": str(t["entry_date"]), "pnl_pct": gross,
+                    "pnl_pct_net": round(net, 6)})
+    return out
+
+
+def positions_from_results(results: dict) -> List[dict]:
+    grouped: dict = {}
+    order = []
+    for t in results.get("trades") or []:
+        key = (str(t["entry_date"]), t.get("side") or "long")
+        if key not in grouped:
+            grouped[key] = {"entry_date": key[0], "side": key[1],
+                            "exit_date": str(t["exit_date"]), "net_pnl": 0.0,
+                            "fees": 0.0, "entry_notional": 0.0,
+                            "exit_notional": 0.0, "bars_held": 0,
+                            "closes": 0, "exit_reasons": []}
+            order.append(key)
+        g = grouped[key]
+        shares = float(t.get("shares") or 0.0)
+        g["exit_date"] = str(t["exit_date"])
+        g["net_pnl"] += float(t.get("pnl") or 0.0)
+        g["fees"] += float(t.get("entry_fee") or 0.0) + float(t.get("exit_fee") or 0.0)
+        g["entry_notional"] += shares * float(t.get("entry_price") or 0.0)
+        g["exit_notional"] += shares * float(t.get("exit_price") or 0.0)
+        g["bars_held"] = max(g["bars_held"], int(t.get("bars_held") or 0))
+        g["closes"] += 1
+        g["exit_reasons"].append(t.get("exit_reason") or "")
+    out = []
+    for key in order:
+        g = grouped[key]
+        g["net_pnl"] = round(g["net_pnl"], 6)
+        g["fees"] = round(g["fees"], 6)
+        out.append(g)
+    return out
+
+
+def execution_metrics(results: dict, capital: float) -> dict:
+    positions = positions_from_results(results)
+    fees = sum(p["fees"] for p in positions)
+    traded = sum(p["entry_notional"] + p["exit_notional"] for p in positions)
+    bars_in_market = sum(p["bars_held"] for p in positions)
+    out = {
+        "positions": len(positions),
+        "long_positions": sum(1 for p in positions if p["side"] == "long"),
+        "short_positions": sum(1 for p in positions if p["side"] == "short"),
+        "trade_records": len(results.get("trades") or []),
+        "fees_usd": round(fees, 6),
+        "funding_pnl_usd": float(results.get("total_funding_pnl") or 0.0),
+        "traded_notional_usd": round(traded, 6),
+        "turnover": round(traded / capital, 6) if capital else None,
+        "bars_in_market": bars_in_market,
+        "net_pnl_usd": round(float(results.get("final_capital") or 0.0) - capital, 6),
+        "position_list": positions,
+    }
+    execution = results.get("execution")
+    if execution:
+        out["rejected_entries"] = execution["rejected_entry_count"]
+        out["skipped_partial_closes"] = execution["skipped_partial_close_count"]
+        out["close_residual_qty"] = execution["close_residual_qty"]
+        out["combined_adverse_price_pct"] = execution["combined_adverse_price_pct"]
+    return out
+
 
 def dd_adjusted_return(return_pct: float, max_dd_pct: float) -> float:
-    """DDadj = total return / |max drawdown| (#963 definition).
-
-    A leg with zero drawdown carries no risk denominator; return 0.0 so an
-    untraded leg never inflates the mean (zero-trade legs are additionally
-    flagged degenerate in score_candidate).
-    """
     if not max_dd_pct:
         return 0.0
     return return_pct / abs(max_dd_pct)
 
 
+LIQUIDATED_DDADJ_FLOOR = -100.0
+
+
 def leg_from_results(results: dict, bh_return_pct: Optional[float] = None) -> dict:
-    """Collapse a Backtester result dict to the per-leg metrics M1 reports."""
     ret = float(results["total_return_pct"])
     dd = float(results["max_drawdown_pct"])
+    liquidated = bool(results.get("liquidated"))
     return {
         "sharpe": float(results["sharpe_ratio"]),
         "return_pct": ret,
         "max_dd_pct": dd,
-        "ddadj": round(dd_adjusted_return(ret, dd), 3),
+        "ddadj": (
+            LIQUIDATED_DDADJ_FLOOR
+            if liquidated
+            else round(dd_adjusted_return(ret, dd), 3)
+        ),
         "trades": int(results["total_trades"]),
         "bh_return_pct": bh_return_pct,
-        # #1005: equity hit 0 — metrics are floored at the bust bar (return
-        # and DD read −100%); surfaced so blown legs are never silent.
-        "liquidated": bool(results.get("liquidated")),
+        "liquidated": liquidated,
     }
 
 
 def incumbent_bars(incumbent_legs: dict) -> dict:
-    """Per-dataset incumbent-median bars (M1 step 2).
-
-    ``incumbent_legs``: {dataset_key: {incumbent_name: leg | None}}.
-    Returns {dataset_key: {"sharpe": median, "ddadj": median, "n": count}}
-    over incumbents that produced a leg; a dataset where no incumbent ran
-    yields None (no bar — the candidate leg is reported but unscored).
-    """
     bars = {}
     for ds, legs in incumbent_legs.items():
         present = [leg for leg in legs.values() if leg is not None]
@@ -146,13 +161,6 @@ def incumbent_bars(incumbent_legs: dict) -> dict:
 
 
 def score_candidate(candidate_legs: dict, bars: dict) -> dict:
-    """Verdict for one window (M1 steps 2 + 5).
-
-    Pass = candidate mean beats the mean per-dataset bar on BOTH Sharpe and
-    DDadj, across datasets where both sides ran, AND the result is not
-    degenerate (must trade on a majority of scored datasets — #976 rejected
-    zero-trade-leg passes as meaningless).
-    """
     rows = []
     for ds in candidate_legs:
         leg = candidate_legs[ds]
@@ -173,9 +181,6 @@ def score_candidate(candidate_legs: dict, bars: dict) -> dict:
     mean_bar_sharpe = statistics.mean(r["bar"]["sharpe"] for r in scored)
     mean_bar_ddadj = statistics.mean(r["bar"]["ddadj"] for r in scored)
     traded = sum(1 for r in scored if r["leg"]["trades"] > 0)
-    # Counted over `rows` (all legs), NOT `scored`, by design (#1005): a blown
-    # leg with no incumbent bar is excluded from the scored means but operators
-    # must still see every death, so this count can exceed scored_datasets.
     liquidated = sum(1 for r in rows
                      if r["leg"] is not None and r["leg"].get("liquidated"))
     degenerate = traded < math.ceil(len(scored) / 2)
@@ -205,7 +210,6 @@ def score_candidate(candidate_legs: dict, bars: dict) -> dict:
 
 
 def parse_sweep_arg(raw: str) -> tuple:
-    """Parse 'param=v1,v2,v3' into (param, [values]) with numeric coercion."""
     if "=" not in raw:
         raise ValueError(f"--sweep expects param=v1,v2,...  got: {raw!r}")
     param, _, values = raw.partition("=")
@@ -226,11 +230,6 @@ def parse_sweep_arg(raw: str) -> tuple:
 
 
 def expand_sweep(base_params: dict, sweep_specs: List[tuple]) -> List[tuple]:
-    """Cartesian product of sweep values over base params.
-
-    Returns [(label, params), ...]; label names only the swept params so the
-    plateau table stays readable.
-    """
     names = [s[0] for s in sweep_specs]
     grids = [s[1] for s in sweep_specs]
     combos = []
@@ -247,16 +246,11 @@ def dataset_key(symbol: str, timeframe: str) -> str:
 
 
 def parse_dataset_arg(raw: str) -> tuple:
-    """Parse 'BTC/USDT:1h' into (symbol, timeframe)."""
     sym, sep, tf = raw.rpartition(":")
     if not sep or not sym or not tf:
         raise ValueError(f"--datasets expects SYMBOL:TIMEFRAME, got: {raw!r}")
     return sym.strip(), tf.strip()
 
-
-# ---------------------------------------------------------------------------
-# Leg execution (I/O; everything above stays pure for tests).
-# ---------------------------------------------------------------------------
 
 def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
             window: tuple, capital: float = DEFAULT_CAPITAL,
@@ -266,31 +260,101 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
             stop_loss_atr_mult: Optional[float] = None,
             trailing_stop_atr_mult: Optional[float] = None,
             profile_allocation: Optional[dict] = None,
+            allowed_regimes: Optional[list[str]] = None,
+            regime_windows_spec: Optional[dict] = None,
+            regime_directional_policy: Optional[dict] = None,
+            regime_enabled: bool = False,
+            regime_period: int = 14,
+            regime_adx_threshold: float = 20.0,
             *,
             commission_pct: Optional[float] = None,
-            slippage_pct: Optional[float] = None) -> Optional[dict]:
-    """Run one (strategy, dataset, window) leg on the audit-identical harness.
-
-    ``commission_pct`` / ``slippage_pct`` are keyword-only friction overrides
-    (default ``None``): with both ``None`` the harness is byte-identical to the
-    M1 scorer (platform fee + the Backtester's 5 bps slippage default). The fee
-    audit (#999) passes ``commission_pct=0.0, slippage_pct=0.0`` for the gross
-    (zero-friction) re-run. The returned leg dict carries an additive
-    ``span_days`` key (calendar span of the data slice) so callers can
-    annualize trade counts.
-    """
+            slippage_pct: Optional[float] = None,
+            keep_trades: bool = False,
+            intrabar_resolution: str = "ohlc_walk",
+            exchange_id: Optional[str] = None,
+            manifest_ctx: Optional[dict] = None,
+            comparison_mode: Optional[str] = None,
+            stop_kwargs: Optional[dict] = None) -> Optional[dict]:
     from atr import ensure_atr_indicator
+    import pandas as pd
     from data_fetcher import load_cached_data
-    from backtester import Backtester
-    from run_backtest import (FUNDING_COLUMN_STRATEGIES, _attach_funding_if_needed,
-                              _build_profile_label_series)
+    from backtester import Backtester, validate_close_capabilities
+    from run_backtest import (FUNDING_COLUMN_STRATEGIES, OBSERVATION_INPUT_STRATEGIES,
+                              _attach_funding_if_needed, _build_profile_label_series)
 
-    start, end = window
-    df = load_cached_data(symbol, timeframe, start_date=start, end_date=end)
-    if df.empty:
-        return None
-    if name in FUNDING_COLUMN_STRATEGIES:
-        df = _attach_funding_if_needed(df, name, symbol, start)
+    validate_close_capabilities(close_refs=close_strategies,
+                                comparison_mode=comparison_mode,
+                                platform=FEE_PLATFORM, phase="preflight")
+
+    manifest_window = None
+    manifest_info = None
+    execution_spec = None
+    observation_params = {}
+    if manifest_ctx is None and name in OBSERVATION_INPUT_STRATEGIES:
+        raise ValueError(
+            f"{name} reads recorded open interest as an entry input; only the --manifest path "
+            "(schema offline_candle_manifest/v2 with an open_interest series) can run it")
+    if manifest_ctx is not None:
+        import offline_manifest as om
+        if name in FUNDING_COLUMN_STRATEGIES:
+            raise ValueError(
+                f"{name} reads funding as an entry input; the frozen manifest path "
+                "attaches funding only as a cost")
+        if profile_allocation:
+            raise ValueError("profile_allocation is not supported on the manifest path")
+        if exchange_id is not None:
+            raise ValueError("exchange_id and a manifest are mutually exclusive")
+        if commission_pct is not None or slippage_pct is not None:
+            raise ValueError("the manifest owns fees and slippage; do not also pass "
+                             "commission_pct or slippage_pct")
+        manifest = manifest_ctx["manifest"]
+        dataset = om.dataset_by_key(manifest, dataset_key(symbol, timeframe))
+        df, manifest_window, candle_cov = om.window_frame(
+            manifest, dataset, manifest_ctx["window"])
+        df, funding_cov = om.attach_funding_cost(df, dataset, manifest_window)
+        oi_cov = None
+        if name in OBSERVATION_INPUT_STRATEGIES:
+            if dataset.get("open_interest") is None:
+                raise ValueError(
+                    f"{name} reads open interest as an entry input; manifest dataset "
+                    f"{dataset['key']} attaches no open_interest series")
+            oi_obs, oi_cov = om.attach_open_interest(manifest, dataset, manifest_window)
+            observation_params = {"open_interest_observations": oi_obs}
+        spec = om.execution_spec(manifest, dataset,
+                                 manifest_ctx.get("cost_multiplier", 1.0))
+        if close_strategies:
+            execution_spec = spec
+            commission_pct = None
+            slippage_pct = None
+        else:
+            commission_pct = spec["taker_fee_pct"]
+            slippage_pct = spec["half_spread_pct"] + spec["slippage_pct"]
+        manifest_info = {
+            "provenance": dict(manifest["provenance"]),
+            "dataset": dataset["key"],
+            "candles_sha256": dataset["candles"]["sha256"],
+            "funding_sha256": (dataset["funding"] or {}).get("sha256"),
+            "candle_coverage": candle_cov,
+            "funding_coverage": funding_cov,
+            "open_interest_coverage": oi_cov,
+            "open_interest_sha256": (dataset.get("open_interest") or {}).get("sha256"),
+            "cost_multiplier": manifest_ctx.get("cost_multiplier", 1.0),
+            "cost_model": "execution_spec" if execution_spec else "legacy_flat",
+            "execution_spec": spec,
+        }
+    else:
+        start, end = window
+        load_kwargs = {} if exchange_id is None else {"exchange_id": exchange_id}
+        df = load_cached_data(symbol, timeframe, start_date=start, end_date=end,
+                              **load_kwargs)
+        if df.empty:
+            return None
+        if end is not None:
+            df = df[df.index < pd.Timestamp(end)]
+            if df.empty:
+                return None
+        if name in FUNDING_COLUMN_STRATEGIES:
+            df = _attach_funding_if_needed(df, name, symbol, start)
 
     strat = reg.STRATEGY_REGISTRY.get(name)
     if strat is None:
@@ -298,11 +362,10 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
     strat_params = params if params is not None else strat["default_params"]
 
     if profile_allocation:
-        # #998: per-profile signals + long-window label, then engine replays the switch.
         param_sets = profile_allocation["param_sets"]
         df_signals = None
         for p in sorted(param_sets):
-            p_params = {**(strat_params or {}), **(param_sets[p] or {})}
+            p_params = {**(strat_params or {}), **(param_sets[p] or {}), **observation_params}
             res = reg.apply_strategy(name, df, p_params)
             if df_signals is None:
                 df_signals = res.copy()
@@ -314,29 +377,64 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
         df_signals["_profile_label"] = _build_profile_label_series(
             df_signals, profile_allocation["window_spec"]).values
     else:
-        df_signals = reg.apply_strategy(name, df, strat_params)
+        df_signals = reg.apply_strategy(name, df, {**(strat_params or {}), **observation_params}
+                                        if observation_params else strat_params)
         if close_strategies:
             df_signals = ensure_atr_indicator(df_signals)
 
+    use_regime = (regime_enabled or bool(allowed_regimes)
+                  or bool(regime_windows_spec)
+                  or bool(regime_directional_policy))
+
+    indicator_frame = None
+    if manifest_window is not None:
+        import offline_manifest as om
+        if use_regime and "regime" not in df_signals.columns:
+            from regime import ensure_regime_columns
+            ensure_regime_columns(
+                df_signals,
+                period=regime_period,
+                adx_threshold=regime_adx_threshold,
+                windows_spec=regime_windows_spec,
+            )
+        indicator_frame = df_signals
+        df_signals = om.slice_window(df_signals, manifest_window)
+        df = om.slice_window(df, manifest_window)
     bt_kwargs = dict(
-        initial_capital=capital, platform=PLATFORM,
+        initial_capital=capital, platform=FEE_PLATFORM,
         open_strategy={"name": name, "params": dict(strat_params or {})},
         close_strategies=close_strategies,
         direction=direction, invert_signal=invert_signal,
         stop_loss_atr_mult=stop_loss_atr_mult,
         trailing_stop_atr_mult=trailing_stop_atr_mult,
         profile_allocation=profile_allocation,
-        # commission_pct=None keeps the Backtester's platform-derived fee — the
-        # M1 default; an explicit 0.0 (fee audit gross run) overrides it.
+        regime_enabled=use_regime,
+        regime_period=regime_period,
+        regime_adx_threshold=regime_adx_threshold,
+        allowed_regimes=allowed_regimes,
+        regime_windows_spec=regime_windows_spec,
         commission_pct=commission_pct,
+        intrabar_resolution=intrabar_resolution,
+        comparison_mode=comparison_mode,
     )
-    # Only override slippage when asked; otherwise the Backtester's 5 bps
-    # default stands (passing None would zero it out via the constructor).
     if slippage_pct is not None:
         bt_kwargs["slippage_pct"] = slippage_pct
+    if execution_spec is not None:
+        bt_kwargs["execution_spec"] = execution_spec
+    if regime_directional_policy:
+        bt_kwargs["regime_directional_policy"] = regime_directional_policy
+        bt_kwargs["regime_directional_certified"] = True
+    for key, value in (stop_kwargs or {}).items():
+        if key in ("stop_loss_atr_mult", "trailing_stop_atr_mult"):
+            if value != bt_kwargs[key]:
+                raise ValueError(
+                    f"stop_kwargs.{key}={value!r} disagrees with {key}={bt_kwargs[key]!r}")
+            continue
+        bt_kwargs[key] = value
     bt = Backtester(**bt_kwargs)
     results = bt.run(df_signals, strategy_name=name, symbol=symbol,
-                     timeframe=timeframe, params=strat_params, save=False)
+                     timeframe=timeframe, params=strat_params, save=False,
+                     indicator_frame=indicator_frame)
     closes = df["close"].astype(float)
     bh = round((closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100, 2)
     leg = leg_from_results(results, bh_return_pct=bh)
@@ -345,35 +443,50 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
     except (AttributeError, TypeError):
         span_days = None
     leg["span_days"] = round(span_days, 4) if span_days else span_days
+    leg["close_validation"] = results.get("close_validation")
+    if keep_trades:
+        leg["trade_samples"] = trade_samples_from_results(results)
+    if manifest_info is not None:
+        leg["manifest"] = manifest_info
+        leg["execution"] = execution_metrics(results, capital)
     return leg
 
 
 def compute_incumbent_legs(reg, datasets: List[tuple], window: tuple,
-                           capital: float) -> dict:
-    """All incumbent legs for one window: {dataset_key: {name: leg|None}}."""
+                           capital: float, *,
+                           intrabar_resolution: str = "ohlc_walk",
+                           manifest_ctx: Optional[dict] = None) -> dict:
     out = {}
     for symbol, timeframe in datasets:
         ds = dataset_key(symbol, timeframe)
         out[ds] = {}
         for name in INCUMBENTS:
             out[ds][name] = run_leg(reg, name, None, symbol, timeframe,
-                                    window, capital=capital)
+                                    window, capital=capital,
+                                    intrabar_resolution=intrabar_resolution,
+                                    manifest_ctx=manifest_ctx)
     return out
 
 
-def validate_candidate(candidate: dict) -> dict:
-    """Reject candidate configs the harness cannot faithfully model.
+def manifest_windows(manifest: dict) -> dict:
+    return {name: (w["start"], w["end"]) for name, w in manifest["windows"].items()}
 
-    Mirrors the run_backtest.py --config guards: the plain signal path (no
-    close evaluator) runs one leg at a time — long/flat by default, short/flat
-    under direction="short" (#989: signal=-1 opens the short, +1 closes it).
-    direction="both" remains unmodelable there (one signal cannot open one
-    side and close the other), so it would silently score as long/flat — a
-    misleading verdict, not an error. Likewise invert_signal is
-    HL-perps/manual-only live (config.go rejects it elsewhere at startup), so
-    a candidate declaring another type must not have signals flipped on a
-    path the live daemon would refuse to load.
-    """
+
+def manifest_datasets(manifest: dict) -> List[tuple]:
+    return [(d["coin"], manifest["interval"]) for d in manifest["datasets"]]
+
+
+def candidate_close_preflight(candidate: dict) -> dict:
+    from backtester import validate_close_capabilities
+    return validate_close_capabilities(
+        close_refs=candidate.get("close_strategies"),
+        comparison_mode=candidate.get("comparison_mode"),
+        platform=FEE_PLATFORM,
+        strategy_type=str(candidate.get("type") or "perps").strip().lower(),
+        phase="preflight").to_dict()
+
+
+def validate_candidate(candidate: dict) -> dict:
     if not isinstance(candidate, dict) or not candidate.get("name"):
         raise ValueError("candidate needs a 'name'")
     direction = str(candidate.get("direction") or "long").strip().lower()
@@ -391,72 +504,198 @@ def validate_candidate(candidate: dict) -> dict:
             "close_strategies (the open/close engine models both sides) or "
             "evaluate each leg separately.")
     ctype = str(candidate.get("type") or "perps").strip().lower()
+    candidate_close_preflight(candidate)
     if candidate.get("invert_signal") and ctype not in ("perps", "manual"):
         raise ValueError(
             f"candidate sets invert_signal on type={ctype!r}, but "
             f"invert_signal is HL-perps/manual-only (the live daemon rejects "
             f"this at startup — config.go). Remove invert_signal or declare "
             f"type perps/manual.")
-    # #996: backtester-level ATR stop owners are mutually exclusive (mirrors
-    # the live config's exclusive stop fields).
     if candidate.get("stop_loss_atr_mult") and candidate.get("trailing_stop_atr_mult"):
         raise ValueError(
             "candidate sets both stop_loss_atr_mult and "
             "trailing_stop_atr_mult; the stop owners are mutually exclusive "
             "— pick one.")
-    # #998: regime-profile allocation is backtestable; validate the block shape
-    # and require an inline window_spec so the harness can compute the label
-    # series (eval_windows has no live regime store / config).
+    candidate_stop_kwargs(candidate)
     pal = candidate.get("profile_allocation")
     if pal:
         from backtester import _parse_profile_allocation
-        _parse_profile_allocation(pal)  # raises on bad param_sets/confirm/initial
+        _parse_profile_allocation(pal)
         if not pal.get("window_spec"):
             raise ValueError(
                 "candidate.profile_allocation needs an inline 'window_spec' "
                 "({classifier, period[, thresholds|adx_threshold]}) so the "
                 "harness can compute the switch label series.")
+
+    ar = candidate.get("allowed_regimes")
+    if ar is not None:
+        if not isinstance(ar, list):
+            raise ValueError(
+                "candidate.allowed_regimes must be a list of strings "
+                "(or omitted for no gate)")
+        if not all(isinstance(x, str) for x in ar):
+            raise ValueError(
+                "candidate.allowed_regimes entries must all be strings")
+        if len(ar) == 0:
+            candidate.pop("allowed_regimes", None)
+
+    rws = candidate.get("regime_windows_spec")
+    if rws is not None:
+        if not isinstance(rws, dict):
+            raise ValueError(
+                "candidate.regime_windows_spec must be an object "
+                "{window_name: {classifier, period, ...}} (or omitted for "
+                "the legacy single-lookback ADX gate)")
+        if not rws:
+            candidate.pop("regime_windows_spec", None)
+        else:
+            from regime import parse_regime_windows_spec_json
+            try:
+                normalized = parse_regime_windows_spec_json(json.dumps(rws))
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"candidate.regime_windows_spec: {exc}")
+            candidate["regime_windows_spec"] = normalized
+
+    rdp = candidate.get("regime_directional_policy")
+    if rdp is not None:
+        if not isinstance(rdp, dict):
+            raise ValueError(
+                "candidate.regime_directional_policy must be an object "
+                "{trend_regime: {label: {direction, invert_signal?}}} "
+                "(or omitted for no directional gate)")
+        if not rdp:
+            candidate.pop("regime_directional_policy", None)
+        else:
+            from backtester import _normalize_regime_directional_policy
+            try:
+                normalized_rdp = _normalize_regime_directional_policy(rdp)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"candidate.regime_directional_policy: {exc}")
+            both_labels = sorted(
+                label for label, entry in (normalized_rdp or {}).items()
+                if entry.get("direction") == "both")
+            if both_labels and not close_refs:
+                raise ValueError(
+                    "candidate.regime_directional_policy resolves "
+                    f"direction='both' for {both_labels} but the candidate "
+                    "has no close_strategies. The plain signal path runs one "
+                    "leg at a time, so a both-sided regime would be rejected "
+                    "by the Backtester (or silently mis-scored). Add "
+                    "close_strategies (the open/close engine models both "
+                    "sides) or drop the both-states.")
+            candidate["regime_directional_policy"] = {
+                "trend_regime": normalized_rdp}
+
+    rp = candidate.get("regime_period")
+    rt = candidate.get("regime_adx_threshold")
+    if rp is not None or rt is not None:
+        if candidate.get("regime_windows_spec"):
+            raise ValueError(
+                "candidate sets regime_period/regime_adx_threshold alongside "
+                "regime_windows_spec; the windows spec owns the gate's "
+                "classifier and lookback — drop the legacy fields")
+        if not (candidate.get("allowed_regimes")
+                or candidate.get("regime_directional_policy")):
+            raise ValueError(
+                "candidate sets regime_period/regime_adx_threshold without a "
+                "regime gate consumer (allowed_regimes or "
+                "regime_directional_policy) — they would be a silent no-op")
+        if rp is not None and (isinstance(rp, bool)
+                               or not isinstance(rp, int) or rp < 2):
+            raise ValueError(
+                f"candidate.regime_period must be an int >= 2, got {rp!r}")
+        if rt is not None and (isinstance(rt, bool)
+                               or not isinstance(rt, (int, float))
+                               or not rt > 0):
+            raise ValueError(
+                "candidate.regime_adx_threshold must be a positive number, "
+                f"got {rt!r}")
     return candidate
+
+
+def candidate_stop_kwargs(candidate: dict) -> Optional[dict]:
+    if candidate.get("stop_context") is None:
+        return None
+    from run_backtest import stop_kwargs_from_json
+    kwargs = stop_kwargs_from_json(candidate["stop_context"])
+    for key in ("stop_loss_atr_mult", "trailing_stop_atr_mult"):
+        if kwargs.get(key) != candidate.get(key):
+            raise ValueError(
+                f"candidate.{key}={candidate.get(key)!r} disagrees with "
+                f"candidate.stop_context.{key}={kwargs.get(key)!r}")
+    return kwargs
+
+
+def run_candidate_leg(reg, candidate: dict, symbol: str, timeframe: str,
+                      window: tuple, capital: float = DEFAULT_CAPITAL, *,
+                      keep_trades: bool = False,
+                      intrabar_resolution: str = "ohlc_walk",
+                      manifest_ctx: Optional[dict] = None) -> Optional[dict]:
+    return run_leg(
+        reg, candidate["name"], candidate.get("params"),
+        symbol, timeframe, window, capital=capital,
+        close_strategies=candidate.get("close_strategies"),
+        direction=candidate.get("direction") or "long",
+        invert_signal=bool(candidate.get("invert_signal")),
+        stop_loss_atr_mult=candidate.get("stop_loss_atr_mult"),
+        trailing_stop_atr_mult=candidate.get("trailing_stop_atr_mult"),
+        profile_allocation=candidate.get("profile_allocation"),
+        allowed_regimes=candidate.get("allowed_regimes"),
+        regime_period=int(candidate.get("regime_period") or 14),
+        regime_adx_threshold=float(
+            candidate.get("regime_adx_threshold") or 20.0),
+        regime_windows_spec=candidate.get("regime_windows_spec"),
+        regime_directional_policy=candidate.get("regime_directional_policy"),
+        regime_enabled=bool(candidate.get("regime_enabled")),
+        keep_trades=keep_trades,
+        intrabar_resolution=intrabar_resolution,
+        manifest_ctx=manifest_ctx,
+        comparison_mode=candidate.get("comparison_mode"),
+        stop_kwargs=candidate_stop_kwargs(candidate),
+    )
 
 
 def evaluate_window(reg, candidate: dict, datasets: List[tuple],
                     window_name: str, capital: float,
-                    bars_memo: dict) -> dict:
-    """Candidate legs + incumbent bars + verdict for one window."""
+                    bars_memo: dict, *,
+                    intrabar_resolution: str = "ohlc_walk",
+                    manifest: Optional[dict] = None,
+                    cost_multiplier: float = 1.0) -> dict:
     validate_candidate(candidate)
-    window = WINDOWS[window_name]
-    if window_name not in bars_memo:
-        bars_memo[window_name] = incumbent_bars(
-            compute_incumbent_legs(reg, datasets, window, capital))
-    bars = bars_memo[window_name]
+    manifest_ctx = None
+    if manifest is not None:
+        window = manifest_windows(manifest)[window_name]
+        manifest_ctx = {"manifest": manifest, "window": window_name,
+                        "cost_multiplier": cost_multiplier}
+    else:
+        window = WINDOWS[window_name]
+    memo_key = (window_name if manifest is None
+                else (manifest["path"], window_name, cost_multiplier))
+    if memo_key not in bars_memo:
+        bars_memo[memo_key] = incumbent_bars(
+            compute_incumbent_legs(reg, datasets, window, capital,
+                                   intrabar_resolution=intrabar_resolution,
+                                   manifest_ctx=manifest_ctx))
+    bars = bars_memo[memo_key]
 
     candidate_legs = {}
     for symbol, timeframe in datasets:
         ds = dataset_key(symbol, timeframe)
-        candidate_legs[ds] = run_leg(
-            reg, candidate["name"], candidate.get("params"),
-            symbol, timeframe, window, capital=capital,
-            close_strategies=candidate.get("close_strategies"),
-            # The validated default ("long") must also be the EXECUTED
-            # default: with close refs and direction=None the engine path
-            # would open shorts on raw signal=-1, silently scoring a
-            # different entry universe than the long-leg harness (#996).
-            direction=candidate.get("direction") or "long",
-            invert_signal=bool(candidate.get("invert_signal")),
-            stop_loss_atr_mult=candidate.get("stop_loss_atr_mult"),
-            trailing_stop_atr_mult=candidate.get("trailing_stop_atr_mult"),
-            profile_allocation=candidate.get("profile_allocation"),
-        )
+        candidate_legs[ds] = run_candidate_leg(
+            reg, candidate, symbol, timeframe, window, capital=capital,
+            intrabar_resolution=intrabar_resolution,
+            manifest_ctx=manifest_ctx)
     score = score_candidate(candidate_legs, bars)
     score["window"] = window_name
     score["window_range"] = list(window)
     score["bars"] = bars
+    from backtester import aggregate_close_validations
+    ran = [leg.get("close_validation") for leg in candidate_legs.values() if leg is not None]
+    score["close_validation"] = aggregate_close_validations(
+        ran or [candidate_close_preflight(candidate)])
     return score
 
-
-# ---------------------------------------------------------------------------
-# Reporting.
-# ---------------------------------------------------------------------------
 
 def _fmt(v, width=8, prec=2):
     if v is None:
@@ -489,6 +728,9 @@ def format_window_report(score: dict) -> str:
             f"{_fmt(leg['max_dd_pct'])} {_fmt(leg['bh_return_pct'])} "
             f"{leg['trades']:>6}  {beats}"
         )
+    if score.get("close_validation") is not None:
+        from backtester import format_close_validation
+        lines.append(format_close_validation(score["close_validation"]))
     if score.get("verdict") == "no data":
         lines.append("verdict: NO DATA")
         return "\n".join(lines)
@@ -553,10 +795,6 @@ def format_sweep_report(sweep_rows: List[dict], window_name: str) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# CLI.
-# ---------------------------------------------------------------------------
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="M1 multi-window incumbent-relative validation (#977)")
@@ -566,8 +804,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--candidate-json", default=None,
                    help="Path to a candidate JSON file: {name, params, "
                         "close_strategies?, direction?, invert_signal?, "
-                        "stop_loss_atr_mult?, trailing_stop_atr_mult?}. "
-                        "Overrides --strategy/--params.")
+                        "stop_loss_atr_mult?, trailing_stop_atr_mult?, "
+                        "allowed_regimes?, regime_windows_spec?, "
+                        "regime_enabled?, regime_directional_policy?, "
+                        "profile_allocation?, stop_context?}. "
+                        "Overrides --strategy/--params. allowed_regimes enables "
+                        "the entry gate on the M1 bar (legacy lookback unless "
+                        "regime_windows_spec picks another classifier); "
+                        "regime_enabled stamps the regime label a regime or "
+                        "unified stop owner resolves from; stop_context is "
+                        "the engine-fraction stop context tune_live.py writes.")
     p.add_argument("--registry", choices=["spot", "futures"], default="spot")
     p.add_argument("--direction", default=None,
                    choices=["long", "short", "both"],
@@ -577,6 +823,28 @@ def build_parser() -> argparse.ArgumentParser:
                         "strategies score their short leg instead of zero "
                         "trades. 'both' requires close_strategies (engine "
                         "path). Default: long.")
+    p.add_argument("--allowed-regimes", action="append", default=None,
+                   metavar="LABEL",
+                   help="Regime label to allow entries (repeatable). Enables "
+                        "the backtester entry gate for this candidate on the "
+                        "M1 incumbent-relative bar (legacy single-lookback "
+                        "ADX unless --regime-windows-spec picks another "
+                        "classifier).")
+    p.add_argument("--regime-windows-spec", default=None, metavar="JSON",
+                   help="#985 windows spec JSON selecting the entry gate's "
+                        "classifier ({name: {classifier: composite|adx, "
+                        "period, ...}}); the Backtester classifies the "
+                        "PRIMARY (medium-first) window (#1058) so composite "
+                        "labels work in --allowed-regimes. Omit for the "
+                        "legacy ADX gate.")
+    p.add_argument("--regime-directional-policy", default=None, metavar="JSON",
+                   help="#1166 directional-policy JSON (#1025 shape: "
+                        "{trend_regime: {label: {direction: long|short|both, "
+                        "invert_signal?}}}) resolving the entry direction per "
+                        "bar regime. RESEARCH MODE: the leg passes the #1085 "
+                        "certified input explicitly, so the default-off live "
+                        "gate is bypassed deliberately for measurement. "
+                        "both-states require close_strategies.")
     p.add_argument("--windows", default=None,
                    help=f"Comma list of windows (default: all). "
                         f"Known: {', '.join(WINDOWS)}")
@@ -586,8 +854,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--capital", type=float, default=DEFAULT_CAPITAL)
     p.add_argument("--sweep", action="append", default=None, metavar="P=V1,V2",
                    help="Plateau sweep over a param (repeatable; cartesian)")
-    p.add_argument("--sweep-window", default="oos", choices=list(WINDOWS),
-                   help="Window the sweep is scored on (default: oos)")
+    p.add_argument("--sweep-window", default=None,
+                   help="Window the sweep is scored on (default: oos; with "
+                        "--manifest it must be named explicitly, e.g. the "
+                        "declared training window)")
+    p.add_argument("--manifest", default=None, metavar="PATH",
+                   help="#1649 frozen offline manifest (offline_manifest.py): "
+                        "datasets, finite windows, warm-up, venue candles, "
+                        "funding cost, fees, spread/slippage and lot/minimum "
+                        "rules come from the manifest; hashes are verified and "
+                        "no network fetch happens. Default: off (legacy loader).")
+    p.add_argument("--cost-multiplier", type=float, default=1.0,
+                   help="With --manifest: scale spread and slippage (cost "
+                        "sensitivity). Default 1.0.")
     p.add_argument("--profile-allocation", default=None,
                    help="#998 regime-profile allocation JSON: {window_spec:"
                         "{classifier,period,...}, profiles:{label:profile}, "
@@ -595,6 +874,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "Scores the switched composite on the same harness.")
     p.add_argument("--json", default=None, dest="json_out",
                    help="Write the full structured result to this path")
+    p.add_argument("--intrabar-resolution", dest="intrabar_resolution",
+                   choices=["ohlc_walk", "bar_close"], default="ohlc_walk",
+                   help="SL race resolution (#1271): ohlc_walk (default) or "
+                        "bar_close (reproduce pre-#1271 documented baselines).")
+    p.add_argument("--comparison-mode", dest="comparison_mode", default=None,
+                   metavar="MODE",
+                   help="#1683 close comparison mode for the candidate. Omitted = "
+                        "strict (refuses time_stop/zscore_target, whose live "
+                        "inputs no platform supplies, and HL-live-only closes). "
+                        "'approximate' opts research into those exits; every leg, "
+                        "window and the JSON payload carry close_validation with "
+                        "incomplete parity. Overrides nothing: a candidate JSON "
+                        "comparison_mode that differs is an error.")
     return p
 
 
@@ -619,20 +911,60 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.direction:
         candidate["direction"] = args.direction
 
+    if args.allowed_regimes:
+        candidate["allowed_regimes"] = list(args.allowed_regimes)
+
+    if args.regime_windows_spec:
+        candidate["regime_windows_spec"] = json.loads(args.regime_windows_spec)
+
+    if args.regime_directional_policy:
+        candidate["regime_directional_policy"] = json.loads(
+            args.regime_directional_policy)
+
+    if args.comparison_mode is not None:
+        if "comparison_mode" in candidate and candidate["comparison_mode"] != args.comparison_mode:
+            raise SystemExit(
+                f"--comparison-mode {args.comparison_mode!r} conflicts with the candidate "
+                f"JSON comparison_mode {candidate['comparison_mode']!r}; pick one")
+        candidate["comparison_mode"] = args.comparison_mode
+
     try:
         validate_candidate(candidate)
     except ValueError as exc:
         raise SystemExit(str(exc))
 
+    manifest = None
+    known_windows = WINDOWS
+    if args.manifest:
+        import offline_manifest as om
+        try:
+            manifest = om.load_manifest(args.manifest)
+        except om.ManifestError as exc:
+            raise SystemExit(f"manifest error: {exc}")
+        known_windows = manifest_windows(manifest)
+        if args.datasets:
+            raise SystemExit("--datasets and --manifest are mutually exclusive; "
+                             "the manifest owns the datasets")
+        if args.sweep and not args.sweep_window:
+            raise SystemExit("--manifest sweeps need an explicit --sweep-window "
+                             f"(known: {list(known_windows)})")
+    elif args.cost_multiplier != 1.0:
+        raise SystemExit("--cost-multiplier needs --manifest")
+    sweep_window = args.sweep_window or "oos"
+    if args.sweep and sweep_window not in known_windows:
+        raise SystemExit(f"unknown --sweep-window {sweep_window!r}; known: {list(known_windows)}")
+
     if args.windows:
         window_names = [w.strip() for w in args.windows.split(",") if w.strip()]
-        unknown = [w for w in window_names if w not in WINDOWS]
+        unknown = [w for w in window_names if w not in known_windows]
         if unknown:
-            raise SystemExit(f"unknown windows {unknown}; known: {list(WINDOWS)}")
+            raise SystemExit(f"unknown windows {unknown}; known: {list(known_windows)}")
     else:
-        window_names = list(WINDOWS)
+        window_names = list(known_windows)
 
-    if args.datasets:
+    if manifest is not None:
+        datasets = manifest_datasets(manifest)
+    elif args.datasets:
         datasets = [parse_dataset_arg(d) for d in args.datasets.split(",") if d.strip()]
     else:
         datasets = list(DATASETS)
@@ -650,11 +982,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     window_scores = []
     for wname in window_names:
         score = evaluate_window(reg, candidate, datasets, wname,
-                                args.capital, bars_memo)
+                                args.capital, bars_memo,
+                                intrabar_resolution=args.intrabar_resolution,
+                                manifest=manifest,
+                                cost_multiplier=args.cost_multiplier)
         window_scores.append(score)
         print(format_window_report(score))
 
     print(format_summary(window_scores))
+    from backtester import aggregate_close_validations, format_close_validation
+    print(format_close_validation(aggregate_close_validations(
+        s.get("close_validation") for s in window_scores)))
 
     sweep_rows = []
     if args.sweep:
@@ -663,20 +1001,36 @@ def main(argv: Optional[List[str]] = None) -> int:
         for label, params in expand_sweep(base, specs):
             combo = dict(candidate)
             combo["params"] = params
-            score = evaluate_window(reg, combo, datasets, args.sweep_window,
-                                    args.capital, bars_memo)
+            score = evaluate_window(reg, combo, datasets, sweep_window,
+                                    args.capital, bars_memo,
+                                    intrabar_resolution=args.intrabar_resolution,
+                                    manifest=manifest,
+                                    cost_multiplier=args.cost_multiplier)
             sweep_rows.append({"label": label, "params": params, "score": score})
-        print(format_sweep_report(sweep_rows, args.sweep_window))
+        print(format_sweep_report(sweep_rows, sweep_window))
 
     if args.json_out:
+        manifest_meta = None
+        if manifest is not None:
+            import offline_manifest as om
+            manifest_meta = {
+                "path": os.path.relpath(manifest["path"]),
+                "sha256": om.sha256_file(manifest["path"]),
+                "provenance": manifest["provenance"],
+                "cost_multiplier": args.cost_multiplier,
+            }
         payload = {
             "candidate": candidate,
             "registry": args.registry,
             "incumbents": INCUMBENTS,
             "datasets": [dataset_key(s, t) for s, t in datasets],
-            "windows": {w: list(WINDOWS[w]) for w in window_names},
+            "windows": {w: list(known_windows[w]) for w in window_names},
+            "manifest": manifest_meta,
             "window_scores": window_scores,
             "sweep": sweep_rows,
+            "close_validation": aggregate_close_validations(
+                [s.get("close_validation") for s in window_scores]
+                + [r["score"].get("close_validation") for r in sweep_rows]),
         }
         with open(args.json_out, "w") as fh:
             json.dump(payload, fh, indent=2, default=str)

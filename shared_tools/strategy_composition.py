@@ -1,24 +1,24 @@
-"""Helpers for composing decoupled open and close strategy decisions.
-
-The check scripts still emit the legacy integer ``signal`` because the Go
-executor consumes that today. When a config opts into ``open_strategy`` /
-``close_strategies``, these helpers evaluate the open layer and close layer
-separately, then compose them back to the existing signal contract.
-"""
 
 from __future__ import annotations
 
 import json
 import inspect
+import sys
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
 import pandas as pd
 
 
+CLOSE_OWNER_ON_CHAIN_TP = "on_chain_tp"
+VALID_CLOSE_OWNERS = {CLOSE_OWNER_ON_CHAIN_TP}
 VALID_POSITION_SIDES = {"", "long", "short"}
 VALID_OPEN_ACTIONS = {"long", "short", "none"}
-POSITION_CONTEXT_PARAM_KEYS = {"side", "avg_cost", "current_quantity", "initial_quantity", "entry_atr", "regime"}
+POSITION_CONTEXT_PARAM_KEYS = {
+    "side", "avg_cost", "current_quantity", "initial_quantity", "entry_atr", "regime",
+    "risk_anchor_price", "tp_model", "bars_held", "opened_at_ms", "regime_applied_label",
+    "regime_pending_label", "regime_pending_count",
+}
 
 
 @dataclass
@@ -27,6 +27,9 @@ class CloseEvaluation:
     close_fraction: float
     sl_price: float = 0.0
     atr_value: float = 0.0
+    tier_fill_price: float = 0.0
+    reason: str = ""
+    tp_tier: object = None
 
 
 @dataclass
@@ -36,19 +39,10 @@ class OpenCloseEvaluation:
     open_result_df: pd.DataFrame
     open_signal: int
     close_evaluations: list[CloseEvaluation]
+    close_owner: Optional[str] = None
 
 
 def parse_strategy_refs_arg(raw: Optional[str]) -> Optional[dict]:
-    """#640: Parse --strategy-refs JSON into a dict shaped for run_signal_check.
-
-    Returns None when raw is None/empty so the caller can fall through to
-    legacy --params/--open-strategy/--close-strategies flags. The returned
-    dict has keys:
-      - open_name: str|None
-      - open_params: dict|None
-      - close_csv: str (comma-joined names; matches the legacy --close-strategies)
-      - close_params_by_name: dict[str, dict] keyed by close strategy name
-    """
     if not raw:
         return None
     import json
@@ -69,12 +63,24 @@ def parse_strategy_refs_arg(raw: Optional[str]) -> Optional[dict]:
         ref_params = ref.get("params")
         if ref_params:
             close_params_by_name[name] = ref_params
-    return {
+    parsed = {
         "open_name": open_name,
         "open_params": open_params,
         "close_csv": ",".join(close_names) if close_names else None,
         "close_params_by_name": close_params_by_name or None,
+        "close_owner": payload.get("close_owner") or None,
     }
+    if "invert_open_signal" in payload:
+        parsed["invert_open_signal"] = payload.get("invert_open_signal")
+    return parsed
+
+
+def parse_invert_open_signal(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"invert_open_signal must be a bool, got {value!r}")
 
 
 def parse_close_strategies(raw: Optional[str | Iterable[str]]) -> list[str]:
@@ -128,15 +134,32 @@ def legacy_close_fraction_from_signal(signal: int, position_side: str) -> float:
     return 0.0
 
 
-def max_close_fraction(evaluations: Iterable[CloseEvaluation]) -> tuple[float, str]:
+def best_close_evaluation(evaluations: Iterable[CloseEvaluation]) -> Optional[CloseEvaluation]:
+    best = None
     best_fraction = 0.0
-    best_strategy = ""
     for evaluation in evaluations:
         fraction = clamp_close_fraction(evaluation.close_fraction)
         if fraction > best_fraction:
             best_fraction = fraction
-            best_strategy = evaluation.strategy
-    return best_fraction, best_strategy
+            best = evaluation
+    return best
+
+
+def max_close_fraction(evaluations: Iterable[CloseEvaluation]) -> tuple[float, str]:
+    best = best_close_evaluation(evaluations)
+    if best is None:
+        return 0.0, ""
+    return clamp_close_fraction(best.close_fraction), best.strategy
+
+
+def _positive_price(value) -> float:
+    try:
+        price = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if price != price or price in (float("inf"), float("-inf")) or price <= 0:
+        return 0.0
+    return price
 
 
 def compose_signal(open_action: str, close_fraction: float, position_side: str) -> int:
@@ -167,7 +190,12 @@ def effective_close_strategies(
     positional_strategy: str,
     open_strategy: Optional[str],
     close_strategies: Optional[Iterable[str]],
+    close_owner: Optional[str] = None,
 ) -> list[str]:
+    if close_owner is not None:
+        if close_owner not in VALID_CLOSE_OWNERS:
+            raise ValueError(f"close_owner must be one of {sorted(VALID_CLOSE_OWNERS)}, got {close_owner!r}")
+        return []
     explicit = parse_close_strategies(close_strategies)
     if explicit:
         return explicit
@@ -187,13 +215,25 @@ _DEPRECATED_CLOSE_NAMES = {"tp_at_pct": "tiered_tp_pct"}
 
 
 def canonical_close_name(name: str) -> str:
-    """Rewrite deprecated close evaluator names (#841 read shim)."""
     name = (name or "").strip()
     return _DEPRECATED_CLOSE_NAMES.get(name, name)
 
 
+def close_names_include_avwap_stop(close_names: Iterable[str]) -> bool:
+    return any(canonical_close_name(name) == "avwap_stop" for name in close_names)
+
+
+def warn_avwap_stop_missing_context() -> None:
+    print(
+        "[WARN] close strategy 'avwap_stop' is configured but the open strategy "
+        "produced no usable 'avwap' value; the AVWAP exit can never fire and the "
+        "position is protected only by the engine stop-loss. Verify the open "
+        "strategy is an AVWAP-family strategy that emits an 'avwap' column (#1196).",
+        file=sys.stderr,
+    )
+
+
 def rewrite_deprecated_close_ref(name: str, params: Optional[dict]) -> tuple[str, Optional[dict]]:
-    """One-window shim: tp_at_pct → single-tier tiered_tp_pct (#841)."""
     name = (name or "").strip()
     resolved = canonical_close_name(name)
     if name != "tp_at_pct":
@@ -212,15 +252,143 @@ def rewrite_deprecated_close_ref(name: str, params: Optional[dict]) -> tuple[str
     return resolved, out
 
 
+EDGE_STATUS_NO_EDGE = "no_edge"
+ALLOW_NO_EDGE_FLAG = "--allow-no-edge"
+MODE_FLAG = "--mode"
+GATE_MODE_PAPER = "paper"
+GATE_MODE_LIVE = "live"
+GATE_MODE_MISSING = "missing"
+GATE_MODE_INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class GateMode:
+    kind: str
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class Acknowledgement:
+    value: bool
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class StrategyReference:
+    role: str
+    name: str
+
+
+def parse_raw_gate_mode(tokens) -> GateMode:
+    if tokens is None:
+        return GateMode(GATE_MODE_MISSING)
+    if not isinstance(tokens, (list, tuple)) or not all(isinstance(t, str) for t in tokens):
+        return GateMode(GATE_MODE_INVALID, f"mode evidence must be a list of strings, got {tokens!r}")
+    tokens = list(tokens)
+    values: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == MODE_FLAG:
+            if i + 1 >= len(tokens):
+                return GateMode(GATE_MODE_INVALID, "dangling --mode with no value")
+            values.append(tokens[i + 1])
+            i += 2
+            continue
+        if token.startswith(MODE_FLAG + "="):
+            values.append(token[len(MODE_FLAG) + 1:])
+        i += 1
+    if not values:
+        return GateMode(GATE_MODE_MISSING)
+    if len(values) > 1:
+        return GateMode(GATE_MODE_INVALID, f"--mode given {len(values)} times ({values!r})")
+    value = values[0]
+    if value == GATE_MODE_PAPER:
+        return GateMode(GATE_MODE_PAPER)
+    if value == GATE_MODE_LIVE:
+        return GateMode(GATE_MODE_LIVE)
+    return GateMode(GATE_MODE_INVALID, f"--mode value {value!r} is not exactly 'paper' or 'live'")
+
+
+def parse_allow_no_edge_tokens(tokens) -> Acknowledgement:
+    hits = [
+        t for t in (tokens or [])
+        if isinstance(t, str) and (t == ALLOW_NO_EDGE_FLAG or t.startswith(ALLOW_NO_EDGE_FLAG + "="))
+    ]
+    if not hits:
+        return Acknowledgement(False)
+    if len(hits) > 1:
+        return Acknowledgement(False, f"{ALLOW_NO_EDGE_FLAG} given {len(hits)} times")
+    if hits[0] != ALLOW_NO_EDGE_FLAG:
+        return Acknowledgement(False, f"{ALLOW_NO_EDGE_FLAG} takes no value, got {hits[0]!r}")
+    return Acknowledgement(True)
+
+
+def parse_allow_no_edge_value(slot: dict, key: str = "allow_no_edge") -> Acknowledgement:
+    if key not in slot:
+        return Acknowledgement(False)
+    value = slot[key]
+    if value is True:
+        return Acknowledgement(True)
+    if value is False:
+        return Acknowledgement(False)
+    return Acknowledgement(False, f"{key} must be a JSON boolean, got {value!r}")
+
+
 def validate_close_strategy_names(
     close_names: Iterable[str],
     get_open_strategy: Callable[[str], object],
     get_close_strategy: Callable[[str], object],
     list_open_strategies: Optional[Callable[[], Iterable[str]]] = None,
     list_close_strategies: Optional[Callable[[], Iterable[str]]] = None,
+    required_platform: Optional[str] = None,
 ) -> None:
-    """Validate explicit close names against close registry, then legacy open fallback."""
+    """Validate close refs, optionally enforcing platform support.
+
+    Fork extension: ``required_platform`` (e.g. ``"blofin-perps"``) rejects
+    evaluators not supported on that platform, using the close registry's
+    ``platforms``/``support`` metadata (see support_matrix.json).
+    """
     for name in close_names:
+        resolved = canonical_close_name(name)
+        try:
+            entry = get_close_strategy(resolved)
+        except ValueError:
+            pass
+        else:
+            if required_platform:
+                platforms = tuple(entry.get("platforms", ())) if isinstance(entry, dict) else ()
+                if required_platform not in platforms:
+                    support = (entry.get("support") or {}).get(required_platform, {}) if isinstance(entry, dict) else {}
+                    detail = str(support.get("notes") or "")
+                    suffix = f": {detail}" if detail else ""
+                    raise ValueError(
+                        f"Close strategy '{resolved}' is not supported on "
+                        f"{required_platform}{suffix}"
+                    )
+            continue
+        try:
+            get_open_strategy(resolved)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unknown close strategy: {name}. "
+                f"Available close strategies: {_safe_list_strategy_names(list_close_strategies)}; "
+                f"fallback open strategies: {_safe_list_strategy_names(list_open_strategies)}"
+            ) from exc
+
+
+def resolve_strategy_references(
+    positional_strategy: str,
+    open_strategy: Optional[str],
+    close_strategies: Optional[str | Iterable[str]],
+    get_open_strategy: Callable[[str], object],
+    get_close_strategy: Callable[[str], object],
+    list_open_strategies: Optional[Callable[[], Iterable[str]]] = None,
+    list_close_strategies: Optional[Callable[[], Iterable[str]]] = None,
+) -> list[StrategyReference]:
+    open_name = (open_strategy or positional_strategy or "").strip()
+    refs = [StrategyReference("open", open_name)] if open_name else []
+    for name in parse_close_strategies(close_strategies):
         resolved = canonical_close_name(name)
         try:
             get_close_strategy(resolved)
@@ -229,13 +397,66 @@ def validate_close_strategy_names(
             pass
         try:
             get_open_strategy(resolved)
-            continue
         except ValueError as exc:
             raise ValueError(
                 f"Unknown close strategy: {name}. "
                 f"Available close strategies: {_safe_list_strategy_names(list_close_strategies)}; "
                 f"fallback open strategies: {_safe_list_strategy_names(list_open_strategies)}"
             ) from exc
+        refs.append(StrategyReference("close", resolved))
+    return refs
+
+
+def admit_strategy_references(
+    references: Iterable[StrategyReference],
+    gate_mode: GateMode,
+    acknowledgement: Acknowledgement,
+    get_strategy: Callable[[str], object],
+) -> None:
+    for ref in references:
+        entry = get_strategy(ref.name)
+        if not isinstance(entry, dict) or entry.get("edge_status") != EDGE_STATUS_NO_EDGE:
+            continue
+        source = entry.get("edge_source") or "unknown"
+        evidence = entry.get("edge_ref") or "unknown"
+        label = f"{ref.role} strategy '{ref.name}' is edge_status=no_edge (source {source}, evidence {evidence})"
+        if gate_mode.kind == GATE_MODE_INVALID:
+            raise ValueError(f"{label}: invalid mode input refused ({gate_mode.detail})")
+        if acknowledgement.error:
+            raise ValueError(f"{label}: invalid acknowledgement refused ({acknowledgement.error})")
+        if gate_mode.kind == GATE_MODE_PAPER:
+            continue
+        if acknowledgement.value is True:
+            continue
+        mode_text = "explicit live mode" if gate_mode.kind == GATE_MODE_LIVE else "missing mode (treated as live)"
+        raise ValueError(
+            f"{label}: {mode_text} requires allow_no_edge: true on the strategy "
+            f"({ALLOW_NO_EDGE_FLAG}); paper evaluation needs an explicit --mode=paper"
+        )
+
+
+def admit_configured_strategies(
+    positional_strategy: str,
+    open_strategy: Optional[str],
+    close_strategies: Optional[str | Iterable[str]],
+    gate_mode: GateMode,
+    acknowledgement: Acknowledgement,
+    get_open_strategy: Callable[[str], object],
+    get_close_strategy: Callable[[str], object],
+    list_open_strategies: Optional[Callable[[], Iterable[str]]] = None,
+    list_close_strategies: Optional[Callable[[], Iterable[str]]] = None,
+) -> list[StrategyReference]:
+    references = resolve_strategy_references(
+        positional_strategy,
+        open_strategy,
+        close_strategies,
+        get_open_strategy,
+        get_close_strategy,
+        list_open_strategies,
+        list_close_strategies,
+    )
+    admit_strategy_references(references, gate_mode, acknowledgement, get_open_strategy)
+    return references
 
 
 def _last_signal(result_df: pd.DataFrame) -> int:
@@ -291,11 +512,6 @@ def strip_unsupported_position_context(fn, params: dict) -> dict:
             inspect.Parameter.KEYWORD_ONLY,
         )
     }
-    # Framework-injected position-context kwargs (regime, side, avg_cost, ...) must be
-    # opt-in via explicit signature. The earlier VAR_KEYWORD short-circuit silently
-    # forwarded them through `def *_strategy(df, **params)` wrappers into thin cores
-    # that crash on unknown kwargs (#720). Regular strategy params still pass through
-    # untouched — only POSITION_CONTEXT_PARAM_KEYS are stripped when undeclared.
     return {
         key: value for key, value in params.items()
         if key in accepted or key not in POSITION_CONTEXT_PARAM_KEYS
@@ -305,7 +521,7 @@ def strip_unsupported_position_context(fn, params: dict) -> dict:
 def evaluate_open_close(
     apply_strategy: Callable[[str, pd.DataFrame, Optional[dict]], pd.DataFrame],
     get_strategy: Callable[[str], object],
-    df: pd.DataFrame,
+    df: Optional[pd.DataFrame],
     positional_strategy: str,
     open_strategy: Optional[str],
     close_strategies: Optional[Iterable[str]],
@@ -315,11 +531,18 @@ def evaluate_open_close(
     close_evaluate: Optional[Callable[[str, dict, dict, Optional[dict]], dict]] = None,
     market_ctx: Optional[dict] = None,
     close_params_by_name: Optional[dict[str, dict]] = None,
+    close_owner: Optional[str] = None,
+    invert_open_signal: bool = False,
+    protection_df: Optional[pd.DataFrame] = None,
+    protection_params: Optional[dict] = None,
 ) -> OpenCloseEvaluation:
     open_name = (open_strategy or positional_strategy).strip()
     close_names = effective_close_strategies(
-        positional_strategy, open_name, close_strategies
+        positional_strategy, open_name, close_strategies, close_owner
     )
+    decision_available = df is not None
+    if not decision_available and protection_df is None:
+        raise ValueError("evaluate_open_close needs a decision frame or a protection frame")
     cache: dict[tuple[str, str], pd.DataFrame] = {}
 
     def run(name: str, run_params: Optional[dict]) -> pd.DataFrame:
@@ -331,17 +554,36 @@ def evaluate_open_close(
             cache[key] = apply_strategy(name, df, run_params)
         return cache[key]
 
-    open_result = run(open_name, params)
-    open_signal = _last_signal(open_result)
+    if decision_available:
+        open_result = run(open_name, params)
+        open_signal = _last_signal(open_result)
+    else:
+        get_strategy(open_name)
+        open_result = pd.DataFrame()
+        open_signal = 0
     close_evals: list[CloseEvaluation] = []
-    market = market_ctx if market_ctx is not None else _default_market_ctx(df)
+    if market_ctx is not None:
+        market = market_ctx
+    else:
+        market = _default_market_ctx(protection_df if protection_df is not None else df)
+    avwap_source = open_result
+    if protection_df is not None and close_names:
+        get_strategy(open_name)
+        avwap_source = apply_strategy(
+            open_name, protection_df, protection_params if protection_params is not None else params)
+    avwap_injected = False
+    if not avwap_source.empty and "avwap" in avwap_source.columns:
+        try:
+            avwap_value = float(avwap_source["avwap"].iloc[-1])
+        except (TypeError, ValueError):
+            avwap_value = float("nan")
+        if avwap_value == avwap_value and avwap_value > 0:
+            market = {**market, "avwap": avwap_value}
+            avwap_injected = True
+    if not avwap_injected and "avwap" not in market and close_names_include_avwap_stop(close_names):
+        warn_avwap_stop_missing_context()
     for name in close_names:
         resolved, _ = rewrite_deprecated_close_ref(name, None)
-        # #640: per-close params arrive via close_params_by_name (carried on the
-        # matching StrategyRef on the Go side). Implicit-self close still
-        # inherits the open strategy's params unless the operator explicitly
-        # set per-ref params for that name. Other close strategies default to
-        # their registry defaults — never to the open strategy's params.
         if close_params_by_name and name in close_params_by_name:
             base_close_params = close_params_by_name[name]
         elif close_params_by_name and resolved in close_params_by_name:
@@ -359,17 +601,26 @@ def evaluate_open_close(
                     close_fraction=result.get("close_fraction", 0.0),
                     sl_price=result.get("sl_price", 0.0),
                     atr_value=result.get("atr_value", 0.0),
+                    tier_fill_price=_positive_price(result.get("tier_fill_price")),
+                    reason=str(result.get("reason") or ""),
+                    tp_tier=result.get("tp_tier"),
                 ))
                 continue
             except ValueError as exc:
                 if not _is_unknown_close_strategy_error(exc):
                     raise
+        if not decision_available:
+            close_evals.append(CloseEvaluation(strategy=resolved, close_fraction=0.0))
+            continue
         close_params = _merge_close_params(base_close_params, position_ctx)
         result = run(resolved, close_params)
         signal = _last_signal(result)
+        if invert_open_signal and resolved == open_name and signal:
+            signal = -signal
         close_evals.append(CloseEvaluation(
             strategy=resolved,
             close_fraction=_last_close_fraction(result, signal, position_side),
+            reason="open_signal_close",
         ))
 
     return OpenCloseEvaluation(
@@ -378,6 +629,7 @@ def evaluate_open_close(
         open_result_df=open_result,
         open_signal=open_signal,
         close_evaluations=close_evals,
+        close_owner=close_owner,
     )
 
 
@@ -386,8 +638,11 @@ def finalize_decision(
     evaluation: OpenCloseEvaluation,
     position_side: str,
     open_signal: Optional[int] = None,
+    invert_open_signal: bool = False,
 ) -> dict:
     signal = evaluation.open_signal if open_signal is None else normalize_signal(open_signal)
+    if invert_open_signal and signal:
+        signal = -signal
     open_action = open_action_from_signal(signal)
     close_fraction, close_strategy = max_close_fraction(evaluation.close_evaluations)
     sl_price = 0.0
@@ -397,7 +652,7 @@ def finalize_decision(
             sl_price = ev.sl_price
             atr_value = ev.atr_value
             break
-    return {
+    decision = {
         "open_strategy": evaluation.open_strategy,
         "close_strategies": evaluation.close_strategies,
         "open_action": open_action,
@@ -407,3 +662,18 @@ def finalize_decision(
         "sl_price": sl_price,
         "atr_value": atr_value,
     }
+    if invert_open_signal:
+        decision["open_signal_inverted"] = True
+    if evaluation.close_owner:
+        decision["close_owner"] = evaluation.close_owner
+    best = best_close_evaluation(evaluation.close_evaluations)
+    if best is not None and close_fraction > 0:
+        decision["close_evaluator"] = best.strategy
+        decision["close_source"] = "evaluator"
+        if best.reason:
+            decision["close_reason"] = best.reason
+        if best.tp_tier is not None:
+            decision["tp_tier"] = best.tp_tier
+    if best is not None and best.tier_fill_price > 0:
+        decision["close_tier_fill_price"] = best.tier_fill_price
+    return decision

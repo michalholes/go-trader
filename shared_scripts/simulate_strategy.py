@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Replay strategy signals over dashboard candles for what-if preview (#811)."""
 
 from __future__ import annotations
 
@@ -21,16 +20,14 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "shared_tools"))
 sys.path.insert(0, os.path.join(ROOT, "backtest"))
 
-from atr import ensure_atr_indicator  # noqa: E402
-from backtester import Backtester  # noqa: E402
-from registry_loader import load_registry  # noqa: E402
-from run_backtest import _apply_htf_filter_to_df  # noqa: E402
-
-
-def _registry_for_type(strategy_type: str) -> str:
-    if strategy_type in ("perps", "futures", "manual"):
-        return "futures"
-    return "spot"
+from atr import ensure_atr_indicator
+from regime import normalize_regime_gate_on_failure
+from backtester import Backtester, CloseCapabilityError
+from registry_loader import load_registry, registry_for_strategy_type
+from run_backtest import (_apply_htf_filter_to_df, _atr_window_evidence,
+                          _resolve_regime_windows_spec, live_stop_engine_inputs,
+                          stop_raw_fields)
+from backtester import STOP_FIELD_KEYS, STOP_GEOMETRY_INPUT_KEYS, STOP_UNITS_PREVIEW
 
 
 def _fee_platform(platform: str, strategy_type: str) -> str:
@@ -41,6 +38,12 @@ def _fee_platform(platform: str, strategy_type: str) -> str:
     if platform in ("binanceus", "hyperliquid", "robinhood", "luno", "okx", "okx-perps"):
         return platform
     return "binanceus"
+
+
+def _resolve_gate_on_failure(cfg: Dict[str, Any], regime_cfg: Dict[str, Any]) -> str:
+    per_raw = str(cfg.get("regime_gate_on_failure") or "").strip().lower()
+    glob_gate = normalize_regime_gate_on_failure(regime_cfg.get("gate_on_failure"))
+    return normalize_regime_gate_on_failure(per_raw) if per_raw else glob_gate
 
 
 def _candles_to_df(candles: List[dict]) -> pd.DataFrame:
@@ -145,6 +148,76 @@ def _marker(time: int, kind: str, is_close: bool, price: float, pnl: float = 0.0
     }
 
 
+_ATR_REGIME_STOP_SPELLINGS = {
+    "stop_loss_atr_mult_regime": ("stop_loss_atr_regime",),
+    "trailing_stop_atr_mult_regime": (
+        "trail_stop_atr_regime",
+        "trailing_stop_atr_regime",
+    ),
+}
+
+
+def _resolve_atr_regime_stop(cfg: dict, canon: str):
+    """Fold the legacy spellings of one per-regime ATR stop field onto its v19
+    canonical key, merging equivalent blocks and refusing differing ones the way
+    renameV19AtrMultRegimeKeys does in scheduler/config_migration_v19.go."""
+    resolved = None
+    source = None
+    for key in (canon,) + _ATR_REGIME_STOP_SPELLINGS[canon]:
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        if source is None:
+            resolved, source = value, key
+            continue
+        if value != resolved:
+            raise ValueError(
+                f"conflicting ATR-regime stop keys {source!r} and {key!r} both "
+                f"normalize to {canon!r} with differing values"
+            )
+    return resolved
+
+
+_PREVIEW_LEVERAGE_SOURCES = {
+    "tuner_override": True,
+    "strategy_config": True,
+    "loader_default": False,
+}
+
+
+def _preview_stop_kwargs(cfg: dict) -> dict:
+    resolved = {k: cfg.get(k) for k in STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS}
+    resolved["stop_loss_atr_mult_regime"] = _resolve_atr_regime_stop(
+        cfg, "stop_loss_atr_mult_regime")
+    resolved["trailing_stop_atr_mult_regime"] = _resolve_atr_regime_stop(
+        cfg, "trailing_stop_atr_mult_regime")
+    if not any(v is not None for v in resolved.values()):
+        return {}
+    if cfg.get("stop_units") != "live_percent":
+        raise ValueError(
+            "preview payload carries stop fields without stop_units='live_percent'; "
+            "refusing to guess whether they are live percent or engine fractions")
+    source = str(cfg.get("leverage_source") or "")
+    if source not in _PREVIEW_LEVERAGE_SOURCES:
+        raise ValueError(f"preview payload leverage_source must be one of "
+                         f"{sorted(_PREVIEW_LEVERAGE_SOURCES)}, got {source!r}")
+    leverage = resolved.get("leverage")
+    if leverage is None:
+        lev = {"status": "missing", "source": source, "value": None}
+    elif not isinstance(leverage, (int, float)) or isinstance(leverage, bool) or leverage <= 0:
+        lev = {"status": "invalid", "source": source, "value": None}
+    else:
+        lev = {"status": "verified" if _PREVIEW_LEVERAGE_SOURCES[source] else "unverified",
+               "source": source, "value": float(leverage)}
+    window_evidence = _atr_window_evidence(cfg, dict(cfg.get("regime") or {}))
+    kwargs, context = live_stop_engine_inputs(
+        resolved, raw_fields=stop_raw_fields(resolved), source=STOP_UNITS_PREVIEW,
+        leverage=lev, extra_evidence={"atr_regime_window": window_evidence})
+    kwargs["capability_context"] = context
+    kwargs["stop_platform"] = str(cfg.get("platform") or "").strip().lower()
+    return kwargs
+
+
 def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
     strategy_type = str(cfg.get("type") or "spot")
     if strategy_type == "options":
@@ -158,7 +231,7 @@ def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
     if not open_name:
         raise ValueError("missing open strategy name")
 
-    reg = load_registry(_registry_for_type(strategy_type))
+    reg = load_registry(registry_for_strategy_type(strategy_type))
     if open_name not in reg.STRATEGY_REGISTRY:
         raise ValueError(f"unknown strategy {open_name!r}")
 
@@ -171,17 +244,11 @@ def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
     merged_params = {**defaults, **params}
 
     df_signals = reg.apply_strategy(open_name, df, merged_params)
-    # #842: a strategy has a single close_strategy ref; still accept the legacy
-    # close_strategies array (length <=1 after the collapse). The Backtester's
-    # close_strategies= list interface is fed the 0-or-1 element list.
     single_close = cfg.get("close_strategy")
     if isinstance(single_close, dict) and single_close.get("name"):
         close_refs = [dict(single_close)]
     else:
         legacy = cfg.get("close_strategies") or []
-        # Match the live Go loader (#842): the array collapsed to a single
-        # close_strategy, so reject a len>1 legacy array instead of previewing
-        # it under the old max-fraction semantics the scheduler no longer runs.
         if len(legacy) > 1:
             raise ValueError(
                 f"{len(legacy)} close_strategies supplied; the array model was "
@@ -191,7 +258,9 @@ def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
             )
         close_refs = [dict(r) for r in legacy]
     if close_refs:
-        df_signals = ensure_atr_indicator(df_signals)
+        df_signals = ensure_atr_indicator(
+            df_signals, method=str(cfg.get("atr_method") or "simple")
+        )
 
     if cfg.get("htf_filter"):
         df_signals = _apply_htf_filter_to_df(df_signals, symbol, timeframe)
@@ -199,6 +268,7 @@ def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
     regime_cfg = dict(cfg.get("regime") or {})
     regime_enabled = bool(regime_cfg.get("enabled"))
     allowed = list(cfg.get("allowed_regimes") or [])
+    gate_on_failure = _resolve_gate_on_failure(cfg, regime_cfg)
 
     bt = Backtester(
         initial_capital=float(cfg.get("initial_capital") or 1000),
@@ -208,15 +278,11 @@ def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
         regime_enabled=regime_enabled,
         regime_period=int(regime_cfg.get("period") or 14),
         regime_adx_threshold=float(regime_cfg.get("adx_threshold") or 20),
+        regime_windows_spec=_resolve_regime_windows_spec(regime_cfg),
         allowed_regimes=allowed,
-        stop_loss_atr_mult=cfg.get("stop_loss_atr_mult"),
-        stop_loss_pct=cfg.get("stop_loss_pct"),
-        stop_loss_margin_pct=cfg.get("stop_loss_margin_pct"),
-        trailing_stop_atr_mult=cfg.get("trailing_stop_atr_mult"),
-        trailing_stop_pct=cfg.get("trailing_stop_pct"),
-        stop_loss_atr_regime=cfg.get("stop_loss_atr_regime"),
-        trailing_stop_atr_regime=cfg.get("trailing_stop_atr_regime"),
+        regime_gate_on_failure=gate_on_failure,
         strategy_type=strategy_type,
+        **_preview_stop_kwargs(cfg),
     )
     results = bt.run(
         df_signals,
@@ -247,6 +313,9 @@ def _run_payload(payload: dict) -> dict:
         cfg = dict(item.get("config") or item)
         try:
             out[label] = _simulate_one(cfg, candles)
+        except CloseCapabilityError as exc:
+            return {"error": f"{label}: {exc}", "markers": {},
+                    "label": label, "close_capability": exc.to_dict()}
         except Exception as exc:
             return {"error": f"{label}: {exc}", "markers": out}
     return {"markers": out}

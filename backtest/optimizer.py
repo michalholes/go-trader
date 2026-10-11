@@ -1,8 +1,3 @@
-"""
-Walk-forward optimization framework to prevent overfitting.
-Splits data into rolling in-sample/out-of-sample windows,
-optimizes parameters on in-sample, validates on out-of-sample.
-"""
 
 import sys
 import os
@@ -15,8 +10,8 @@ import numpy as np
 import pandas as pd
 
 from registry_loader import load_registry
-from backtester import Backtester
-# backtester puts shared_tools on sys.path; atr lives there.
+from backtester import (STOP_OWNERS_NEEDING_ATR, Backtester, CloseCapabilityError,
+                        aggregate_close_validations)
 from atr import ensure_atr_indicator
 
 
@@ -24,7 +19,6 @@ _EXPECTED_FOLD_ERRORS = (KeyError, ValueError, TypeError, IndexError, ZeroDivisi
 
 
 def generate_param_grid(param_ranges: Dict[str, list]) -> List[dict]:
-    """Generate all parameter combinations from ranges."""
     keys = list(param_ranges.keys())
     values = list(param_ranges.values())
     combos = list(itertools.product(*values))
@@ -33,23 +27,6 @@ def generate_param_grid(param_ranges: Dict[str, list]) -> List[dict]:
 
 def warmup_exit_long_entry(warmup_with_signal: pd.DataFrame,
                              slippage_pct: float) -> Optional[dict]:
-    """Walk through warmup signals to find whether the strategy ends the
-    warmup period already long, and if so at what effective entry price.
-
-    Mirrors Backtester's execution model: ``signal`` is shifted by one bar
-    (signal at bar t fills at bar t+1's open), slippage is added on entry.
-
-    Returns ``{"entry_price": float, "entry_date": idx}`` when the warmup
-    ends long, or ``None`` when flat. When the warmup frame carries an
-    ``atr`` column the seed also stamps ``entry_atr`` (the fill-bar ATR,
-    same plausibility guard as ``Backtester._stamp_entry_atr``) and
-    ``high_water`` (max close since entry) so the carried position is
-    managed by ATR-based close stacks and trailing stops exactly like a
-    mid-window open — without them every ATR exit silently no-ops on the
-    seeded position for its entire lifetime. The caller passes the dict to
-    ``Backtester.run(starting_long=...)`` so a SELL in the train window
-    actually closes the warmup position rather than being silently dropped.
-    """
     if len(warmup_with_signal) == 0 or "signal" not in warmup_with_signal.columns:
         return None
 
@@ -92,17 +69,6 @@ def warmup_exit_long_entry(warmup_with_signal: pd.DataFrame,
 
 
 def max_indicator_lookback(param_ranges: Dict[str, list]) -> int:
-    """Heuristic warmup size for walk-forward folds.
-
-    Scans the integer values in the parameter grid and returns the largest.
-    Period/lookback-style params are ints (``fast_period``, ``slow_period``,
-    ``atr_period``, ``swing_lookback``, etc.) and dominate warmup cost;
-    non-integer params (multipliers, thresholds) are ignored since they
-    don't add history requirements.
-
-    Returns 0 if no integer params found — matches the pre-warmup behavior
-    for grids like ``vwap_reversion`` that only tune std-dev thresholds.
-    """
     max_lb = 0
     for values in param_ranges.values():
         for v in values:
@@ -111,26 +77,16 @@ def max_indicator_lookback(param_ranges: Dict[str, list]) -> int:
     return max_lb
 
 
-# ---------------------------------------------------------------------------
-# Close-stack co-optimization (#996). A "close stack" is one complete exit
-# configuration the Backtester can run: an optional close-evaluator ref plus
-# the mutually-exclusive backtester-level ATR stop owners. The grid sweeps
-# whole stacks jointly with open-strategy params so walk-forward selection
-# picks (entry, exit) pairs instead of freezing one side.
-# ---------------------------------------------------------------------------
-
-ATR_CLOSE_WARMUP = 14  # standard ATR(14) priming bars for exit evaluation
+ATR_CLOSE_WARMUP = 14
 
 _CLOSE_STACK_SPEC_KEYS = {"close", "stop_loss_atr_mult", "trailing_stop_atr_mult"}
 
 
 def _fmt_num(v) -> str:
-    """Compact float formatting for stack labels (1.0 -> '1', 1.50 -> '1.5')."""
     return f"{v:g}"
 
 
 def close_stack_label(stack: dict) -> str:
-    """Human-readable one-line label for a close stack (fold reports, summary)."""
     parts = []
     for ref in stack.get("close_strategies") or []:
         params = ref.get("params") or {}
@@ -156,22 +112,6 @@ def close_stack_label(stack: dict) -> str:
 
 
 def generate_close_stack_grid(specs: List[dict]) -> List[dict]:
-    """Expand close-stack sweep specs into complete stack candidates.
-
-    Each spec is a dict with keys:
-      close: {"name": str, "params": {param: [candidate values]}} or None.
-             Param candidates may be structured (a whole tp_tiers ladder is
-             ONE candidate value); the cartesian product runs across params.
-      stop_loss_atr_mult / trailing_stop_atr_mult: lists of candidate values
-             (None = no stop). Defaults to [None] when omitted.
-
-    The two stop owners are mutually exclusive (mirrors the live config's
-    exclusive stop fields); a spec that would produce a combo with both set
-    raises. Stacks are deduped across specs by canonical JSON.
-
-    Returns [{"label", "close_strategies", "stop_loss_atr_mult",
-    "trailing_stop_atr_mult"}, ...].
-    """
     stacks: List[dict] = []
     seen = set()
     for i, spec in enumerate(specs):
@@ -191,8 +131,6 @@ def generate_close_stack_grid(specs: List[dict]) -> List[dict]:
                 raise ValueError(
                     f"close-stack spec {i}: close param {k!r} must be a "
                     f"non-empty list of candidate values")
-            # Classic footgun: one ladder passed where a list of candidate
-            # ladders is expected — each tp_tiers candidate is itself a list.
             if k == "tp_tiers" and not all(isinstance(c, list) for c in v):
                 raise ValueError(
                     f"close-stack spec {i}: tp_tiers candidates must each be "
@@ -228,13 +166,9 @@ def generate_close_stack_grid(specs: List[dict]) -> List[dict]:
 
 
 def _result_metric(result: dict, metric: str) -> float:
-    """Extract the optimization metric from a Backtester result.
-
-    ``dd_adjusted_return`` is derived (return / |max DD|, the #963 DDadj
-    definition mirrored from eval_windows.dd_adjusted_return — zero-DD legs
-    score 0.0 so untraded combos never win); other metrics are read directly.
-    """
     if metric == "dd_adjusted_return":
+        if result.get("liquidated"):
+            return -100.0
         ret = float(result.get("total_return_pct", 0) or 0)
         dd = float(result.get("max_drawdown_pct", 0) or 0)
         return ret / abs(dd) if dd else 0.0
@@ -242,27 +176,24 @@ def _result_metric(result: dict, metric: str) -> float:
     return v if isinstance(v, (int, float)) else -np.inf
 
 
-# Default sweep for `--sweep-close` (#996): the audit baseline plus ATR-stop
-# and tiered-TP variants around the live default ladder. Ladders are swept as
-# whole candidates (a ladder is one grid value, not per-tier dimensions).
-_TP_LADDER_DEFAULT = [  # live default (defaultHLProtectionTiers mirror)
+_TP_LADDER_DEFAULT = [
     {"atr_multiple": 1.5, "close_fraction": 0.4},
     {"atr_multiple": 3.0, "close_fraction": 0.8},
     {"atr_multiple": 5.0, "close_fraction": 1.0},
 ]
-_TP_LADDER_TIGHT = [  # bank earlier, cut tail risk
+_TP_LADDER_TIGHT = [
     {"atr_multiple": 1.0, "close_fraction": 0.5},
     {"atr_multiple": 2.0, "close_fraction": 0.8},
     {"atr_multiple": 3.0, "close_fraction": 1.0},
 ]
-_TP_LADDER_RUNNER = [  # smaller early clips, let winners run
+_TP_LADDER_RUNNER = [
     {"atr_multiple": 2.0, "close_fraction": 0.33},
     {"atr_multiple": 4.0, "close_fraction": 0.66},
     {"atr_multiple": 6.0, "close_fraction": 1.0},
 ]
 
 DEFAULT_CLOSE_STACK_SPECS = [
-    {"close": None},  # audit baseline: open-signal-as-close, no stops
+    {"close": None},
     {"close": None, "stop_loss_atr_mult": [1.5, 2.0, 3.0]},
     {"close": None, "trailing_stop_atr_mult": [2.0, 2.5, 3.0]},
     {"close": {"name": "tiered_tp_atr",
@@ -298,62 +229,32 @@ def walk_forward_optimize(
     close_strategies: Optional[List[dict]] = None,
     close_stack_grid: Optional[List[dict]] = None,
     direction: Optional[str] = None,
+    comparison_mode: Optional[str] = None,
+    stop_kwargs: Optional[dict] = None,
 ) -> dict:
-    """
-    Walk-forward optimization.
-
-    1. Split data into n_splits rolling windows
-    2. For each window: optimize on train portion, validate on test portion
-    3. Report aggregated out-of-sample performance
-
-    Args:
-        df: OHLCV DataFrame with datetime index
-        strategy_name: Name of registered strategy
-        param_ranges: Dict of param_name -> [values to test]
-        n_splits: Number of walk-forward windows
-        train_pct: Fraction of each window used for training
-        optimize_metric: Metric to maximize during optimization
-        initial_capital: Starting capital per window
-        symbol: Trading pair
-        timeframe: Candle timeframe
-        close_stack_grid: Optional list of close stacks (#996, from
-            ``generate_close_stack_grid``) swept jointly with the open-param
-            grid — selection picks the best (open params, close stack) pair
-            per fold. Mutually exclusive with the fixed ``close_strategies``/
-            stop-mult kwargs.
-        direction: Backtester direction gate (long/both; "short" is rejected
-            — the walk-forward warmup seeder is long-only, see the guard
-            below). When a
-            close-stack grid is supplied and direction is omitted it defaults
-            to "long": close refs activate the open/close engine where a raw
-            signal=-1 OPENS a short, so without the gate the baseline stack
-            (plain path, structurally long/flat) and the close-ref stacks
-            (long/short) would be scored on different entry universes — the
-            sweep comparison must hold the entry side constant.
-
-    Returns:
-        Dict with optimization results and best parameters per window
-    """
     total_len = len(df)
     window_size = total_len // n_splits
     if window_size < 50:
         raise ValueError(f"Not enough data: {total_len} rows / {n_splits} splits = {window_size} rows per window. Need >= 50.")
 
     if close_stack_grid and (close_strategies or stop_loss_atr_mult
-                             or trailing_stop_atr_mult):
+                             or trailing_stop_atr_mult or stop_kwargs):
         raise ValueError(
             "close_stack_grid is mutually exclusive with the fixed "
-            "close_strategies / stop_loss_atr_mult / trailing_stop_atr_mult "
-            "kwargs — the grid owns the close stack")
+            "close_strategies / stop_loss_atr_mult / trailing_stop_atr_mult / "
+            "stop_kwargs inputs — the grid owns the close stack")
+    extra_stop_kwargs = {}
+    for key, value in (stop_kwargs or {}).items():
+        if key in ("stop_loss_atr_mult", "trailing_stop_atr_mult"):
+            expected = stop_loss_atr_mult if key == "stop_loss_atr_mult" \
+                else trailing_stop_atr_mult
+            if value != expected:
+                raise ValueError(
+                    f"stop_kwargs.{key}={value!r} disagrees with {key}={expected!r}")
+            continue
+        extra_stop_kwargs[key] = value
     if close_stack_grid and direction is None:
         direction = "long"
-    # #989 review: walk-forward cannot measure the short leg faithfully yet.
-    # The warmup seeder (warmup_exit_long_entry) scans the raw warmup signals
-    # for a carried LONG position and feeds it to Backtester.run as
-    # starting_long — but under direction="short" a +1 signal never opens
-    # anything in the actual run, so the seed would inject a phantom long
-    # into the short measurement. Faithful support needs a short-aware
-    # warmup seeder; until then reject loudly regardless of close stacks.
     if direction == "short":
         raise ValueError(
             "direction='short' is not supported by walk-forward optimization "
@@ -369,8 +270,6 @@ def walk_forward_optimize(
     param_grid = generate_param_grid(param_ranges)
     warmup = max_indicator_lookback(param_ranges)
 
-    # One Backtester per close stack, constructed up front so invalid stacks
-    # fail loudly instead of being silently skipped inside the fold loop.
     if close_stack_grid:
         stacks = close_stack_grid
     else:
@@ -381,11 +280,6 @@ def walk_forward_optimize(
         }
         fixed["label"] = close_stack_label(fixed)
         stacks = [fixed]
-    # Guard the whole optimize surface, grid or not: a no-close stack runs on
-    # the plain single-leg path, which cannot model "both" (one signal cannot
-    # open one side and close the other — Backtester.run rejects it too), so
-    # a baseline stack in the grid cannot score the requested universe.
-    # direction="short" was rejected wholesale above (warmup seeder).
     if direction == "both" and any(
         not stack.get("close_strategies") for stack in stacks
     ):
@@ -403,24 +297,24 @@ def walk_forward_optimize(
             trailing_stop_atr_mult=stack.get("trailing_stop_atr_mult"),
             close_strategies=stack.get("close_strategies"),
             direction=direction,
+            comparison_mode=comparison_mode,
+            **extra_stop_kwargs,
         ))
         for stack in stacks
     ]
-    bt = stack_bts[0][1]  # slippage reference for warmup_exit_long_entry
+    bt = stack_bts[0][1]
+    stack_validations = [
+        {"label": stack["label"], "close_validation": stack_bt._close_validation.to_dict()}
+        for stack, stack_bt in stack_bts
+    ]
+    grid_validation = aggregate_close_validations(
+        v["close_validation"] for v in stack_validations)
 
-    # Any ATR-based exit needs an `atr` column on the signal frame: close
-    # evaluators stamp entry_atr from it (mirror of the run_backtest
-    # single-mode injection — without it tiered_tp_atr silently no-ops), and
-    # the warmup slice needs it so warmup_exit_long_entry can stamp the
-    # carried position's entry_atr (bare scalar stops included — the
-    # Backtester self-injects ATR for mid-window opens but never sees the
-    # warmup bars). ATR(14) also needs warmup bars to prime before the
-    # first fill.
     needs_atr = any(stack.get("close_strategies") for stack, _ in stack_bts)
     uses_exits = needs_atr or any(
         stack.get("stop_loss_atr_mult") or stack.get("trailing_stop_atr_mult")
         for stack, _ in stack_bts
-    )
+    ) or any(stack_bt.stop_owner in STOP_OWNERS_NEEDING_ATR for _, stack_bt in stack_bts)
     if uses_exits:
         warmup = max(warmup, ATR_CLOSE_WARMUP)
 
@@ -448,8 +342,6 @@ def walk_forward_optimize(
         if len(train_df) < 30 or len(test_df) < 10:
             continue
 
-        # Pre-roll indicator state with ``warmup`` bars of preceding history
-        # so long-lookback indicators prime before the first signal bar.
         train_boundary = start_idx + train_size
         train_start_ext = max(0, start_idx - warmup)
         test_start_ext = max(0, train_boundary - warmup)
@@ -463,17 +355,8 @@ def walk_forward_optimize(
                   f"Train {train_df.index[0].strftime('%Y-%m-%d')}→{train_df.index[-1].strftime('%Y-%m-%d')} "
                   f"| Test {test_df.index[0].strftime('%Y-%m-%d')}→{test_df.index[-1].strftime('%Y-%m-%d')}")
 
-        # Pass the boundary bar (last warmup row) into the Backtester along
-        # with the train rows. Its raw signal then becomes row 1's shifted
-        # signal inside Backtester.run, so a BUY/SELL emitted on the final
-        # warmup bar fires on the first train bar's open — matching live.
-        # The warmup scan runs on bars strictly before the boundary so it
-        # doesn't double-count that signal.
         train_boundary_idx = max(train_trim - 1, 0)
 
-        # Optimize on training data — joint (open params x close stack) grid.
-        # Signals are computed once per open-param combo and shared across
-        # all close stacks (the expensive parts are apply_strategy + bt.run).
         best_metric = -np.inf
         best_params = None
         best_stack = None
@@ -487,6 +370,8 @@ def walk_forward_optimize(
                 train_seed = warmup_exit_long_entry(
                     signals_ext.iloc[:train_boundary_idx], bt.slippage_pct,
                 ) if train_boundary_idx else None
+            except CloseCapabilityError:
+                raise
             except _EXPECTED_FOLD_ERRORS as e:
                 if verbose:
                     print(f"    [skip] fold {fold+1} {strategy_name} {params}: {type(e).__name__}: {e}")
@@ -503,6 +388,8 @@ def walk_forward_optimize(
                         best_params = params
                         best_stack = stack
                         best_bt = stack_bt
+                except CloseCapabilityError:
+                    raise
                 except _EXPECTED_FOLD_ERRORS as e:
                     if verbose:
                         print(f"    [skip] fold {fold+1} {strategy_name} {params} "
@@ -512,7 +399,6 @@ def walk_forward_optimize(
         if best_params is None:
             continue
 
-        # Validate on test data with best params + best close stack
         test_boundary_idx = max(test_trim - 1, 0)
         try:
             test_signals_ext = apply_strategy(strategy_name, test_ext_df, best_params)
@@ -526,6 +412,8 @@ def walk_forward_optimize(
                                       symbol=symbol, timeframe=timeframe,
                                       params=best_params, save=False,
                                       starting_long=test_seed)
+        except CloseCapabilityError:
+            raise
         except _EXPECTED_FOLD_ERRORS as e:
             if verbose:
                 print(f"    [skip] fold {fold+1} validation {strategy_name}: {type(e).__name__}: {e}")
@@ -539,6 +427,7 @@ def walk_forward_optimize(
                 k: best_stack.get(k) for k in
                 ("close_strategies", "stop_loss_atr_mult", "trailing_stop_atr_mult")
             },
+            "best_close_stack_validation": best_bt._close_validation.to_dict(),
             "train_metric": best_metric,
             "test_result": test_result,
             "train_period": f"{train_df.index[0].strftime('%Y-%m-%d')} to {train_df.index[-1].strftime('%Y-%m-%d')}",
@@ -555,14 +444,14 @@ def walk_forward_optimize(
                   f"MaxDD: {test_result['max_drawdown_pct']:.2f}%")
 
     if not window_results:
-        return {"error": "No valid optimization windows", "strategy": strategy_name}
+        return {"error": "No valid optimization windows", "strategy": strategy_name,
+                "close_validation": grid_validation,
+                "close_stack_validations": stack_validations}
 
-    # Aggregate out-of-sample results
     oos_returns = [w["test_result"]["total_return_pct"] for w in window_results]
     oos_sharpes = [w["test_result"]["sharpe_ratio"] for w in window_results]
     oos_drawdowns = [w["test_result"]["max_drawdown_pct"] for w in window_results]
 
-    # Find most common best params / close stack
     all_params = [str(w["best_params"]) for w in window_results]
     from collections import Counter
     most_common_params = Counter(all_params).most_common(1)[0][0]
@@ -585,6 +474,8 @@ def walk_forward_optimize(
         "oos_worst_drawdown": round(min(oos_drawdowns), 2),
         "most_common_best_params": most_common_params,
         "most_common_best_close_stack": most_common_stack,
+        "close_validation": grid_validation,
+        "close_stack_validations": stack_validations,
         "window_results": window_results,
     }
 
@@ -602,15 +493,12 @@ def walk_forward_optimize(
         print(f"  Most Stable Params: {summary['most_common_best_params']}")
         if len(stack_bts) > 1:
             print(f"  Most Stable Close Stack: {summary['most_common_best_close_stack']}")
+        from backtester import format_close_validation
+        print(f"  {format_close_validation(grid_validation)}")
 
     return summary
 
 
-# Predefined parameter ranges for optimization.
-# Grids are kept small (≤ ~32 combinations) to bound walk-forward runtime;
-# each strategy registered in shared_strategies/{spot,futures}/strategies.py
-# should have an entry here. Missing entries fall back to the strategy's
-# default_params (single-point grid) so optimize mode still runs.
 DEFAULT_PARAM_RANGES = {
     "sma_crossover": {
         "fast_period": [10, 15, 20, 25],
@@ -719,6 +607,12 @@ DEFAULT_PARAM_RANGES = {
         "ob_lookback": [15, 20, 30],
         "max_ob_age": [30, 50, 80],
     },
+    "ob_touch": {
+        "internal_lookback": [3, 5, 8],
+        "swing_lookback": [30, 50, 80],
+        "inl_num": [5, 7],
+        "htf_factor": [1, 4, 12],
+    },
     "vwap_reversion": {
         "entry_std": [1.0, 1.5, 2.0],
         "exit_std": [0.0, 0.2, 0.5],
@@ -727,11 +621,61 @@ DEFAULT_PARAM_RANGES = {
         "pivot_strength": [3, 5, 8],
         "buffer_atr_mult": [0.1, 0.25, 0.5],
         "confirm_bars": [1, 2, 3],
+        "gate_rsi_period": [0, 14, 21],
+        "gate_ema_period": [0, 100, 200],
+    },
+    "anchored_vwap_channel": {
+        "pivot_strength": [3, 5, 8],
+        "buffer_atr_mult": [0.1, 0.25, 0.5],
+        "confirm_bars": [1, 2, 3],
+        "min_width_atr_mult": [1.0, 1.5, 2.5],
+    },
+    "anchored_vwap_reversion": {
+        "pivot_strength": [3, 5, 8],
+        "entry_atr_mult": [1.0, 1.5, 2.0],
+        "buffer_atr_mult": [0.1, 0.25, 0.5],
+        "confirm_bars": [1, 2, 3],
+    },
+    "chaikin_money_flow_breakout": {
+        "flow_window": [10, 20, 40, 80],
+        "breakout_window": [10, 20, 40, 80],
+        "flow_threshold": [0.0, 0.05, 0.10, 0.20],
+    },
+    "open_interest_breakout": {
+        "price_lookback": [10, 20, 40],
+        "oi_lookback": [2, 4, 8],
+        "oi_change_threshold": [0.0, 0.002, 0.005, 0.01],
+    },
+    "connors_rsi_reversion": {
+        "price_period": [2, 3, 5],
+        "streak_period": [2, 3],
+        "rank_window": [50, 100, 150],
+        "oversold": [5.0, 10.0, 20.0],
+        "overbought": [80.0, 90.0, 95.0],
+    },
+    "vortex_trend": {
+        "period": [7, 14, 21, 28],
+        "min_separation": [0.0, 0.02, 0.05, 0.10],
+    },
+    "relative_vigor_index": {
+        "period": [4, 6, 8, 10, 14, 20, 30],
+        "zero_line_filter": [True],
+    },
+    "awesome_oscillator": {
+        "fast_period": [3, 5, 8, 13],
+        "slow_period": [21, 34, 55, 89],
+    },
+    "analog_retrieval": {
+        "horizon": [6, 12, 24],
+        "k_neighbors": [15, 25, 50],
+        "min_t_stat": [1.5, 2.0, 2.5],
+        "min_edge_atr": [0.1, 0.25, 0.5],
     },
     "chart_pattern": {
         "pivot_lookback": [3, 5, 7],
         "tolerance": [0.02, 0.03, 0.05],
         "vol_multiplier": [1.2, 1.5, 2.0],
+        "htf_gate_factor": [0, 6, 10],
     },
     "liquidity_sweeps": {
         "swing_lookback": [10, 20, 30],
@@ -759,11 +703,22 @@ DEFAULT_PARAM_RANGES = {
         "entry_period": [10, 20, 30],
         "exit_period": [5, 10, 15],
     },
+    "breakout_retest": {
+        "channel_lookback": [15, 20, 30],
+        "compression_lookback": [40, 60],
+        "compression_quantile": [0.20, 0.30],
+        "volume_multiplier": [1.2, 1.5],
+        "retest_window": [3, 5],
+        "retest_atr_buffer": [0.25, 0.50],
+    },
+    "commodity_channel_trend": {
+        "lookback": [14, 20, 30, 50],
+        "threshold": [50.0, 100.0, 150.0, 200.0],
+        "trend_period": [20, 50, 100, 150],
+    },
     "momentum_pro": {
         "ema_fast": [13, 20, 26],
         "ema_mid": [34, 50, 80],
-        # Single value (243 combos). Present so max_indicator_lookback provisions
-        # 200 warmup bars per fold and the EMA(200) regime gate is primed OOS.
         "ema_long": [200],
         "adx_threshold": [18.0, 20.0, 25.0],
         "pullback_window": [4, 6, 8],
@@ -775,22 +730,24 @@ DEFAULT_PARAM_RANGES = {
         "adx_max": [20.0, 25.0, 30.0],
         "rsi_oversold": [25.0, 30.0, 35.0],
         "rsi_overbought": [65.0, 70.0, 75.0],
+        "touch_entry": [0, 1],
+        "turn_entry": [0, 1],
+    },
+    "rsi_bb_combo": {
+        "bb_period": [14, 20, 30],
+        "bb_std": [1.5, 2.0, 2.5],
+        "rsi_oversold": [25.0, 30.0, 35.0],
+        "rsi_overbought": [65.0, 70.0, 75.0],
+        "confirm_window": [2, 3, 5],
     },
     "mtf_confluence": {
         "htf_factor": [3, 4, 6],
         "htf_ema_fast": [10, 20, 26],
-        # NOTE: the real warmup need is ~htf_factor × htf_ema_slow NATIVE bars
-        # (the slow EMA counts HTF buckets), which max_indicator_lookback's
-        # raw-int heuristic can't see. Safe regardless: the strategy holds the
-        # HTF trend neutral until primed, so under-provisioned folds just
-        # trade less at the start — never on look-ahead or junk EMAs.
         "htf_ema_slow": [40, 50],
         "ltf_ema": [13, 20],
         "pullback_window": [4, 6, 8],
     },
     "vol_momentum": {
-        # mom_window dominates warmup; atr_period (14) is below every value here
-        # so max_indicator_lookback provisions enough history per fold.
         "mom_window": [16, 24, 48],
         "entry_threshold": [0.20, 0.30, 0.40],
         "exit_threshold": [0.0, 0.05, 0.10],
@@ -811,18 +768,10 @@ DEFAULT_PARAM_RANGES = {
         "slow_veto_threshold": [0.03, 0.05, 0.08],
     },
     "regime_adaptive_htf": {
-        # Real warmup is ~htf_factor × (period + confirm_buckets) NATIVE bars
-        # (composite metrics count HTF buckets), which max_indicator_lookback's
-        # raw-int heuristic can't see; the pinned slow_trend_lookback value
-        # provisions 100 bars and under-provisioned folds stay flat until the
-        # label primes — never look-ahead (same caveat as mtf_confluence).
         "htf_factor": [4, 6, 8],
         "confirm_buckets": [1, 2, 3],
         "period": [10, 14],
         "mr_entry_z": [1.75, 2.0, 2.25],
-        # Drift-confirmed trend participation: "breakout" dominates in
-        # trending years (2023/2024), "off" in grind years (2026 OOS) — see
-        # the regime_adaptive_htf module docstring's per-window table.
         "trend_entry": ["off", "breakout"],
         "slow_trend_lookback": [100],
     },
@@ -830,6 +779,11 @@ DEFAULT_PARAM_RANGES = {
         "box_width_pct": [0.03, 0.05, 0.08, 0.10],
         "min_bars": [12, 16, 24],
         "edge_entry_frac": [0.1, 0.2, 0.33],
+    },
+    "atr_band_revert": {
+        "period": [14, 20, 30],
+        "atr_period": [10, 14, 20],
+        "k_entry": [1.0, 1.5, 2.0],
     },
     "bear_pullback_st": {
         "ema_short": [13, 20, 26],
@@ -844,15 +798,6 @@ DEFAULT_PARAM_RANGES = {
         "rally_window": [3, 5, 8],
         "rally_touch_buffer_pct": [0.0005, 0.001, 0.002],
     },
-    # NOTE: close-evaluator names (tp_at_pct, tiered_tp_pct, tiered_tp_atr, …) are
-    # intentionally absent here. walk_forward_optimize only sweeps OPEN-registry
-    # strategy params through THIS table (it builds the entry signal via the open
-    # registry), so a close-param grid keyed by a close name would be dead weight
-    # — unreachable and never swept. Close-param optimization lives in the
-    # close-stack grid instead (#996): DEFAULT_CLOSE_STACK_SPECS /
-    # generate_close_stack_grid, swept jointly via the close_stack_grid kwarg.
-    # Do not re-add close names here (#944).
-    # Futures-only
     "breakout": {
         "lookback": [10, 20, 30],
         "atr_period": [10, 14, 20],
@@ -869,12 +814,11 @@ DEFAULT_PARAM_RANGES = {
         "exit_threshold": [0.0, 0.00002, 0.00005],
         "drift_threshold": [1.5, 2.0, 2.5],
     },
-    "hold": {},  # no parameters — always signal=0; used by type=manual close-eval loop (#569)
+    "hold": {},
 }
 
 
 if __name__ == "__main__":
-    # Test with synthetic data
     np.random.seed(42)
     dates = pd.date_range("2020-01-01", periods=500, freq="D")
     prices = 100 + np.cumsum(np.random.randn(500) * 2)

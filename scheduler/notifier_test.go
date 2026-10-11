@@ -7,82 +7,10 @@ import (
 	"time"
 )
 
-// mockNotifier is a test double that records all calls.
-type mockNotifier struct {
-	mu         sync.Mutex
-	messages   []mockMessage
-	dms        []mockDM
-	askResp    string
-	askErr     error
-	closed     bool
-	failSendDM bool // when true, SendDM errors (exercises SendMessage fallback in sendTradeDestination)
-}
-
-type mockMessage struct {
-	channelID string
-	content   string
-}
-
-type mockDM struct {
-	userID  string
-	content string
-}
-
-func (m *mockNotifier) SendMessage(channelID string, content string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.messages = append(m.messages, mockMessage{channelID, content})
-	return nil
-}
-
-func (m *mockNotifier) SendDM(userID, content string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failSendDM {
-		return fmt.Errorf("mock SendDM failed")
-	}
-	m.dms = append(m.dms, mockDM{userID, content})
-	return nil
-}
-
-func (m *mockNotifier) AskDM(userID, question string, timeout time.Duration) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.dms = append(m.dms, mockDM{userID, question})
-	return m.askResp, m.askErr
-}
-
-func (m *mockNotifier) Close() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-}
-
-func TestSendTradeDestination_PrefersSendDM(t *testing.T) {
-	m := &mockNotifier{}
-	if err := sendTradeDestination(m, "user-1", "hello"); err != nil {
-		t.Fatal(err)
-	}
-	if len(m.dms) != 1 || m.dms[0].userID != "user-1" {
-		t.Fatalf("expected 1 DM, got %#v", m.dms)
-	}
-	if len(m.messages) != 0 {
-		t.Fatalf("expected no channel messages, got %#v", m.messages)
-	}
-}
-
-func TestSendTradeDestination_FallsBackToSendMessage(t *testing.T) {
-	m := &mockNotifier{failSendDM: true}
-	if err := sendTradeDestination(m, "channel-99", "hello"); err != nil {
-		t.Fatal(err)
-	}
-	if len(m.dms) != 0 {
-		t.Fatalf("expected no DMs when SendDM fails, got %#v", m.dms)
-	}
-	if len(m.messages) != 1 || m.messages[0].channelID != "channel-99" {
-		t.Fatalf("expected 1 channel message, got %#v", m.messages)
-	}
-}
+// mockNotifier/mockMessage/mockDM live in hyperliquid_balance_test.go
+// (upstream #1597 colocated a superset mock there when notifier_test.go
+// was deleted; our merge restored this file, so the shared mock is kept
+// in exactly one place).
 
 func TestMultiNotifier_NoBackends(t *testing.T) {
 	mn := NewMultiNotifier()
@@ -96,7 +24,6 @@ func TestMultiNotifier_NoBackends(t *testing.T) {
 		t.Error("expected no owner")
 	}
 
-	// Operations should not panic.
 	mn.SendToAllChannels("test")
 	mn.SendOwnerDM("test")
 	mn.Close()
@@ -105,9 +32,10 @@ func TestMultiNotifier_NoBackends(t *testing.T) {
 func TestMultiNotifier_SingleBackend(t *testing.T) {
 	mock := &mockNotifier{}
 	mn := NewMultiNotifier(notifierBackend{
-		notifier: mock,
-		channels: map[string]string{"spot": "ch1", "hyperliquid": "ch2"},
-		ownerID:  "owner1",
+		notifier:           mock,
+		channels:           map[string]string{"spot": "ch1", "hyperliquid": "ch2"},
+		tradeAlertChannels: map[string]string{"default": "trade-alerts"},
+		ownerID:            "owner1",
 	})
 
 	if !mn.HasBackends() {
@@ -123,7 +51,6 @@ func TestMultiNotifier_SingleBackend(t *testing.T) {
 		t.Errorf("expected owner1, got %s", mn.OwnerID())
 	}
 
-	// SendToChannel
 	mn.SendToChannel("binanceus", "spot", "spot message")
 	if len(mock.messages) != 1 || mock.messages[0].channelID != "ch1" {
 		t.Errorf("expected message to ch1, got %v", mock.messages)
@@ -134,19 +61,19 @@ func TestMultiNotifier_SingleBackend(t *testing.T) {
 		t.Errorf("expected message to ch2, got %v", mock.messages)
 	}
 
-	// SendToChannel with no match
 	mn.SendToChannel("unknown", "unknown", "no match")
 	if len(mock.messages) != 2 {
 		t.Errorf("expected no new messages, got %d", len(mock.messages))
 	}
 
-	// SendOwnerDM
 	mn.SendOwnerDM("hello owner")
-	if len(mock.dms) != 1 || mock.dms[0].userID != "owner1" {
-		t.Errorf("expected DM to owner1, got %v", mock.dms)
+	if len(mock.dms) != 0 {
+		t.Errorf("informational owner updates must not be sent as DMs: %v", mock.dms)
+	}
+	if len(mock.messages) != 3 || mock.messages[2].channelID != "trade-alerts" || mock.messages[2].content != "hello owner" {
+		t.Errorf("expected owner update in the configured trade-alert channel, got %v", mock.messages)
 	}
 
-	// SendToAllChannels
 	mock.messages = nil
 	mn.SendToAllChannels("broadcast")
 	if len(mock.messages) != 2 {
@@ -160,14 +87,16 @@ func TestMultiNotifier_DualBackends(t *testing.T) {
 
 	mn := NewMultiNotifier(
 		notifierBackend{
-			notifier: discord,
-			channels: map[string]string{"spot": "discord-ch1"},
-			ownerID:  "discord-owner",
+			notifier:           discord,
+			channels:           map[string]string{"spot": "discord-ch1"},
+			tradeAlertChannels: map[string]string{"default": "discord-alerts"},
+			ownerID:            "discord-owner",
 		},
 		notifierBackend{
-			notifier: telegram,
-			channels: map[string]string{"spot": "telegram-ch1"},
-			ownerID:  "telegram-owner",
+			notifier:           telegram,
+			channels:           map[string]string{"spot": "telegram-ch1"},
+			tradeAlertChannels: map[string]string{"default": "telegram-alerts"},
+			ownerID:            "telegram-owner",
 		},
 	)
 
@@ -175,7 +104,6 @@ func TestMultiNotifier_DualBackends(t *testing.T) {
 		t.Errorf("expected 2 backends, got %d", mn.BackendCount())
 	}
 
-	// SendToChannel sends to both backends
 	mn.SendToChannel("binanceus", "spot", "spot msg")
 	if len(discord.messages) != 1 || discord.messages[0].channelID != "discord-ch1" {
 		t.Errorf("expected discord message to discord-ch1, got %v", discord.messages)
@@ -184,16 +112,17 @@ func TestMultiNotifier_DualBackends(t *testing.T) {
 		t.Errorf("expected telegram message to telegram-ch1, got %v", telegram.messages)
 	}
 
-	// SendOwnerDM sends to both owners
 	mn.SendOwnerDM("update available")
-	if len(discord.dms) != 1 || discord.dms[0].userID != "discord-owner" {
-		t.Errorf("expected discord DM to discord-owner, got %v", discord.dms)
+	if len(discord.dms) != 0 || len(telegram.dms) != 0 {
+		t.Errorf("informational updates must not be sent as DMs: discord=%v telegram=%v", discord.dms, telegram.dms)
 	}
-	if len(telegram.dms) != 1 || telegram.dms[0].userID != "telegram-owner" {
-		t.Errorf("expected telegram DM to telegram-owner, got %v", telegram.dms)
+	if len(discord.messages) != 2 || discord.messages[1].channelID != "discord-alerts" || discord.messages[1].content != "update available" {
+		t.Errorf("expected discord channel update, got %v", discord.messages)
+	}
+	if len(telegram.messages) != 2 || telegram.messages[1].channelID != "telegram-alerts" || telegram.messages[1].content != "update available" {
+		t.Errorf("expected telegram channel update, got %v", telegram.messages)
 	}
 
-	// AskOwnerDM uses first backend with owner
 	discord.askResp = "yes"
 	resp, err := mn.AskOwnerDM("upgrade?", 5*time.Second)
 	if err != nil {
@@ -203,7 +132,6 @@ func TestMultiNotifier_DualBackends(t *testing.T) {
 		t.Errorf("expected 'yes', got %q", resp)
 	}
 
-	// Close shuts down all
 	mn.Close()
 	if !discord.closed || !telegram.closed {
 		t.Error("expected both backends closed")
@@ -218,13 +146,13 @@ func TestMultiNotifier_ResolveChannelKey(t *testing.T) {
 		},
 	)
 
-	if key := mn.resolveChannelKey("hyperliquid", "perps"); key != "hyperliquid" {
+	if key := mn.resolveChannelKey("hyperliquid", "perps", true, ""); key != "hyperliquid" {
 		t.Errorf("expected 'hyperliquid', got %q", key)
 	}
-	if key := mn.resolveChannelKey("binanceus", "spot"); key != "spot" {
+	if key := mn.resolveChannelKey("binanceus", "spot", true, ""); key != "spot" {
 		t.Errorf("expected 'spot', got %q", key)
 	}
-	if key := mn.resolveChannelKey("unknown", "unknown"); key != "" {
+	if key := mn.resolveChannelKey("unknown", "unknown", true, ""); key != "" {
 		t.Errorf("expected '', got %q", key)
 	}
 }
@@ -272,12 +200,11 @@ func TestMultiNotifier_SendToAllChannels_Deduplicated(t *testing.T) {
 	mock := &mockNotifier{}
 	mn := NewMultiNotifier(notifierBackend{
 		notifier: mock,
-		channels: map[string]string{"spot": "ch1", "perps": "ch1"}, // same channel
+		channels: map[string]string{"spot": "ch1", "perps": "ch1"},
 		ownerID:  "o1",
 	})
 
 	mn.SendToAllChannels("broadcast")
-	// Should only send once to ch1 (deduplicated)
 	if len(mock.messages) != 1 {
 		t.Errorf("expected 1 message (deduplicated), got %d: %v", len(mock.messages), mock.messages)
 	}
@@ -312,7 +239,6 @@ func TestMultiNotifier_AskDM_MatchesOwner(t *testing.T) {
 		notifierBackend{notifier: telegram, ownerID: "telegram-owner"},
 	)
 
-	// AskDM with matching owner should route correctly
 	resp, err := mn.AskDM("telegram-owner", "question?", 5*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -322,7 +248,6 @@ func TestMultiNotifier_AskDM_MatchesOwner(t *testing.T) {
 	}
 }
 
-// errNotifier always returns errors.
 type errNotifier struct{}
 
 func (e *errNotifier) SendMessage(channelID string, content string) error {
@@ -363,7 +288,6 @@ func TestMultiNotifier_SendMessage_RoutesPerBackend(t *testing.T) {
 		},
 	)
 
-	// Sending to a Discord channel should NOT reach Telegram.
 	mn.SendMessage("discord-ch1", "hello discord")
 	if len(discord.messages) != 1 {
 		t.Errorf("expected 1 discord message, got %d", len(discord.messages))
@@ -372,7 +296,6 @@ func TestMultiNotifier_SendMessage_RoutesPerBackend(t *testing.T) {
 		t.Errorf("expected 0 telegram messages, got %d", len(telegram.messages))
 	}
 
-	// Sending to a Telegram channel should NOT reach Discord.
 	mn.SendMessage("telegram-ch1", "hello telegram")
 	if len(discord.messages) != 1 {
 		t.Errorf("expected still 1 discord message, got %d", len(discord.messages))
@@ -397,7 +320,6 @@ func TestMultiNotifier_SendDM_RoutesPerBackend(t *testing.T) {
 		},
 	)
 
-	// DM to Discord owner should NOT reach Telegram.
 	mn.SendDM("discord-owner", "hello discord")
 	if len(discord.dms) != 1 {
 		t.Errorf("expected 1 discord DM, got %d", len(discord.dms))
@@ -406,7 +328,6 @@ func TestMultiNotifier_SendDM_RoutesPerBackend(t *testing.T) {
 		t.Errorf("expected 0 telegram DMs, got %d", len(telegram.dms))
 	}
 
-	// DM to Telegram owner should NOT reach Discord.
 	mn.SendDM("telegram-owner", "hello telegram")
 	if len(discord.dms) != 1 {
 		t.Errorf("expected still 1 discord DM, got %d", len(discord.dms))
@@ -426,7 +347,6 @@ func TestMultiNotifier_PostLeaderboardBroadcast_DedicatedChannel(t *testing.T) {
 
 	mn.PostLeaderboardBroadcast("top10 board")
 
-	// Should send exactly once to lb-ch (not broadcast to spot-ch + perps-ch).
 	if len(mock.messages) != 1 {
 		t.Fatalf("expected 1 message on dedicated channel, got %d: %v", len(mock.messages), mock.messages)
 	}
@@ -444,7 +364,6 @@ func TestMultiNotifier_PostLeaderboardBroadcast_FallbackBroadcast(t *testing.T) 
 
 	mn.PostLeaderboardBroadcast("top10 board")
 
-	// Should broadcast to both unique channels.
 	if len(mock.messages) != 2 {
 		t.Fatalf("expected 2 broadcast messages, got %d: %v", len(mock.messages), mock.messages)
 	}
@@ -461,8 +380,6 @@ func TestMultiNotifier_PostLeaderboardBroadcast_PerBackend(t *testing.T) {
 	discord := &mockNotifier{}
 	telegram := &mockNotifier{}
 
-	// Discord has dedicated channel; Telegram should still receive a broadcast
-	// across its own channels.
 	mn := NewMultiNotifier(
 		notifierBackend{
 			notifier:           discord,
@@ -477,11 +394,9 @@ func TestMultiNotifier_PostLeaderboardBroadcast_PerBackend(t *testing.T) {
 
 	mn.PostLeaderboardBroadcast("top10 board")
 
-	// Discord: 1 message on lb-ch.
 	if len(discord.messages) != 1 || discord.messages[0].channelID != "discord-lb" {
 		t.Errorf("expected discord 1 message on discord-lb, got %v", discord.messages)
 	}
-	// Telegram: 2 messages, broadcast to both channels.
 	if len(telegram.messages) != 2 {
 		t.Fatalf("expected telegram 2 broadcast messages, got %d: %v", len(telegram.messages), telegram.messages)
 	}
@@ -500,7 +415,6 @@ func TestMultiNotifier_SendMessage_UnknownChannel(t *testing.T) {
 		notifierBackend{notifier: mock, channels: map[string]string{"spot": "ch1"}},
 	)
 
-	// Unknown channel ID should not be sent anywhere.
 	err := mn.SendMessage("unknown-channel", "test")
 	if err != nil {
 		t.Errorf("expected nil error for unmatched channel, got %v", err)
@@ -579,9 +493,9 @@ func TestMultiNotifier_ReloadConfigConcurrentRoutingReads(t *testing.T) {
 			mn.SendToAllChannels("broadcast")
 			mn.SendOwnerDM("owner")
 			_ = mn.HasChannel("hyperliquid", "perps")
-			_ = mn.resolveChannelKey("hyperliquid", "perps")
+			_ = mn.resolveChannelKey("hyperliquid", "perps", true, "")
 			_ = mn.AllChannelKeys()
-			sendTradeAlerts(sc, stratState, 1, &stateMu, mn)
+			sendTradeAlerts(sc, stratState, 1, &stateMu, mn, nil)
 		}
 	}()
 	close(start)
@@ -591,7 +505,7 @@ func TestMultiNotifier_ReloadConfigConcurrentRoutingReads(t *testing.T) {
 func TestResolveTradeAlertChannel_OverrideHit(t *testing.T) {
 	override := map[string]string{"hyperliquid": "override-ch"}
 	channels := map[string]string{"hyperliquid": "summary-ch"}
-	got := resolveTradeAlertChannel(override, channels, "hyperliquid", "perps", true)
+	got := resolveTradeAlertChannel(override, channels, "hyperliquid", "perps", true, "")
 	if got != "override-ch" {
 		t.Errorf("expected override-ch, got %q", got)
 	}
@@ -600,7 +514,7 @@ func TestResolveTradeAlertChannel_OverrideHit(t *testing.T) {
 func TestResolveTradeAlertChannel_OverrideMiss_FallsThrough(t *testing.T) {
 	override := map[string]string{"deribit": "override-ch"}
 	channels := map[string]string{"hyperliquid": "summary-ch"}
-	got := resolveTradeAlertChannel(override, channels, "hyperliquid", "perps", true)
+	got := resolveTradeAlertChannel(override, channels, "hyperliquid", "perps", true, "")
 	if got != "summary-ch" {
 		t.Errorf("expected fallback summary-ch, got %q", got)
 	}
@@ -614,10 +528,10 @@ func TestResolveTradeAlertChannel_PaperLiveOverlay(t *testing.T) {
 	}
 	channels := map[string]string{"hyperliquid": "summary-ch"}
 
-	if got := resolveTradeAlertChannel(override, channels, "hyperliquid", "perps", false); got != "paper-override" {
+	if got := resolveTradeAlertChannel(override, channels, "hyperliquid", "perps", false, ""); got != "paper-override" {
 		t.Errorf("paper: expected paper-override, got %q", got)
 	}
-	if got := resolveTradeAlertChannel(override, channels, "hyperliquid", "perps", true); got != "live-override" {
+	if got := resolveTradeAlertChannel(override, channels, "hyperliquid", "perps", true, ""); got != "live-override" {
 		t.Errorf("live: expected live-override, got %q", got)
 	}
 }
@@ -629,8 +543,7 @@ func TestTradeAlertRoutes_OverrideDoesNotAffectSummaries(t *testing.T) {
 		tradeAlertChannels: map[string]string{"hyperliquid": "trade-ch"},
 	})
 
-	// Summary path uses resolveChannelKey — must still see "summary-ch".
-	key := mn.resolveChannelKey("hyperliquid", "perps")
+	key := mn.resolveChannelKey("hyperliquid", "perps", true, "")
 	if key != "hyperliquid" {
 		t.Errorf("summary key: expected hyperliquid, got %q", key)
 	}
@@ -639,22 +552,19 @@ func TestTradeAlertRoutes_OverrideDoesNotAffectSummaries(t *testing.T) {
 		t.Errorf("summary channel: expected summary-ch, got %q", summaryChID)
 	}
 
-	// Trade alert path uses tradeAlertRoutes — must use the override.
-	routes := mn.tradeAlertRoutes("hyperliquid", "perps", true)
+	routes := mn.tradeAlertRoutes("hyperliquid", "perps", true, "")
 	if len(routes) != 1 {
 		t.Fatalf("expected 1 route, got %d", len(routes))
 	}
 	if routes[0].channel != "trade-ch" {
 		t.Errorf("trade route: expected trade-ch, got %q", routes[0].channel)
 	}
-	// No channels["hyperliquid-live"] set, so liveCh must be empty.
 	if routes[0].liveChan != "" {
 		t.Errorf("liveChan: expected empty, got %q", routes[0].liveChan)
 	}
 }
 
 func TestTradeAlertRoutes_LiveChanConsultsOverride(t *testing.T) {
-	// override["hyperliquid-live"] is set: liveCh resolves from override, dedupes against primary.
 	mn := NewMultiNotifier(notifierBackend{
 		notifier: &mockNotifier{},
 		channels: map[string]string{
@@ -666,23 +576,20 @@ func TestTradeAlertRoutes_LiveChanConsultsOverride(t *testing.T) {
 			"hyperliquid-live": "trade-live-ch",
 		},
 	})
-	routes := mn.tradeAlertRoutes("hyperliquid", "perps", true)
+	routes := mn.tradeAlertRoutes("hyperliquid", "perps", true, "")
 	if len(routes) != 1 {
 		t.Fatalf("expected 1 route, got %d", len(routes))
 	}
 	r := routes[0]
-	// Primary ch: override["hyperliquid-live"] wins (isLive → live key checked first).
 	if r.channel != "trade-live-ch" {
 		t.Errorf("channel: expected trade-live-ch, got %q", r.channel)
 	}
-	// liveCh resolves to the same trade-live-ch → deduped to "".
 	if r.liveChan != "" {
 		t.Errorf("liveChan: expected empty (deduped), got %q", r.liveChan)
 	}
 }
 
 func TestTradeAlertRoutes_LiveChanFallbackWhenNoLiveOverride(t *testing.T) {
-	// override has platform key but no live-specific key: liveCh falls back to channels["<platform>-live"].
 	mn := NewMultiNotifier(notifierBackend{
 		notifier: &mockNotifier{},
 		channels: map[string]string{
@@ -693,16 +600,14 @@ func TestTradeAlertRoutes_LiveChanFallbackWhenNoLiveOverride(t *testing.T) {
 			"hyperliquid": "trade-ch",
 		},
 	})
-	routes := mn.tradeAlertRoutes("hyperliquid", "perps", true)
+	routes := mn.tradeAlertRoutes("hyperliquid", "perps", true, "")
 	if len(routes) != 1 {
 		t.Fatalf("expected 1 route, got %d", len(routes))
 	}
 	r := routes[0]
-	// Primary ch: override["hyperliquid"] wins (no live key in override).
 	if r.channel != "trade-ch" {
 		t.Errorf("channel: expected trade-ch, got %q", r.channel)
 	}
-	// liveCh: override has no "hyperliquid-live" key → falls back to channels["hyperliquid-live"].
 	if r.liveChan != "legacy-live-ch" {
 		t.Errorf("liveChan: expected legacy-live-ch, got %q", r.liveChan)
 	}

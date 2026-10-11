@@ -18,14 +18,17 @@ scheduler/config.json
 scheduler/state.json
 scheduler/state.db
 .worktrees/
-.claude/
+.claude/*
 local/
 
 # macOS
 .DS_Store
 architecture.md
-# ...but the canonical project architecture reference is tracked
-!docs/ARCHITECTURE.md
 
 # consolidation research generated output (regenerable)
 backtest/consolidation_out/
+
+# #1051: auto-generated agent capability doc (contains a live-state snapshot; regenerable via `go-trader agent-info --bootstrap-md`)
+AGENTS.generated.md
+
+!backtest/testdata/ledger_export/snapshot/state/primary.db

@@ -12,31 +12,81 @@ const (
 	regimeClassifierComposite = "composite"
 )
 
-// Default composite thresholds (#795); operators may override per window.
 var defaultCompositeThresholds = RegimeCompositeThresholds{
-	ReturnPct:  0.05,
-	RangePct:   0.03,
+	ReturnEff:  0.05,
+	RangeEff:   0.03,
 	ADX:        25.0,
 	Efficiency: 0.5,
 }
 
-// RegimeCompositeThresholds tunes the composite metric mapper. ReturnPct/RangePct
-// gate the ATR-efficiency net-move/range; Efficiency is the Kaufman efficiency
-// ratio (∈ (0,1]) that splits clean vs choppy trends; ADX corroborates.
 type RegimeCompositeThresholds struct {
-	ReturnPct  float64 `json:"return_pct"`
-	RangePct   float64 `json:"range_pct"`
+	ReturnEff  float64 `json:"return_eff"`
+	RangeEff   float64 `json:"range_eff"`
 	ADX        float64 `json:"adx"`
 	Efficiency float64 `json:"efficiency"`
 }
 
+func (t *RegimeCompositeThresholds) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var out RegimeCompositeThresholds
+	var oldReturn, newReturn *float64
+	var oldRange, newRange *float64
+	for key, blob := range raw {
+		v, err := decodeCompositeThresholdValue(key, blob)
+		if err != nil {
+			return err
+		}
+		switch key {
+		case "return_eff":
+			newReturn = &v
+		case "return_pct":
+			oldReturn = &v
+		case "range_eff":
+			newRange = &v
+		case "range_pct":
+			oldRange = &v
+		case "adx":
+			out.ADX = v
+		case "efficiency":
+			out.Efficiency = v
+		default:
+			return fmt.Errorf("thresholds: unknown key %q", key)
+		}
+	}
+	if oldReturn != nil {
+		out.ReturnEff = *oldReturn
+	}
+	if newReturn != nil {
+		out.ReturnEff = *newReturn
+	}
+	if oldRange != nil {
+		out.RangeEff = *oldRange
+	}
+	if newRange != nil {
+		out.RangeEff = *newRange
+	}
+	*t = out
+	return nil
+}
+
+func decodeCompositeThresholdValue(key string, data json.RawMessage) (float64, error) {
+	var v float64
+	if err := json.Unmarshal(data, &v); err != nil {
+		return 0, fmt.Errorf("thresholds.%s: must be a number: %w", key, err)
+	}
+	return v, nil
+}
+
 func (t RegimeCompositeThresholds) withDefaults() RegimeCompositeThresholds {
 	out := defaultCompositeThresholds
-	if t.ReturnPct > 0 {
-		out.ReturnPct = t.ReturnPct
+	if t.ReturnEff > 0 {
+		out.ReturnEff = t.ReturnEff
 	}
-	if t.RangePct > 0 {
-		out.RangePct = t.RangePct
+	if t.RangeEff > 0 {
+		out.RangeEff = t.RangeEff
 	}
 	if t.ADX > 0 {
 		out.ADX = t.ADX
@@ -47,8 +97,6 @@ func (t RegimeCompositeThresholds) withDefaults() RegimeCompositeThresholds {
 	return out
 }
 
-// RegimeWindowSpec describes one named regime window (#792/#795).
-// Bare-int JSON in regime.windows parses as {classifier:"adx", period:N}.
 type RegimeWindowSpec struct {
 	Classifier   string                     `json:"classifier,omitempty"`
 	Period       int                        `json:"period"`
@@ -96,7 +144,6 @@ func (s RegimeWindowSpec) resolvedForEmit(rc *RegimeConfig) RegimeWindowSpec {
 	return out
 }
 
-// RegimeWindowsMap is regime.windows: name -> spec. Accepts bare ints for ADX back-compat.
 type RegimeWindowsMap map[string]RegimeWindowSpec
 
 func (m *RegimeWindowsMap) UnmarshalJSON(data []byte) error {
@@ -136,6 +183,8 @@ func regimeLabelsForClassifier(classifier string) []string {
 			"ranging_quiet",
 			"ranging_volatile",
 			"ranging_directional",
+			"ranging_directional_up",
+			"ranging_directional_down",
 		}
 	default:
 		return append([]string(nil), canonicalTrendRegimeLabels...)
@@ -177,11 +226,11 @@ func validateRegimeWindowSpec(name string, spec RegimeWindowSpec, rc *RegimeConf
 		}
 	case regimeClassifierComposite:
 		th := spec.compositeThresholds()
-		if th.ReturnPct <= 0 {
-			errs = append(errs, fmt.Sprintf("%s: thresholds.return_pct must be > 0", prefix))
+		if th.ReturnEff <= 0 {
+			errs = append(errs, fmt.Sprintf("%s: thresholds.return_eff must be > 0", prefix))
 		}
-		if th.RangePct <= 0 {
-			errs = append(errs, fmt.Sprintf("%s: thresholds.range_pct must be > 0", prefix))
+		if th.RangeEff <= 0 {
+			errs = append(errs, fmt.Sprintf("%s: thresholds.range_eff must be > 0", prefix))
 		}
 		if th.ADX <= 0 || th.ADX > 100 {
 			errs = append(errs, fmt.Sprintf("%s: thresholds.adx must be in (0, 100], got %g", prefix, th.ADX))
@@ -220,26 +269,6 @@ func regimeWindowsSpecJSON(rc *RegimeConfig) string {
 		return ""
 	}
 	return string(blob)
-}
-
-func regimeWindowClassifierEqual(a, b RegimeWindowSpec) bool {
-	return a.effectiveClassifier() == b.effectiveClassifier()
-}
-
-func regimeWindowsClassifiersEqual(old, new RegimeWindowsMap) bool {
-	if len(old) != len(new) {
-		return false
-	}
-	for name, ospec := range old {
-		nspec, ok := new[name]
-		if !ok {
-			return false
-		}
-		if !regimeWindowClassifierEqual(ospec, nspec) {
-			return false
-		}
-	}
-	return true
 }
 
 func openPositionsReferenceRegimeWindow(state *AppState, windowKey string) bool {
@@ -302,15 +331,9 @@ func validateStrategyRegimeVocabulary(cfg *Config) []string {
 			polErrs := sc.RegimeDirectionalPolicy.ResolveRawWithLabels(prefix+".regime_directional_policy", dirLabels)
 			errs = append(errs, polErrs...)
 		}
-		// #907: regime_window_divergence shape validation (window names, on_divergence)
-		// AND window-existence. Both run here (not in validateRegimeWindowsConfig)
-		// because ResolveRaw populates ShortWindow/MediumWindow — and that function
-		// runs BEFORE this one in validateConfig, so the typed fields are empty there
-		// and an existence guard keyed on them would silently skip (PR #916 review).
 		if sc.RegimeWindowDivergence.IsConfigured() {
 			divErrs := sc.RegimeWindowDivergence.ResolveRaw(prefix + ".regime_window_divergence")
 			errs = append(errs, divErrs...)
-			// Existence check only when shape resolved cleanly and regime windows exist.
 			if len(divErrs) == 0 && rc != nil && rc.Enabled {
 				for _, pair := range []struct {
 					field string
@@ -331,12 +354,6 @@ func validateStrategyRegimeVocabulary(cfg *Config) []string {
 						errs = append(errs, fmt.Sprintf("%s: regime_window_divergence.%s=%q not found in regime.windows (valid: %s)", prefix, pair.field, pair.value, strings.Join(sortedRegimeWindowNamesFromConfig(rc.Windows), ", ")))
 					}
 				}
-				// #907/PR#916: louder stand-aside foot-gun warning. A mutating mode
-				// (trust_short/trust_medium) on a non-"both" base direction can only
-				// gate the base side's entries — it can never synthesize the opposite
-				// entry (the signal script already ran with the pre-override direction;
-				// see applyRegimeDivergenceOverride doc). Skip when a directional policy
-				// is configured, since that resolves direction per-regime (may be "both").
 				mode := sc.RegimeWindowDivergence.OnDivergence
 				if (mode == onDivergenceTrustShort || mode == onDivergenceTrustMedium) &&
 					EffectiveDirection(sc) != DirectionBoth &&
@@ -346,13 +363,6 @@ func validateStrategyRegimeVocabulary(cfg *Config) []string {
 				}
 			}
 		}
-		// #998: regime_profile_allocation shape validation (param_sets count,
-		// label coverage, profile references) AND window existence. Check window
-		// existence FIRST: a typo'd window otherwise resolves to the ADX-default
-		// classifier and surfaces a confusing label-coverage error instead of the
-		// real "window not found" cause. When the window is bad we still run
-		// ResolveRaw with nil labels so param_sets/initial_profile shape errors
-		// are not masked.
 		if sc.RegimeProfileAllocation.IsConfigured() {
 			windowRaw := regimeProfileAllocationWindow(sc)
 			windowKey := normalizeRegimeWindowKey(windowRaw)
@@ -372,11 +382,6 @@ func validateStrategyRegimeVocabulary(cfg *Config) []string {
 			}
 			errs = append(errs, sc.RegimeProfileAllocation.ResolveRaw(prefix+".regime_profile_allocation", labels)...)
 		}
-		// stop_loss_atr_regime / trailing_stop_atr_regime vocabulary is resolved
-		// authoritatively in validateRegimeATRConfig (which also populates the
-		// typed runtime fields and runs the mutex checks) using the same
-		// window-classifier labels — see #802. Re-resolving here would just
-		// double-report the same label errors.
 	}
 	return errs
 }
@@ -386,10 +391,28 @@ func formatRegimeWindowSpecInspect(name string, spec RegimeWindowSpec, rc *Regim
 	cls := resolved.effectiveClassifier()
 	if cls == regimeClassifierComposite && resolved.Thresholds != nil {
 		th := resolved.Thresholds
-		return fmt.Sprintf("%s: classifier=%s period=%d thresholds(return_pct=%g range_pct=%g adx=%g efficiency=%g)",
-			name, cls, resolved.Period, th.ReturnPct, th.RangePct, th.ADX, th.Efficiency)
+		return fmt.Sprintf("%s: classifier=%s period=%d thresholds(return_eff=%g range_eff=%g adx=%g efficiency=%g)",
+			name, cls, resolved.Period, th.ReturnEff, th.RangeEff, th.ADX, th.Efficiency)
 	}
 	return fmt.Sprintf("%s: classifier=%s period=%d adx_threshold=%g", name, cls, resolved.Period, resolved.ADXThreshold)
+}
+
+func regimeDisplayWindowAllowSet(rc *RegimeConfig) map[string]bool {
+	if rc == nil || len(rc.DisplayWindows) == 0 {
+		return nil
+	}
+	allow := make(map[string]bool, len(rc.DisplayWindows))
+	for _, name := range rc.DisplayWindows {
+		key := normalizeRegimeWindowKey(name)
+		if key == "" {
+			continue
+		}
+		allow[key] = true
+	}
+	if len(allow) == 0 {
+		return nil
+	}
+	return allow
 }
 
 func formatStrategyRegimeDisplay(ss *StrategyState, rc *RegimeConfig) string {
@@ -397,6 +420,7 @@ func formatStrategyRegimeDisplay(ss *StrategyState, rc *RegimeConfig) string {
 		return ""
 	}
 	if regimeMultiWindowEnabled(rc) && len(ss.RegimeWindows) > 0 {
+		allow := regimeDisplayWindowAllowSet(rc)
 		names := make([]string, 0, len(ss.RegimeWindows))
 		for name := range ss.RegimeWindows {
 			names = append(names, name)
@@ -404,12 +428,14 @@ func formatStrategyRegimeDisplay(ss *StrategyState, rc *RegimeConfig) string {
 		sort.Strings(names)
 		parts := make([]string, 0, len(names))
 		for _, name := range names {
+			if allow != nil && !allow[normalizeRegimeWindowKey(name)] {
+				continue
+			}
 			label := strings.TrimSpace(ss.RegimeWindows[name])
 			if label == "" {
 				continue
 			}
-			cls := regimeClassifierForWindow(rc, name)
-			parts = append(parts, fmt.Sprintf("%s=%s [%s]", name, label, cls))
+			parts = append(parts, fmt.Sprintf("%s=%s", name, label))
 		}
 		if len(parts) > 0 {
 			return strings.Join(parts, "; ")

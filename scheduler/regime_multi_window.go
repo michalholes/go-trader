@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -14,15 +16,12 @@ const (
 	regimeOhlcvMargin        = 10
 )
 
-// RegimeSnapshot is one window's latest regime reading from a check script.
 type RegimeSnapshot struct {
 	Regime  string             `json:"regime"`
 	Score   float64            `json:"score"`
 	Metrics map[string]float64 `json:"metrics,omitempty"`
 }
 
-// RegimePayload holds either a legacy single label or a multi-window map.
-// JSON from check scripts is either a string or {"short": {...}, ...}.
 type RegimePayload struct {
 	Legacy    string
 	Windows   map[string]RegimeSnapshot
@@ -36,9 +35,6 @@ func (p RegimePayload) IsEmpty() bool {
 	return strings.TrimSpace(p.Legacy) == ""
 }
 
-// PrimaryLabel returns the display label for status/summary surfaces.
-// Legacy mode: the single label. Multi-window: medium window if configured,
-// else the smallest bar-count window name.
 func (p RegimePayload) PrimaryLabel(rc *RegimeConfig) string {
 	if !p.MultiMode {
 		return strings.TrimSpace(p.Legacy)
@@ -57,21 +53,12 @@ func (p RegimePayload) PrimaryLabel(rc *RegimeConfig) string {
 	return ""
 }
 
-// Label resolves the regime label for a consumer window key.
-// Empty or "default" in legacy mode uses the single label; in multi-window
-// mode uses primaryRegimeWindowKey when unset.
 func (p RegimePayload) Label(windowKey string, rc *RegimeConfig) string {
 	key := normalizeRegimeWindowKey(windowKey)
 	if !p.MultiMode {
 		return strings.TrimSpace(p.Legacy)
 	}
 	if key == "" || key == regimeWindowDefaultKey {
-		// With explicit regime.windows, the default selector maps to the
-		// primary window. Without them, the check script still emits a
-		// single-window payload keyed by "default" (regimeWindowsSpecJSON's
-		// empty-windows branch), so fall back to that literal key rather than
-		// no-op'ing to an empty label — an empty label silently disables both
-		// regime_directional_policy and the allowed_regimes gate (#797).
 		if regimeMultiWindowEnabled(rc) {
 			key = primaryRegimeWindowKey(rc)
 		} else {
@@ -87,7 +74,6 @@ func (p RegimePayload) Label(windowKey string, rc *RegimeConfig) string {
 	return ""
 }
 
-// WindowLabels returns window name -> label for stamping at open.
 func (p RegimePayload) WindowLabels() map[string]string {
 	if !p.MultiMode {
 		label := strings.TrimSpace(p.Legacy)
@@ -131,8 +117,6 @@ func (p *RegimePayload) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	if _, ok := raw["regime"]; ok {
-		// Flat legacy snapshot: {"regime":"trending_up","score":...} — not a
-		// multi-window map whose sole key happens to be named "regime".
 		if _, hasScore := raw["score"]; hasScore {
 			var snap RegimeSnapshot
 			if err := json.Unmarshal(data, &snap); err != nil {
@@ -298,24 +282,6 @@ func regimeRequiredOhlcvLimit(rc *RegimeConfig) int {
 	return limit
 }
 
-func regimeLabelAtOpen(pos *Position, windowKey string, rc *RegimeConfig) string {
-	if pos == nil {
-		return ""
-	}
-	key := normalizeRegimeWindowKey(windowKey)
-	if key == "" || key == regimeWindowDefaultKey {
-		if regimeMultiWindowEnabled(rc) {
-			key = primaryRegimeWindowKey(rc)
-		}
-	}
-	if key != "" && key != regimeWindowDefaultKey && len(pos.RegimeWindows) > 0 {
-		if label, ok := pos.RegimeWindows[key]; ok && strings.TrimSpace(label) != "" {
-			return strings.TrimSpace(label)
-		}
-	}
-	return strings.TrimSpace(pos.Regime)
-}
-
 func regimeLabelFromWindows(windows map[string]string, windowKey string, rc *RegimeConfig) string {
 	if len(windows) == 0 {
 		return ""
@@ -364,6 +330,21 @@ func validateRegimeWindowsConfig(cfg *Config) []string {
 		errs = append(errs, validateRegimeWindowSpec(trimmed, spec, rc)...)
 	}
 	multi := regimeMultiWindowEnabled(rc)
+	if len(rc.DisplayWindows) > 0 {
+		if !multi {
+			errs = append(errs, "regime.display_windows requires regime.windows to be configured")
+		} else {
+			for _, name := range rc.DisplayWindows {
+				key := normalizeRegimeWindowKey(name)
+				if key == "" {
+					continue
+				}
+				if !regimeWindowExists(rc, key) {
+					errs = append(errs, fmt.Sprintf("regime.display_windows: %q not found in regime.windows (valid: %s)", name, strings.Join(sortedRegimeWindowNamesFromConfig(rc.Windows), ", ")))
+				}
+			}
+		}
+	}
 	for _, sc := range cfg.Strategies {
 		prefix := fmt.Sprintf("strategy[%s]", sc.ID)
 		for _, pair := range []struct {
@@ -386,10 +367,6 @@ func validateRegimeWindowsConfig(cfg *Config) []string {
 				errs = append(errs, fmt.Sprintf("%s: %s=%q not found in regime.windows (valid: %s)", prefix, pair.field, pair.value, strings.Join(sortedRegimeWindowNamesFromConfig(rc.Windows), ", ")))
 			}
 		}
-		// #907: regime_window_divergence window-existence is validated in
-		// validateStrategyRegimeVocabulary (after ResolveRaw populates the typed
-		// fields) — not here, because this function runs first and the fields are
-		// still empty at this point.
 	}
 	return errs
 }
@@ -412,11 +389,6 @@ func regimeWindowExists(rc *RegimeConfig, key string) bool {
 	return ok
 }
 
-// regimeWindowsJSON forwards to regimeWindowsSpecJSON (#795).
-func regimeWindowsJSON(rc *RegimeConfig) string {
-	return regimeWindowsSpecJSON(rc)
-}
-
 func syncStrategyRegimeState(stratState *StrategyState, payload RegimePayload, rc *RegimeConfig) {
 	if stratState == nil {
 		return
@@ -425,10 +397,6 @@ func syncStrategyRegimeState(stratState *StrategyState, payload RegimePayload, r
 	if labels := payload.WindowLabels(); len(labels) > 0 {
 		stratState.RegimeWindows = cloneStringMap(labels)
 	}
-}
-
-func positionRegimeForFeature(pos *Position, sc StrategyConfig, rc *RegimeConfig, feature string) string {
-	return regimeLabelAtOpen(pos, resolveStrategyRegimeWindow(sc, feature, rc), rc)
 }
 
 func strategyRegimeWindowField(sc StrategyConfig, field string) string {
@@ -444,8 +412,6 @@ func strategyRegimeWindowField(sc StrategyConfig, field string) string {
 	}
 }
 
-// positionFeatureRegimeLabel resolves a stamped regime label for ATR/directional
-// features using pos.RegimeWindows when present, without needing RegimeConfig.
 func positionFeatureRegimeLabel(pos *Position, sc StrategyConfig, feature string) string {
 	if pos == nil {
 		return ""
@@ -480,6 +446,19 @@ func strategyCurrentDirectionalRegime(stratState *StrategyState, sc StrategyConf
 	return strings.TrimSpace(stratState.Regime)
 }
 
+func strategyDisplayRegimeLabel(stratState *StrategyState, sc StrategyConfig, rc *RegimeConfig) string {
+	if stratState == nil {
+		return ""
+	}
+	key := normalizeRegimeWindowKey(sc.RegimeGateWindow)
+	if key != "" && key != regimeWindowDefaultKey && len(stratState.RegimeWindows) > 0 {
+		if label, ok := stratState.RegimeWindows[key]; ok && strings.TrimSpace(label) != "" {
+			return strings.TrimSpace(label)
+		}
+	}
+	return strings.TrimSpace(stratState.Regime)
+}
+
 func positionCtxForCheck(sc StrategyConfig, pos *Position, regime *RegimeConfig) PositionCtx {
 	ctx := positionCtxFromPosition(pos)
 	if pos == nil {
@@ -493,6 +472,18 @@ func positionCtxForCheck(sc StrategyConfig, pos *Position, regime *RegimeConfig)
 	} else {
 		ctx.DirectionalRegime = ctx.Regime
 	}
+	if label := protectionATRRegimeLabel(pos, sc); label != "" {
+		ctx.Regime = label
+	}
+	if ctx.RegimeAppliedLabel == "" {
+		ctx.RegimeAppliedLabel = ctx.Regime
+	}
+	if sc.Platform == "blofin" && sc.Type == "perps" && pos.Quantity > 0 {
+		ctx.BarsHeld, ctx.BarsHeldKnown = completedBarsHeld(pos.OpenedAt, time.Now().UTC(), strategyDisplayTimeframe(sc))
+	}
+	if sc.Platform == "hyperliquid" {
+		ctx.OnChainTPResting, ctx.OnChainTPBlocked = hlOnChainTPState(sc, pos)
+	}
 	return ctx
 }
 
@@ -501,6 +492,18 @@ func regimePayloadValue(p *RegimePayload) RegimePayload {
 		return RegimePayload{}
 	}
 	return *p
+}
+
+// regimePayloadForPosition preserves the shared sealed payload when present,
+// but uses the check script's inline classification when the shared regime
+// bundle was unavailable. Entry gates and Hurst/directional evidence gates
+// must continue reading the shared store separately so their configured
+// fail-open/fail-closed behavior is unchanged.
+func regimePayloadForPosition(shared, check RegimePayload) RegimePayload {
+	if !shared.IsEmpty() {
+		return shared
+	}
+	return check
 }
 
 func regimeGateLabel(sc StrategyConfig, payload RegimePayload, rc *RegimeConfig) string {
@@ -513,7 +516,26 @@ func regimeDirectionalLabel(sc StrategyConfig, payload RegimePayload, rc *Regime
 
 func applyRegimeGate(sc StrategyConfig, payload RegimePayload, rc *RegimeConfig, posQty float64) (gateLabel string, blocked bool) {
 	gateLabel = regimeGateLabel(sc, payload, rc)
-	return gateLabel, regimeBlocksOpen(sc.AllowedRegimes, gateLabel, posQty)
+	failClosed := resolveRegimeGateOnFailure(sc, rc) == RegimeGateOnFailureClosed
+	return gateLabel, regimeBlocksOpen(sc.AllowedRegimes, gateLabel, posQty, failClosed)
+}
+
+func regimeGateFailClosedActive(sc StrategyConfig, stratState *StrategyState, rc *RegimeConfig) bool {
+	if len(sc.AllowedRegimes) == 0 || resolveRegimeGateOnFailure(sc, rc) != RegimeGateOnFailureClosed {
+		return false
+	}
+	if stratState != nil && (len(stratState.Positions) > 0 || len(stratState.OptionPositions) > 0) {
+		return false
+	}
+	payload := globalRegimeStore.PayloadForStrategy(sc, rc)
+	return strings.TrimSpace(regimeGateLabel(sc, payload, rc)) == ""
+}
+
+func decorateRegimeLabelGateClosed(label string) string {
+	if strings.TrimSpace(label) == "" {
+		return "? (gate closed)"
+	}
+	return label + " (gate closed)"
 }
 
 func stampPositionRegimeFromPayload(s *StrategyState, symbol string, payload RegimePayload, sc StrategyConfig, rc *RegimeConfig) {
@@ -546,4 +568,85 @@ func regimeWindowFieldsEqual(a, b StrategyConfig) bool {
 	return normalizeRegimeWindowKey(a.RegimeGateWindow) == normalizeRegimeWindowKey(b.RegimeGateWindow) &&
 		normalizeRegimeWindowKey(a.RegimeATRWindow) == normalizeRegimeWindowKey(b.RegimeATRWindow) &&
 		normalizeRegimeWindowKey(a.RegimeDirectionalWindow) == normalizeRegimeWindowKey(b.RegimeDirectionalWindow)
+}
+
+func tradeAlertRegimeWindowKey(sc StrategyConfig, trade Trade, rc *RegimeConfig) string {
+	if trade.TradeType == scaleInTradeType || trade.Manual {
+		return resolveStrategyRegimeWindow(sc, "gate", rc)
+	}
+	return primaryRegimeWindowKey(rc)
+}
+
+var optionsAlertRegimeConfig = parseOptionsAlertRegimeConfig()
+
+func parseOptionsAlertRegimeConfig() *RegimeConfig {
+	var windows RegimeWindowsMap
+	if err := json.Unmarshal([]byte(optionsRegimeWindowsSpecJSON), &windows); err != nil || len(windows) == 0 {
+		return nil
+	}
+	return &RegimeConfig{Enabled: true, Timeframe: optionsRegimeTimeframe, Windows: windows}
+}
+
+func tradeAlertRegimeConfig(sc StrategyConfig, rc *RegimeConfig) *RegimeConfig {
+	if sc.Type == "options" {
+		return optionsAlertRegimeConfig
+	}
+	return rc
+}
+
+func tradeAlertRegimeTimeframe(sc StrategyConfig, rc *RegimeConfig) string {
+	if sc.Type == "options" {
+		return optionsRegimeTimeframe
+	}
+	_, timeframe := strategyRegimeSymbolTimeframe(sc.Args, rc)
+	return normalizeRegimeTimeframe(timeframe)
+}
+
+func tradeAlertRegimeWindowSpan(sc StrategyConfig, trade Trade, rc *RegimeConfig) (string, string) {
+	rc = tradeAlertRegimeConfig(sc, rc)
+	if rc == nil {
+		return "", ""
+	}
+	key := tradeAlertRegimeWindowKey(sc, trade, rc)
+	period := rc.Period
+	spec, exists := regimeWindowSpec(rc, key)
+	if exists && spec.Period > 0 {
+		period = spec.Period
+	}
+	if period <= 0 {
+		return "", ""
+	}
+	tfDur, ok := diagTimeframeDuration(tradeAlertRegimeTimeframe(sc, rc))
+	if !ok {
+		return "", ""
+	}
+	windowName := ""
+	if exists {
+		windowName = key
+	}
+	return windowName, formatRegimeWindowSpan(time.Duration(period) * tfDur)
+}
+
+func formatRegimeWindowSpan(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	if d >= 24*time.Hour {
+		return fmt.Sprintf("%dd", int(math.Round(d.Hours()/24)))
+	}
+	if d >= time.Hour {
+		return fmt.Sprintf("%dh", int(math.Round(d.Hours())))
+	}
+	return fmt.Sprintf("%dm", int(math.Round(d.Minutes())))
+}
+
+func formatTradeAlertRegimeExtra(sc StrategyConfig, trade Trade, rc *RegimeConfig) string {
+	window, span := tradeAlertRegimeWindowSpan(sc, trade, rc)
+	switch {
+	case window != "" && span != "":
+		return fmt.Sprintf("Regime %s (%s): %s", window, span, trade.Regime)
+	case span != "":
+		return fmt.Sprintf("Regime (%s): %s", span, trade.Regime)
+	}
+	return "Regime: " + trade.Regime
 }

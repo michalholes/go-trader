@@ -1,8 +1,3 @@
-"""Trailing-stop tier ratchet close evaluators (#844).
-
-Each tier tightens the trailing ATR distance and may scale out (``close_fraction``
-may be 0 for trail-only rungs). Regime is frozen at open via ``position["regime"]``.
-"""
 
 from __future__ import annotations
 
@@ -16,25 +11,12 @@ from _helpers import (
 )
 from regime_atr import CANONICAL_TREND_REGIME_LABELS, regime_close_default_group
 
-# DEFAULT_RATCHET_TIERS is the conservative fallback ladder (#866) used when the
-# SCALAR trailing_tp_ratchet omits tp_tiers (or sets use_defaults:true). It
-# mirrors the Go single source of truth defaultTrailingRatchetTiers() in
-# scheduler/trailing_tp_ratchet.go — keep the two in sync. Precondition: the
-# first rung tightens to 1.5xATR, so a strategy using this default must set
-# trailing_stop_atr_mult >= 1.5 (else the Go loader rejects it via
-# validateTrailingRatchetInitialTrail).
 DEFAULT_RATCHET_TIERS = [
     {"atr_multiple": 2.0, "trailing_mult_after": 1.5, "close_fraction": 0.0},
     {"atr_multiple": 2.5, "trailing_mult_after": 1.0, "close_fraction": 0.0},
     {"atr_multiple": 3.0, "trailing_mult_after": 0.8, "close_fraction": 0.0},
 ]
 
-# #870: per-quality-group default ratchet ladders for the REGIME variant
-# (trailing_tp_ratchet_regime) when tp_tiers is omitted / use_defaults:true.
-# Mirrors ratchetTierGroupDefaults in scheduler/trailing_tp_ratchet.go. Trend
-# groups (clean/choppy) are pure let-it-ride (close_fraction 0); ranging scales
-# out. Each group's first rung couples to that group's opening trail in
-# REGIME_ATR_DEFAULTS_TRAILING (clean 2.0 / choppy 2.0 / ranging 1.0).
 DEFAULT_RATCHET_TIERS_BY_GROUP = {
     "clean": [
         {"atr_multiple": 3.0, "trailing_mult_after": 1.5, "close_fraction": 0.0},
@@ -46,12 +28,34 @@ DEFAULT_RATCHET_TIERS_BY_GROUP = {
         {"atr_multiple": 2.5, "trailing_mult_after": 1.0, "close_fraction": 0.0},
         {"atr_multiple": 3.0, "trailing_mult_after": 0.8, "close_fraction": 0.0},
     ],
-    "ranging": [
+    "ranging_quiet": [
         {"atr_multiple": 0.75, "trailing_mult_after": 1.0, "close_fraction": 0.4},
         {"atr_multiple": 1.5, "trailing_mult_after": 0.75, "close_fraction": 0.8},
         {"atr_multiple": 2.0, "trailing_mult_after": 0.75, "close_fraction": 1.0},
     ],
+    "ranging_volatile": [
+        {"atr_multiple": 1.0, "trailing_mult_after": 1.0, "close_fraction": 0.4},
+        {"atr_multiple": 2.0, "trailing_mult_after": 0.75, "close_fraction": 0.8},
+        {"atr_multiple": 3.0, "trailing_mult_after": 0.75, "close_fraction": 1.0},
+    ],
+    "ranging_directional": [
+        {"atr_multiple": 1.0, "trailing_mult_after": 1.0, "close_fraction": 0.25},
+        {"atr_multiple": 2.0, "trailing_mult_after": 1.0, "close_fraction": 0.50},
+        {"atr_multiple": 3.0, "trailing_mult_after": 0.8, "close_fraction": 0.75},
+        {"atr_multiple": 4.5, "trailing_mult_after": 0.6, "close_fraction": 0.75},
+    ],
 }
+
+
+def ratchet_close_default_group(label: str) -> Optional[str]:
+    l = (label or "").strip()
+    if l in ("ranging_quiet", "ranging_volatile", "ranging_directional"):
+        return l
+    if l in ("ranging_directional_up", "ranging_directional_down"):
+        return "ranging_directional"
+    if l == "ranging":
+        return "ranging_quiet"
+    return regime_close_default_group(l)
 
 
 def _first_present(d: dict, *keys: str):
@@ -62,7 +66,6 @@ def _first_present(d: dict, *keys: str):
 
 
 def resolve_trailing_mult_after(tier: dict, firing_multiple: float) -> Optional[float]:
-    """Return the new trail distance in ATR units for a firing tier."""
     has_abs = "trailing_mult_after" in tier
     has_frac = "tp_atr_fraction" in tier
     if has_abs and has_frac:
@@ -85,7 +88,6 @@ def resolve_trailing_mult_after(tier: dict, firing_multiple: float) -> Optional[
 
 
 def _parse_tier_dict(tier: dict) -> Optional[Tuple[float, float, Optional[float]]]:
-    """Return (atr_multiple, close_fraction, trailing_mult) or None when invalid."""
     if not isinstance(tier, dict):
         return None
     mult_raw = _first_present(tier, "atr_multiple", "multiple", "atr")
@@ -149,21 +151,16 @@ def _parse_regime_table(raw, labels) -> Tuple[List[Tuple[float, float, float]], 
             errs.append(f"tp_tiers: unknown regime key {key!r}")
     if errs:
         return [], errs
-    # Validation-only path may pass regime="" — caller supplies table per open.
     return [], []
 
 
 def resolve_tiers_for_regime(
     params: dict, regime: str, *, regime_table: bool
 ) -> Tuple[List[Tuple[float, float, float]], List[str]]:
-    """Resolve concrete tiers for the stamped regime label."""
     raw = tier_list_from_params(params)
     if raw is None:
-        # Omitted tp_tiers (or use_defaults:true) resolves to the system default
-        # ladder. #870: the regime variant resolves the per-quality-group ladder
-        # for the stamped regime; the scalar variant uses the single #866 default.
         if regime_table:
-            group = regime_close_default_group(regime)
+            group = ratchet_close_default_group(regime)
             ladder = DEFAULT_RATCHET_TIERS_BY_GROUP.get(group) if group else None
             if not ladder:
                 return [], []
@@ -233,6 +230,7 @@ def _evaluate(position: dict, market: dict, params: dict, *, regime_table: bool)
     return {
         "close_fraction": close_fraction,
         "reason": f"{tag}{suffix}:{multiple:g}",
+        "tp_tier": multiple,
     }
 
 
@@ -247,7 +245,6 @@ def maybe_apply_mark_ratchet(
     post_tp_trail_mult: Optional[float],
     trailing_stop_atr_mult: float,
 ) -> tuple[int, Optional[float]]:
-    """Return (new_watermark, new_post_tp_trail_mult) after mark-based tier clears."""
     if not tiers or mark_price <= 0 or avg_cost <= 0 or entry_atr <= 0:
         return watermark, post_tp_trail_mult
     profit_distance = mark_price - avg_cost if side == "long" else avg_cost - mark_price
