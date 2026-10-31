@@ -115,7 +115,7 @@ def main():
         try:
             price = fetch_price(symbol)
             if price > 0:
-                prices[symbol] = round(price, 2)
+                prices[symbol] = float(price)
             else:
                 print(f"Failed to fetch {symbol}: no positive price", file=sys.stderr)
         except Exception as e:
@@ -136,7 +136,7 @@ def main():
                 except (ValueError, TypeError):
                     last = 0
                 if last > 0:
-                    prices[symbol] = round(last, 2)
+                    prices[symbol] = float(last)
         except Exception as e2:
             print(f"BloFin spot fallback failed: {e2}", file=sys.stderr)
 
